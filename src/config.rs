@@ -630,10 +630,7 @@ fn parse_email_provider_config(
     match value.trim().to_ascii_lowercase().as_str() {
         "noop" => Ok(EmailProviderConfig::Noop),
         "sendgrid" => {
-            let provider_credential = sendgrid_provider_credential
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty());
-            let api_key = match provider_credential {
+            let api_key = match sendgrid_provider_credential {
                 Some(value) => value,
                 None => {
                     anyhow::bail!(
