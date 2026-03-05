@@ -13,6 +13,9 @@ on:
         default: false
         type: boolean
 
+permissions:
+  contents: read
+
 jobs:
   ops-tooling-smoke:
     runs-on: ubuntu-latest

@@ -275,7 +275,7 @@ impl AppConfig {
             .unwrap_or_else(|_| "false".to_string())
             .parse::<bool>()
             .context("EMAIL_METRICS_LATENCY_ENABLED must be true or false")?;
-        let sendgrid_api_key = resolve_optional_secret_from_env(
+        let sendgrid_env_value = resolve_optional_secret_from_env(
             "SENDGRID_API_KEY",
             std::env::var("SENDGRID_API_KEY").ok(),
             "SENDGRID_API_KEY_FILE",
@@ -283,7 +283,7 @@ impl AppConfig {
         )?;
         let email_provider = parse_email_provider_config(
             std::env::var("EMAIL_PROVIDER").unwrap_or_else(|_| "noop".to_string()),
-            sendgrid_api_key,
+            sendgrid_env_value,
             SendGridEnvConfig {
                 api_base_url: std::env::var("SENDGRID_API_BASE_URL").ok(),
                 from_email: std::env::var("SENDGRID_FROM_EMAIL").ok(),
@@ -624,13 +624,13 @@ fn parse_login_abuse_bucket_mode(value: String) -> Result<LoginAbuseBucketMode> 
 
 fn parse_email_provider_config(
     value: String,
-    sendgrid_api_key: Option<String>,
+    sendgrid_env_value: Option<String>,
     sendgrid: SendGridEnvConfig,
 ) -> Result<EmailProviderConfig> {
     match value.trim().to_ascii_lowercase().as_str() {
         "noop" => Ok(EmailProviderConfig::Noop),
         "sendgrid" => {
-            let api_key = sendgrid_api_key
+            let api_key = sendgrid_env_value
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
                 .context("SENDGRID_API_KEY or SENDGRID_API_KEY_FILE is required when EMAIL_PROVIDER=sendgrid")?;
@@ -932,22 +932,22 @@ fn is_truthy(value: &str) -> bool {
 
 fn resolve_optional_secret_from_env(
     secret_name: &str,
-    secret_value: Option<String>,
+    inline_value: Option<String>,
     secret_file_name: &str,
-    secret_file_value: Option<String>,
+    file_value: Option<String>,
 ) -> Result<Option<String>> {
-    let secret_value = secret_value
+    let inline_value = inline_value
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
-    let secret_file_value = secret_file_value
+    let file_value = file_value
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
 
-    if secret_value.is_some() && secret_file_value.is_some() {
+    if inline_value.is_some() && file_value.is_some() {
         anyhow::bail!("{secret_name} and {secret_file_name} cannot both be set");
     }
 
-    if let Some(secret_file_path) = secret_file_value {
+    if let Some(secret_file_path) = file_value {
         let secret = std::fs::read_to_string(&secret_file_path).with_context(|| {
             format!("{secret_file_name} points to unreadable file: {secret_file_path}")
         })?;
@@ -958,7 +958,7 @@ fn resolve_optional_secret_from_env(
         return Ok(Some(secret));
     }
 
-    Ok(secret_value)
+    Ok(inline_value)
 }
 
 fn normalize_pem(value: String) -> String {

@@ -30,6 +30,9 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: read
+
 jobs:
   replay-audit-compliance:
     runs-on: ubuntu-latest

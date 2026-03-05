@@ -932,9 +932,12 @@ mod tests {
         Json,
     };
     use base32::Alphabet;
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use chrono::Utc;
     use hmac::{Hmac, Mac};
+    use rand::{rngs::OsRng, RngCore};
     use sha1::Sha1;
+    use uuid::Uuid;
 
     use crate::{
         adapters::{
@@ -2187,7 +2190,7 @@ mod tests {
         cfg.database_url = database_url;
         cfg.bootstrap_user_email =
             Some(format!("bootstrap-pg-{}@example.com", uuid::Uuid::new_v4()));
-        cfg.bootstrap_user_password = Some("StartPass!1234".to_string());
+        cfg.bootstrap_user_password = Some(generated_test_password("bootstrap-pg"));
         cfg.login_abuse_attempts_prefix =
             format!("handler:pg:test:attempts:{}", uuid::Uuid::new_v4());
         cfg.login_abuse_lock_prefix = format!("handler:pg:test:lock:{}", uuid::Uuid::new_v4());
@@ -2359,9 +2362,9 @@ mod tests {
             mfa_challenge_ttl_seconds: 300,
             mfa_challenge_max_attempts: 3,
             mfa_totp_issuer: "handler-tests".to_string(),
-            mfa_encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_string(),
+            mfa_encryption_key: generated_test_mfa_encryption_key_base64(),
             bootstrap_user_email: Some("bootstrap@example.com".to_string()),
-            bootstrap_user_password: Some("StartPass!1234".to_string()),
+            bootstrap_user_password: Some(generated_test_password("bootstrap-user")),
             login_max_attempts: 5,
             login_attempt_window_seconds: 300,
             login_lockout_seconds: 900,
@@ -2390,6 +2393,16 @@ mod tests {
             .expect("secret should be valid base32");
         let step = (Utc::now().timestamp() / 30) as u64;
         totp_code_for_step(&secret_bytes, step).expect("totp generation should succeed")
+    }
+
+    fn generated_test_password(label: &str) -> String {
+        format!("A{label}!9z{}", Uuid::new_v4().simple())
+    }
+
+    fn generated_test_mfa_encryption_key_base64() -> String {
+        let mut key_bytes = [0_u8; 32];
+        OsRng.fill_bytes(&mut key_bytes);
+        BASE64_STANDARD.encode(key_bytes)
     }
 
     fn totp_code_for_step(secret: &[u8], step: u64) -> Option<String> {

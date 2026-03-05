@@ -279,8 +279,8 @@ impl AuthService {
                 "invalid MFA encryption key length: expected 32 bytes"
             ));
         }
-        let mut mfa_encryption_key = [0u8; 32];
-        mfa_encryption_key.copy_from_slice(&raw_key);
+        let mfa_encryption_key = <[u8; 32]>::try_from(raw_key.as_slice())
+            .map_err(|_| anyhow::anyhow!("invalid MFA encryption key length: expected 32 bytes"))?;
 
         Ok(Self {
             users,
@@ -1531,7 +1531,7 @@ impl AuthService {
     async fn audit_register_accepted(
         &self,
         email: &str,
-        actor_user_id: Option<&str>,
+        _actor_user_id: Option<&str>,
         outcome: &str,
         ctx: &RequestContext,
         now: chrono::DateTime<Utc>,
@@ -1539,7 +1539,7 @@ impl AuthService {
         self.audit
             .append(AuditEvent {
                 event_type: "auth.register.accepted".to_string(),
-                actor_user_id: actor_user_id.map(str::to_string),
+                actor_user_id: None,
                 trace_id: ctx.trace_id.clone(),
                 metadata: json!({"email": email, "outcome": outcome, "ip": ctx.ip, "user_agent": ctx.user_agent}),
                 created_at: now,
@@ -1550,14 +1550,14 @@ impl AuthService {
     async fn audit_verify_email_rejected(
         &self,
         reason: &str,
-        actor_user_id: Option<&str>,
+        _actor_user_id: Option<&str>,
         ctx: &RequestContext,
         now: chrono::DateTime<Utc>,
     ) {
         self.audit
             .append(AuditEvent {
                 event_type: "auth.verify_email.rejected".to_string(),
-                actor_user_id: actor_user_id.map(str::to_string),
+                actor_user_id: None,
                 trace_id: ctx.trace_id.clone(),
                 metadata: json!({"reason": reason, "ip": ctx.ip, "user_agent": ctx.user_agent}),
                 created_at: now,
@@ -1568,7 +1568,7 @@ impl AuthService {
     async fn audit_password_forgot_accepted(
         &self,
         email: &str,
-        actor_user_id: Option<&str>,
+        _actor_user_id: Option<&str>,
         outcome: &str,
         ctx: &RequestContext,
         now: chrono::DateTime<Utc>,
@@ -1576,7 +1576,7 @@ impl AuthService {
         self.audit
             .append(AuditEvent {
                 event_type: "auth.password.forgot.accepted".to_string(),
-                actor_user_id: actor_user_id.map(str::to_string),
+                actor_user_id: None,
                 trace_id: ctx.trace_id.clone(),
                 metadata: json!({"email": email, "outcome": outcome, "ip": ctx.ip, "user_agent": ctx.user_agent}),
                 created_at: now,
@@ -1587,14 +1587,14 @@ impl AuthService {
     async fn audit_password_reset_rejected(
         &self,
         reason: &str,
-        actor_user_id: Option<&str>,
+        _actor_user_id: Option<&str>,
         ctx: &RequestContext,
         now: chrono::DateTime<Utc>,
     ) {
         self.audit
             .append(AuditEvent {
                 event_type: "auth.password.reset.rejected".to_string(),
-                actor_user_id: actor_user_id.map(str::to_string),
+                actor_user_id: None,
                 trace_id: ctx.trace_id.clone(),
                 metadata: json!({"reason": reason, "ip": ctx.ip, "user_agent": ctx.user_agent}),
                 created_at: now,
@@ -1605,14 +1605,14 @@ impl AuthService {
     async fn audit_password_change_rejected(
         &self,
         reason: &str,
-        actor_user_id: Option<&str>,
+        _actor_user_id: Option<&str>,
         ctx: &RequestContext,
         now: chrono::DateTime<Utc>,
     ) {
         self.audit
             .append(AuditEvent {
                 event_type: "auth.password.change.rejected".to_string(),
-                actor_user_id: actor_user_id.map(str::to_string),
+                actor_user_id: None,
                 trace_id: ctx.trace_id.clone(),
                 metadata: json!({"reason": reason, "ip": ctx.ip, "user_agent": ctx.user_agent}),
                 created_at: now,
@@ -1678,14 +1678,14 @@ impl AuthService {
     async fn audit_mfa_verify_rejected(
         &self,
         reason: &str,
-        actor_user_id: Option<&str>,
+        _actor_user_id: Option<&str>,
         ctx: &RequestContext,
         now: chrono::DateTime<Utc>,
     ) {
         self.audit
             .append(AuditEvent {
                 event_type: "auth.mfa.verify.rejected".to_string(),
-                actor_user_id: actor_user_id.map(str::to_string),
+                actor_user_id: None,
                 trace_id: ctx.trace_id.clone(),
                 metadata: json!({"reason": reason, "ip": ctx.ip, "user_agent": ctx.user_agent}),
                 created_at: now,
@@ -1727,13 +1727,13 @@ impl AuthService {
         &self,
         reason: &str,
         email: &str,
-        actor_user_id: Option<&str>,
+        _actor_user_id: Option<&str>,
         ctx: &RequestContext,
     ) {
         self.audit
             .append(AuditEvent {
                 event_type: "auth.login.rejected".to_string(),
-                actor_user_id: actor_user_id.map(str::to_string),
+                actor_user_id: None,
                 trace_id: ctx.trace_id.clone(),
                 metadata: json!({"reason": reason, "email": email, "ip": ctx.ip, "user_agent": ctx.user_agent}),
                 created_at: Utc::now(),
@@ -1779,7 +1779,7 @@ impl AuthService {
     async fn audit_refresh_rejected(
         &self,
         reason: &str,
-        actor_user_id: Option<&str>,
+        _actor_user_id: Option<&str>,
         session_id: Option<&str>,
         ctx: &RequestContext,
         now: chrono::DateTime<Utc>,
@@ -1787,7 +1787,7 @@ impl AuthService {
         self.audit
             .append(AuditEvent {
                 event_type: "auth.refresh.rejected".to_string(),
-                actor_user_id: actor_user_id.map(str::to_string),
+                actor_user_id: None,
                 trace_id: ctx.trace_id.clone(),
                 metadata: json!({"reason": reason, "session_id": session_id, "ip": ctx.ip, "user_agent": ctx.user_agent}),
                 created_at: now,
@@ -1974,7 +1974,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use chrono::{DateTime, Utc};
+    use rand::{rngs::OsRng, RngCore};
+    use uuid::Uuid;
 
     use crate::{
         adapters::inmemory::{
@@ -2126,6 +2129,8 @@ mod tests {
     #[tokio::test]
     async fn password_change_revokes_sessions_and_replaces_credentials() {
         let harness = build_harness();
+        let wrong_current_password = generated_test_password("wrong-current");
+        let next_password = generated_test_password("next-credential");
 
         let login_initial = harness
             .service
@@ -2146,8 +2151,8 @@ mod tests {
             .password_change(
                 PasswordChangeCommand {
                     user_id: principal.user_id.clone(),
-                    current_password: "WrongPassword!123".to_string(),
-                    new_password: "NextPass!1234".to_string(),
+                    current_password: wrong_current_password,
+                    new_password: next_password.clone(),
                 },
                 test_context("password-change-wrong-current"),
             )
@@ -2163,7 +2168,7 @@ mod tests {
                 PasswordChangeCommand {
                     user_id: principal.user_id.clone(),
                     current_password: harness.bootstrap_password.clone(),
-                    new_password: "NextPass!1234".to_string(),
+                    new_password: next_password.clone(),
                 },
                 test_context("password-change-success"),
             )
@@ -2197,7 +2202,7 @@ mod tests {
             .login(
                 LoginCommand {
                     email: harness.bootstrap_email.clone(),
-                    password: "NextPass!1234".to_string(),
+                    password: next_password,
                     device_info: Some("test-device-3".to_string()),
                 },
                 test_context("login-new-password"),
@@ -2263,8 +2268,8 @@ mod tests {
         assert_eq!(active_after[0].id, principal1.session_id);
 
         let other_email = "other@example.com";
-        let other_password = "OtherPass!1234";
-        let other_hash = super::hash_password(other_password).expect("hashing should work");
+        let other_password = generated_test_password("other-user");
+        let other_hash = super::hash_password(&other_password).expect("hashing should work");
         let other_user = harness
             .users
             .create_pending_user(other_email, &other_hash)
@@ -2282,7 +2287,7 @@ mod tests {
             .login(
                 LoginCommand {
                     email: other_email.to_string(),
-                    password: other_password.to_string(),
+                    password: other_password,
                     device_info: Some("other-device".to_string()),
                 },
                 test_context("login-other-user"),
@@ -3330,9 +3335,9 @@ mod tests {
             mfa_challenge_ttl_seconds: 300,
             mfa_challenge_max_attempts: 3,
             mfa_totp_issuer: "auth-tests".to_string(),
-            mfa_encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_string(),
+            mfa_encryption_key: generated_test_mfa_encryption_key_base64(),
             bootstrap_user_email: Some("bootstrap@example.com".to_string()),
-            bootstrap_user_password: Some("StartPass!1234".to_string()),
+            bootstrap_user_password: Some(generated_test_password("bootstrap-user")),
             login_max_attempts: 5,
             login_attempt_window_seconds: 300,
             login_lockout_seconds: 900,
@@ -3375,5 +3380,15 @@ mod tests {
             .expect("secret should be valid base32");
         let step = (Utc::now().timestamp() / 30) as u64;
         super::totp_code_for_step(&secret_bytes, step).expect("totp generation should succeed")
+    }
+
+    fn generated_test_password(label: &str) -> String {
+        format!("A{label}!9z{}", Uuid::new_v4().simple())
+    }
+
+    fn generated_test_mfa_encryption_key_base64() -> String {
+        let mut key_bytes = [0_u8; 32];
+        OsRng.fill_bytes(&mut key_bytes);
+        BASE64_STANDARD.encode(key_bytes)
     }
 }
