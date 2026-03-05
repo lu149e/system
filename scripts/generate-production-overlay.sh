@@ -8,6 +8,18 @@ BASE_KUSTOMIZE_DIR="${ROOT_DIR}/deploy/k8s"
 
 ENFORCE_DATABASE_TLS="${ENFORCE_DATABASE_TLS:-true}"
 ENFORCE_REDIS_TLS="${ENFORCE_REDIS_TLS:-true}"
+ENFORCE_SECURE_TRANSPORT="${ENFORCE_SECURE_TRANSPORT:-true}"
+PASSKEY_ENABLED="${PASSKEY_ENABLED:-false}"
+PASSKEY_RP_ID="${PASSKEY_RP_ID:-}"
+PASSKEY_RP_ORIGIN="${PASSKEY_RP_ORIGIN:-}"
+PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS="${PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS:-60}"
+LOGIN_RISK_MODE="${LOGIN_RISK_MODE:-baseline}"
+LOGIN_RISK_BLOCKED_CIDRS="${LOGIN_RISK_BLOCKED_CIDRS:-}"
+LOGIN_RISK_BLOCKED_USER_AGENT_SUBSTRINGS="${LOGIN_RISK_BLOCKED_USER_AGENT_SUBSTRINGS:-}"
+LOGIN_RISK_BLOCKED_EMAIL_DOMAINS="${LOGIN_RISK_BLOCKED_EMAIL_DOMAINS:-}"
+LOGIN_RISK_CHALLENGE_CIDRS="${LOGIN_RISK_CHALLENGE_CIDRS:-}"
+LOGIN_RISK_CHALLENGE_USER_AGENT_SUBSTRINGS="${LOGIN_RISK_CHALLENGE_USER_AGENT_SUBSTRINGS:-}"
+LOGIN_RISK_CHALLENGE_EMAIL_DOMAINS="${LOGIN_RISK_CHALLENGE_EMAIL_DOMAINS:-}"
 
 required_vars=(
   IMAGE_DIGEST
@@ -60,6 +72,62 @@ validate_boolean_flag() {
   fi
 }
 
+validate_positive_u64() {
+  local field_name="$1"
+  local value="$2"
+
+  if [[ ! "${value}" =~ ^[0-9]+$ ]] || [[ "${value}" == "0" ]]; then
+    fail "${field_name} must be a positive integer"
+  fi
+}
+
+validate_login_risk_mode() {
+  if [[ "${LOGIN_RISK_MODE}" != "allow_all" && "${LOGIN_RISK_MODE}" != "baseline" ]]; then
+    fail "LOGIN_RISK_MODE must be either 'allow_all' or 'baseline'"
+  fi
+}
+
+validate_passkey_origin_with_python() {
+  local field_name="$1"
+  local value="$2"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail "python3 is required to validate ${field_name} URL"
+  fi
+
+  python3 - "$field_name" "$value" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+field = sys.argv[1]
+raw = sys.argv[2].strip()
+
+parsed = urlparse(raw)
+if parsed.scheme.lower() != "https" or not parsed.netloc:
+    print(f"ERROR: {field} must be a valid HTTPS origin URL: {raw}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+validate_passkey_configuration() {
+  validate_boolean_flag "PASSKEY_ENABLED" "${PASSKEY_ENABLED}"
+  validate_positive_u64 \
+    "PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS" \
+    "${PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS}"
+
+  if [[ "${PASSKEY_ENABLED}" == "true" ]]; then
+    if [[ -z "${PASSKEY_RP_ID//[[:space:]]/}" ]]; then
+      fail "PASSKEY_RP_ID is required when PASSKEY_ENABLED=true"
+    fi
+
+    if [[ -z "${PASSKEY_RP_ORIGIN//[[:space:]]/}" ]]; then
+      fail "PASSKEY_RP_ORIGIN is required when PASSKEY_ENABLED=true"
+    fi
+
+    validate_passkey_origin_with_python "PASSKEY_RP_ORIGIN" "${PASSKEY_RP_ORIGIN}"
+  fi
+}
+
 validate_cidr_with_python() {
   local field_name="$1"
   local value="$2"
@@ -83,6 +151,36 @@ except ValueError:
 PY
 }
 
+validate_optional_cidr_csv_with_python() {
+  local field_name="$1"
+  local value="$2"
+
+  if [[ -z "${value//[[:space:]]/}" ]]; then
+    return
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail "python3 is required to validate ${field_name} CIDR CSV"
+  fi
+
+  python3 - "$field_name" "$value" <<'PY'
+import ipaddress
+import sys
+
+field = sys.argv[1]
+raw = sys.argv[2]
+
+entries = [item.strip() for item in raw.split(",") if item.strip()]
+
+for entry in entries:
+    try:
+        ipaddress.ip_network(entry, strict=False)
+    except ValueError:
+        print(f"ERROR: {field} contains invalid CIDR entry: {entry}", file=sys.stderr)
+        sys.exit(1)
+PY
+}
+
 replace_tokens() {
   local template_file="$1"
   local output_file="$2"
@@ -98,6 +196,18 @@ replace_tokens() {
   content="${content//__PRODUCTION_REDIS_CIDR__/${REDIS_CIDR}}"
   content="${content//__PRODUCTION_ENFORCE_DATABASE_TLS__/${ENFORCE_DATABASE_TLS}}"
   content="${content//__PRODUCTION_ENFORCE_REDIS_TLS__/${ENFORCE_REDIS_TLS}}"
+  content="${content//__PRODUCTION_ENFORCE_SECURE_TRANSPORT__/${ENFORCE_SECURE_TRANSPORT}}"
+  content="${content//__PRODUCTION_PASSKEY_ENABLED__/${PASSKEY_ENABLED}}"
+  content="${content//__PRODUCTION_PASSKEY_RP_ID__/${PASSKEY_RP_ID}}"
+  content="${content//__PRODUCTION_PASSKEY_RP_ORIGIN__/${PASSKEY_RP_ORIGIN}}"
+  content="${content//__PRODUCTION_PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS__/${PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS}}"
+  content="${content//__PRODUCTION_LOGIN_RISK_MODE__/${LOGIN_RISK_MODE}}"
+  content="${content//__PRODUCTION_LOGIN_RISK_BLOCKED_CIDRS__/${LOGIN_RISK_BLOCKED_CIDRS}}"
+  content="${content//__PRODUCTION_LOGIN_RISK_BLOCKED_USER_AGENTS__/${LOGIN_RISK_BLOCKED_USER_AGENT_SUBSTRINGS}}"
+  content="${content//__PRODUCTION_LOGIN_RISK_BLOCKED_EMAIL_DOMAINS__/${LOGIN_RISK_BLOCKED_EMAIL_DOMAINS}}"
+  content="${content//__PRODUCTION_LOGIN_RISK_CHALLENGE_CIDRS__/${LOGIN_RISK_CHALLENGE_CIDRS}}"
+  content="${content//__PRODUCTION_LOGIN_RISK_CHALLENGE_USER_AGENTS__/${LOGIN_RISK_CHALLENGE_USER_AGENT_SUBSTRINGS}}"
+  content="${content//__PRODUCTION_LOGIN_RISK_CHALLENGE_EMAIL_DOMAINS__/${LOGIN_RISK_CHALLENGE_EMAIL_DOMAINS}}"
 
   printf '%s\n' "${content}" >"${output_file}"
 }
@@ -131,8 +241,13 @@ main() {
   validate_tls_secret_name
   validate_boolean_flag "ENFORCE_DATABASE_TLS" "${ENFORCE_DATABASE_TLS}"
   validate_boolean_flag "ENFORCE_REDIS_TLS" "${ENFORCE_REDIS_TLS}"
+  validate_boolean_flag "ENFORCE_SECURE_TRANSPORT" "${ENFORCE_SECURE_TRANSPORT}"
+  validate_passkey_configuration
+  validate_login_risk_mode
   validate_cidr_with_python "POSTGRES_CIDR" "${POSTGRES_CIDR}"
   validate_cidr_with_python "REDIS_CIDR" "${REDIS_CIDR}"
+  validate_optional_cidr_csv_with_python "LOGIN_RISK_BLOCKED_CIDRS" "${LOGIN_RISK_BLOCKED_CIDRS}"
+  validate_optional_cidr_csv_with_python "LOGIN_RISK_CHALLENGE_CIDRS" "${LOGIN_RISK_CHALLENGE_CIDRS}"
 
   [[ -d "${TEMPLATES_DIR}" ]] || fail "missing templates directory: ${TEMPLATES_DIR}"
   [[ -f "${TEMPLATES_DIR}/kustomization.yaml" ]] || fail "missing template: ${TEMPLATES_DIR}/kustomization.yaml"

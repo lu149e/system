@@ -9,6 +9,7 @@ mod observability;
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use adapters::{
@@ -17,25 +18,29 @@ use adapters::{
     outbox::{OutboxDispatcher, OutboxTransactionalEmailSender, OutboxWorkerConfig},
     postgres::PostgresAdapters,
     redis::RedisLoginAbuseProtector,
+    risk::{AllowAllLoginRiskAnalyzer, ConfigurableLoginRiskAnalyzer},
 };
 use anyhow::Context;
 use axum::{
+    middleware,
     routing::{delete, get, post},
     Router,
 };
-use config::{AppConfig, AuthRuntime, EmailDeliveryMode, EmailProviderConfig};
+use config::{AppConfig, AuthRuntime, EmailDeliveryMode, EmailProviderConfig, LoginRiskMode};
 use ipnet::IpNet;
 use modules::auth::application::AuthService;
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tower_http::{request_id::MakeRequestUuid, trace::TraceLayer};
 use tracing::info;
+use webauthn_rs::prelude::{Url, Webauthn, WebauthnBuilder};
 
 #[derive(Clone)]
 pub struct AppState {
     pub auth_service: Arc<AuthService>,
     pub jwks: jwks::JwksDocument,
     pub readiness_checker: Arc<dyn health::ReadinessChecker>,
+    pub enforce_secure_transport: bool,
     pub metrics_bearer_token: Option<String>,
     pub metrics_allowed_cidrs: Vec<IpNet>,
     pub trust_x_forwarded_for: bool,
@@ -128,6 +133,10 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = AppConfig::from_env()?;
     observability::configure_email_metrics(cfg.email_metrics_latency_enabled);
+    observability::set_passkey_challenge_janitor_enabled(cfg.passkey_enabled);
+    observability::set_passkey_challenge_prune_interval_seconds(
+        cfg.passkey_challenge_prune_interval_seconds,
+    );
     let jwks_inputs = cfg
         .jwt_keys
         .iter()
@@ -156,6 +165,14 @@ async fn main() -> anyhow::Result<()> {
         EmailProviderConfig::Noop => "noop".to_string(),
         EmailProviderConfig::SendGrid(_) => "sendgrid".to_string(),
     };
+    let passkey_challenge_janitor_interval =
+        Duration::from_secs(cfg.passkey_challenge_prune_interval_seconds);
+    let passkey_challenge_janitor_health = Arc::new(health::PasskeyChallengeJanitorHealth::new(
+        cfg.passkey_enabled,
+        passkey_challenge_janitor_interval
+            .checked_mul(3)
+            .unwrap_or(passkey_challenge_janitor_interval),
+    ));
 
     let (
         users,
@@ -165,6 +182,8 @@ async fn main() -> anyhow::Result<()> {
         mfa_factors,
         mfa_challenges,
         mfa_backup_codes,
+        passkeys,
+        passkey_challenges,
         sessions,
         refresh_tokens,
         audit,
@@ -190,6 +209,7 @@ async fn main() -> anyhow::Result<()> {
                 pg.pool.clone(),
                 Some(redis.health_client()),
                 std::time::Duration::from_secs(2),
+                Arc::clone(&passkey_challenge_janitor_health),
             );
             let outbox_repository = Arc::new(pg.email_outbox.clone())
                 as Arc<dyn modules::auth::ports::EmailOutboxRepository>;
@@ -227,6 +247,9 @@ async fn main() -> anyhow::Result<()> {
                     as Arc<dyn modules::auth::ports::MfaChallengeRepository>,
                 Arc::new(pg.mfa_backup_codes)
                     as Arc<dyn modules::auth::ports::MfaBackupCodeRepository>,
+                Arc::new(pg.passkeys) as Arc<dyn modules::auth::ports::PasskeyCredentialRepository>,
+                Arc::new(pg.passkey_challenges)
+                    as Arc<dyn modules::auth::ports::PasskeyChallengeRepository>,
                 Arc::new(pg.sessions) as Arc<dyn modules::sessions::ports::SessionRepository>,
                 Arc::new(pg.refresh_tokens)
                     as Arc<dyn modules::tokens::ports::RefreshTokenRepository>,
@@ -238,7 +261,9 @@ async fn main() -> anyhow::Result<()> {
         }
         AuthRuntime::InMemory => {
             let adapters = InMemoryAdapters::bootstrap(&cfg)?;
-            let readiness_checker = health::RuntimeReadinessChecker::inmemory();
+            let readiness_checker = health::RuntimeReadinessChecker::inmemory(Arc::clone(
+                &passkey_challenge_janitor_health,
+            ));
             (
                 Arc::new(adapters.users) as Arc<dyn modules::auth::ports::UserRepository>,
                 Arc::new(adapters.login_abuse)
@@ -253,6 +278,10 @@ async fn main() -> anyhow::Result<()> {
                     as Arc<dyn modules::auth::ports::MfaChallengeRepository>,
                 Arc::new(adapters.mfa_backup_codes)
                     as Arc<dyn modules::auth::ports::MfaBackupCodeRepository>,
+                Arc::new(adapters.passkeys)
+                    as Arc<dyn modules::auth::ports::PasskeyCredentialRepository>,
+                Arc::new(adapters.passkey_challenges)
+                    as Arc<dyn modules::auth::ports::PasskeyChallengeRepository>,
                 Arc::new(adapters.sessions) as Arc<dyn modules::sessions::ports::SessionRepository>,
                 Arc::new(adapters.refresh_tokens)
                     as Arc<dyn modules::tokens::ports::RefreshTokenRepository>,
@@ -276,14 +305,35 @@ async fn main() -> anyhow::Result<()> {
         direct_email_sender.clone()
     };
 
+    let login_risk_analyzer = match cfg.login_risk_mode {
+        LoginRiskMode::AllowAll => {
+            Arc::new(AllowAllLoginRiskAnalyzer) as Arc<dyn modules::auth::ports::LoginRiskAnalyzer>
+        }
+        LoginRiskMode::Baseline => Arc::new(ConfigurableLoginRiskAnalyzer::new(
+            cfg.login_risk_blocked_cidrs.clone(),
+            cfg.login_risk_blocked_user_agent_substrings.clone(),
+            cfg.login_risk_blocked_email_domains.clone(),
+            cfg.login_risk_challenge_cidrs.clone(),
+            cfg.login_risk_challenge_user_agent_substrings.clone(),
+            cfg.login_risk_challenge_email_domains.clone(),
+        )) as Arc<dyn modules::auth::ports::LoginRiskAnalyzer>,
+    };
+
+    let passkey_webauthn = build_passkey_webauthn(&cfg)?;
+    let passkey_challenge_janitor_repository = Arc::clone(&passkey_challenges);
+    let passkey_challenge_janitor_health_for_worker = Arc::clone(&passkey_challenge_janitor_health);
+
     let auth_service = Arc::new(AuthService::new(
         users,
         login_abuse,
+        login_risk_analyzer,
         verification_tokens,
         password_reset_tokens,
         mfa_factors,
         mfa_challenges,
         mfa_backup_codes,
+        passkeys,
+        passkey_challenges,
         sessions,
         refresh_tokens,
         audit,
@@ -298,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.mfa_challenge_max_attempts,
         cfg.mfa_totp_issuer,
         cfg.mfa_encryption_key,
+        passkey_webauthn,
         cfg.jwt_issuer,
         cfg.jwt_audience,
     )?);
@@ -306,6 +357,7 @@ async fn main() -> anyhow::Result<()> {
         auth_service,
         jwks,
         readiness_checker,
+        enforce_secure_transport: cfg.enforce_secure_transport,
         metrics_bearer_token: cfg.metrics_bearer_token,
         metrics_allowed_cidrs: cfg.metrics_allowed_cidrs,
         trust_x_forwarded_for: cfg.trust_x_forwarded_for,
@@ -319,6 +371,51 @@ async fn main() -> anyhow::Result<()> {
         });
         tracing::info!("email outbox dispatcher started");
     }
+
+    if cfg.passkey_enabled {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(passkey_challenge_janitor_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                ticker.tick().await;
+
+                let now = chrono::Utc::now();
+                match passkey_challenge_janitor_repository
+                    .prune_expired(now)
+                    .await
+                {
+                    Ok(pruned) => {
+                        observability::record_passkey_challenge_prune_run("success");
+                        observability::set_passkey_challenge_prune_last_success_unixtime(
+                            now.timestamp(),
+                        );
+                        passkey_challenge_janitor_health_for_worker.record_success(now);
+                        if pruned > 0 {
+                            observability::record_passkey_challenge_pruned(pruned);
+                            tracing::info!(pruned, "pruned expired passkey challenges");
+                        }
+                    }
+                    Err(error) => {
+                        observability::record_passkey_challenge_prune_run("error");
+                        observability::set_passkey_challenge_prune_last_failure_unixtime(
+                            now.timestamp(),
+                        );
+                        passkey_challenge_janitor_health_for_worker
+                            .record_failure(now, error.clone());
+                        observability::record_passkey_challenge_prune_error();
+                        tracing::warn!(error = %error, "failed to prune expired passkey challenges");
+                    }
+                }
+            }
+        });
+        tracing::info!(
+            interval_seconds = passkey_challenge_janitor_interval.as_secs(),
+            "passkey challenge janitor started"
+        );
+    }
+
+    let secure_transport_state = state.clone();
 
     let app = Router::new()
         .route("/healthz", get(api::handlers::healthz))
@@ -343,6 +440,22 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/auth/mfa/activate", post(api::handlers::mfa_activate))
         .route("/v1/auth/mfa/verify", post(api::handlers::mfa_verify))
         .route("/v1/auth/mfa/disable", post(api::handlers::mfa_disable))
+        .route(
+            "/v1/auth/passkey/register/start",
+            post(api::handlers::passkey_register_start),
+        )
+        .route(
+            "/v1/auth/passkey/register/finish",
+            post(api::handlers::passkey_register_finish),
+        )
+        .route(
+            "/v1/auth/passkey/login/start",
+            post(api::handlers::passkey_login_start),
+        )
+        .route(
+            "/v1/auth/passkey/login/finish",
+            post(api::handlers::passkey_login_finish),
+        )
         .route("/v1/auth/token/refresh", post(api::handlers::refresh))
         .route("/v1/auth/logout", post(api::handlers::logout))
         .route("/v1/auth/logout-all", post(api::handlers::logout_all))
@@ -354,6 +467,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/auth/me", get(api::handlers::me))
         .route("/metrics", get(api::handlers::metrics))
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            secure_transport_state,
+            api::security::enforce_secure_transport,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(tower_http::request_id::SetRequestIdLayer::x_request_id(
             MakeRequestUuid,
@@ -369,6 +486,29 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+fn build_passkey_webauthn(cfg: &AppConfig) -> anyhow::Result<Option<Webauthn>> {
+    if !cfg.passkey_enabled {
+        return Ok(None);
+    }
+
+    let rp_id = cfg
+        .passkey_rp_id
+        .as_deref()
+        .context("PASSKEY_RP_ID is required when PASSKEY_ENABLED=true")?;
+    let rp_origin = cfg
+        .passkey_rp_origin
+        .as_deref()
+        .context("PASSKEY_RP_ORIGIN is required when PASSKEY_ENABLED=true")?;
+    let rp_origin = Url::parse(rp_origin).context("PASSKEY_RP_ORIGIN must be a valid URL")?;
+
+    let webauthn = WebauthnBuilder::new(rp_id, &rp_origin)
+        .map_err(|_| anyhow::anyhow!("invalid passkey relying party configuration"))?
+        .build()
+        .map_err(|_| anyhow::anyhow!("invalid passkey relying party configuration"))?;
+
+    Ok(Some(webauthn))
 }
 
 #[cfg(test)]

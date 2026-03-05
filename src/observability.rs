@@ -12,6 +12,17 @@ use crate::modules::auth::application::AuthError;
 
 struct MetricsRegistry {
     registry: Registry,
+    login_risk_decisions_total: IntCounterVec,
+    passkey_requests_total: IntCounterVec,
+    passkey_login_rejected_total: IntCounterVec,
+    passkey_register_rejected_total: IntCounterVec,
+    passkey_challenge_janitor_enabled: IntGauge,
+    passkey_challenge_prune_interval_seconds: IntGauge,
+    passkey_challenge_prune_runs_total: IntCounterVec,
+    passkey_challenge_prune_last_success_unixtime: IntGauge,
+    passkey_challenge_prune_last_failure_unixtime: IntGauge,
+    passkey_challenge_pruned_total: IntCounter,
+    passkey_challenge_prune_errors_total: IntCounter,
     refresh_requests_total: IntCounterVec,
     refresh_rejected_total: IntCounterVec,
     refresh_duration_seconds: HistogramVec,
@@ -41,6 +52,87 @@ impl MetricsRegistry {
             &["outcome"],
         )
         .expect("refresh requests metric should initialize");
+
+        let login_risk_decisions_total = IntCounterVec::new(
+            Opts::new(
+                "auth_login_risk_decisions_total",
+                "Total login risk engine decisions partitioned by decision and reason",
+            ),
+            &["decision", "reason"],
+        )
+        .expect("login risk decisions metric should initialize");
+
+        let passkey_requests_total = IntCounterVec::new(
+            Opts::new(
+                "auth_passkey_requests_total",
+                "Total passkey API requests partitioned by operation and outcome",
+            ),
+            &["operation", "outcome"],
+        )
+        .expect("passkey requests metric should initialize");
+
+        let passkey_login_rejected_total = IntCounterVec::new(
+            Opts::new(
+                "auth_passkey_login_rejected_total",
+                "Total passkey login rejections partitioned by reason",
+            ),
+            &["reason"],
+        )
+        .expect("passkey login rejected metric should initialize");
+
+        let passkey_register_rejected_total = IntCounterVec::new(
+            Opts::new(
+                "auth_passkey_register_rejected_total",
+                "Total passkey registration rejections partitioned by reason",
+            ),
+            &["reason"],
+        )
+        .expect("passkey register rejected metric should initialize");
+
+        let passkey_challenge_janitor_enabled = IntGauge::new(
+            "auth_passkey_challenge_janitor_enabled",
+            "Whether passkey challenge janitor is enabled (1=true, 0=false)",
+        )
+        .expect("passkey challenge janitor enabled metric should initialize");
+
+        let passkey_challenge_prune_interval_seconds = IntGauge::new(
+            "auth_passkey_challenge_prune_interval_seconds",
+            "Configured passkey challenge janitor prune interval in seconds",
+        )
+        .expect("passkey challenge prune interval metric should initialize");
+
+        let passkey_challenge_prune_runs_total = IntCounterVec::new(
+            Opts::new(
+                "auth_passkey_challenge_prune_runs_total",
+                "Total janitor prune runs partitioned by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("passkey challenge prune runs metric should initialize");
+
+        let passkey_challenge_prune_last_success_unixtime = IntGauge::new(
+            "auth_passkey_challenge_prune_last_success_unixtime",
+            "Unix timestamp (seconds) of the last successful passkey challenge prune run",
+        )
+        .expect("passkey challenge prune last success metric should initialize");
+
+        let passkey_challenge_prune_last_failure_unixtime = IntGauge::new(
+            "auth_passkey_challenge_prune_last_failure_unixtime",
+            "Unix timestamp (seconds) of the last failed passkey challenge prune run",
+        )
+        .expect("passkey challenge prune last failure metric should initialize");
+
+        let passkey_challenge_pruned_total = IntCounter::new(
+            "auth_passkey_challenge_pruned_total",
+            "Total expired passkey challenges pruned by background janitor",
+        )
+        .expect("passkey challenge pruned metric should initialize");
+
+        let passkey_challenge_prune_errors_total = IntCounter::new(
+            "auth_passkey_challenge_prune_errors_total",
+            "Total passkey challenge janitor prune failures",
+        )
+        .expect("passkey challenge prune errors metric should initialize");
 
         let refresh_rejected_total = IntCounterVec::new(
             Opts::new(
@@ -155,6 +247,43 @@ impl MetricsRegistry {
         .expect("email outbox claim failures metric should initialize");
 
         registry
+            .register(Box::new(login_risk_decisions_total.clone()))
+            .expect("login risk decisions metric should register");
+        registry
+            .register(Box::new(passkey_requests_total.clone()))
+            .expect("passkey requests metric should register");
+        registry
+            .register(Box::new(passkey_login_rejected_total.clone()))
+            .expect("passkey login rejected metric should register");
+        registry
+            .register(Box::new(passkey_register_rejected_total.clone()))
+            .expect("passkey register rejected metric should register");
+        registry
+            .register(Box::new(passkey_challenge_janitor_enabled.clone()))
+            .expect("passkey challenge janitor enabled metric should register");
+        registry
+            .register(Box::new(passkey_challenge_prune_interval_seconds.clone()))
+            .expect("passkey challenge prune interval metric should register");
+        registry
+            .register(Box::new(passkey_challenge_prune_runs_total.clone()))
+            .expect("passkey challenge prune runs metric should register");
+        registry
+            .register(Box::new(
+                passkey_challenge_prune_last_success_unixtime.clone(),
+            ))
+            .expect("passkey challenge prune last success metric should register");
+        registry
+            .register(Box::new(
+                passkey_challenge_prune_last_failure_unixtime.clone(),
+            ))
+            .expect("passkey challenge prune last failure metric should register");
+        registry
+            .register(Box::new(passkey_challenge_pruned_total.clone()))
+            .expect("passkey challenge pruned metric should register");
+        registry
+            .register(Box::new(passkey_challenge_prune_errors_total.clone()))
+            .expect("passkey challenge prune errors metric should register");
+        registry
             .register(Box::new(refresh_requests_total.clone()))
             .expect("refresh requests metric should register");
         registry
@@ -202,6 +331,17 @@ impl MetricsRegistry {
 
         Self {
             registry,
+            login_risk_decisions_total,
+            passkey_requests_total,
+            passkey_login_rejected_total,
+            passkey_register_rejected_total,
+            passkey_challenge_janitor_enabled,
+            passkey_challenge_prune_interval_seconds,
+            passkey_challenge_prune_runs_total,
+            passkey_challenge_prune_last_success_unixtime,
+            passkey_challenge_prune_last_failure_unixtime,
+            passkey_challenge_pruned_total,
+            passkey_challenge_prune_errors_total,
             refresh_requests_total,
             refresh_rejected_total,
             refresh_duration_seconds,
@@ -239,6 +379,77 @@ pub fn record_refresh_success(duration: Duration) {
         .refresh_duration_seconds
         .with_label_values(&["success"])
         .observe(duration.as_secs_f64());
+}
+
+pub fn record_login_risk_decision(decision: &str, reason: &str) {
+    metrics()
+        .login_risk_decisions_total
+        .with_label_values(&[decision, reason])
+        .inc();
+}
+
+pub fn record_passkey_request(operation: &str, outcome: &str) {
+    metrics()
+        .passkey_requests_total
+        .with_label_values(&[operation, outcome])
+        .inc();
+}
+
+pub fn record_passkey_login_rejected(reason: &str) {
+    metrics()
+        .passkey_login_rejected_total
+        .with_label_values(&[normalize_passkey_login_rejection_reason(reason)])
+        .inc();
+}
+
+pub fn record_passkey_register_rejected(reason: &str) {
+    metrics()
+        .passkey_register_rejected_total
+        .with_label_values(&[normalize_passkey_register_rejection_reason(reason)])
+        .inc();
+}
+
+pub fn set_passkey_challenge_janitor_enabled(enabled: bool) {
+    metrics()
+        .passkey_challenge_janitor_enabled
+        .set(if enabled { 1 } else { 0 });
+}
+
+pub fn set_passkey_challenge_prune_interval_seconds(interval_seconds: u64) {
+    metrics()
+        .passkey_challenge_prune_interval_seconds
+        .set(interval_seconds as i64);
+}
+
+pub fn record_passkey_challenge_prune_run(outcome: &str) {
+    metrics()
+        .passkey_challenge_prune_runs_total
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+pub fn set_passkey_challenge_prune_last_success_unixtime(unix_time_seconds: i64) {
+    metrics()
+        .passkey_challenge_prune_last_success_unixtime
+        .set(unix_time_seconds);
+}
+
+pub fn set_passkey_challenge_prune_last_failure_unixtime(unix_time_seconds: i64) {
+    metrics()
+        .passkey_challenge_prune_last_failure_unixtime
+        .set(unix_time_seconds);
+}
+
+pub fn record_passkey_challenge_pruned(pruned: u64) {
+    if pruned == 0 {
+        return;
+    }
+
+    metrics().passkey_challenge_pruned_total.inc_by(pruned);
+}
+
+pub fn record_passkey_challenge_prune_error() {
+    metrics().passkey_challenge_prune_errors_total.inc();
 }
 
 pub fn record_refresh_error(error: &AuthError, duration: Duration) {
@@ -380,14 +591,40 @@ fn refresh_error_reason(error: &AuthError) -> &'static str {
     }
 }
 
+fn normalize_passkey_login_rejection_reason(reason: &str) -> &'static str {
+    match reason {
+        "invalid_or_expired_challenge" => "invalid_or_expired_challenge",
+        "account_not_active" => "account_not_active",
+        "passkey_not_registered" => "passkey_not_registered",
+        "invalid_passkey_response" => "invalid_passkey_response",
+        _ => "other",
+    }
+}
+
+fn normalize_passkey_register_rejection_reason(reason: &str) -> &'static str {
+    match reason {
+        "account_not_active" => "account_not_active",
+        "invalid_or_expired_challenge" => "invalid_or_expired_challenge",
+        "challenge_user_mismatch" => "challenge_user_mismatch",
+        "invalid_passkey_response" => "invalid_passkey_response",
+        _ => "other",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         configure_email_metrics, record_email_delivery, record_email_outbox_claim_failure,
         record_email_outbox_claim_poll, record_email_outbox_dispatch, record_email_retry_intensity,
+        record_login_risk_decision, record_passkey_challenge_prune_error,
+        record_passkey_challenge_prune_run, record_passkey_challenge_pruned,
+        record_passkey_login_rejected, record_passkey_register_rejected, record_passkey_request,
         record_problem_response, record_refresh_error, record_refresh_success, render_prometheus,
         set_email_outbox_oldest_due_age_seconds, set_email_outbox_oldest_pending_age_seconds,
-        set_email_outbox_queue_depth,
+        set_email_outbox_queue_depth, set_passkey_challenge_janitor_enabled,
+        set_passkey_challenge_prune_interval_seconds,
+        set_passkey_challenge_prune_last_failure_unixtime,
+        set_passkey_challenge_prune_last_success_unixtime,
     };
     use crate::modules::auth::application::AuthError;
 
@@ -399,6 +636,21 @@ mod tests {
             &AuthError::RefreshReuseDetected,
             std::time::Duration::from_millis(5),
         );
+        record_login_risk_decision("block", "blocked_source_ip");
+        record_passkey_request("login_finish", "success");
+        record_passkey_login_rejected("invalid_passkey_response");
+        record_passkey_login_rejected("unexpected_future_reason");
+        record_passkey_register_rejected("invalid_or_expired_challenge");
+        record_passkey_register_rejected("challenge_user_mismatch");
+        record_passkey_register_rejected("future_register_reason");
+        set_passkey_challenge_janitor_enabled(true);
+        set_passkey_challenge_prune_interval_seconds(60);
+        record_passkey_challenge_prune_run("success");
+        set_passkey_challenge_prune_last_success_unixtime(1_700_000_000);
+        record_passkey_challenge_pruned(2);
+        record_passkey_challenge_prune_run("error");
+        set_passkey_challenge_prune_last_failure_unixtime(1_700_000_030);
+        record_passkey_challenge_prune_error();
         record_problem_response(429, "https://example.com/problems/login-locked");
         record_email_delivery(
             "sendgrid",
@@ -417,6 +669,17 @@ mod tests {
         let payload = render_prometheus().expect("metrics payload should be rendered");
 
         assert!(payload.contains("auth_refresh_requests_total"));
+        assert!(payload.contains("auth_login_risk_decisions_total"));
+        assert!(payload.contains("auth_passkey_requests_total"));
+        assert!(payload.contains("auth_passkey_login_rejected_total"));
+        assert!(payload.contains("auth_passkey_register_rejected_total"));
+        assert!(payload.contains("auth_passkey_challenge_janitor_enabled"));
+        assert!(payload.contains("auth_passkey_challenge_prune_interval_seconds"));
+        assert!(payload.contains("auth_passkey_challenge_prune_runs_total"));
+        assert!(payload.contains("auth_passkey_challenge_prune_last_success_unixtime"));
+        assert!(payload.contains("auth_passkey_challenge_prune_last_failure_unixtime"));
+        assert!(payload.contains("auth_passkey_challenge_pruned_total"));
+        assert!(payload.contains("auth_passkey_challenge_prune_errors_total"));
         assert!(payload.contains("auth_refresh_rejected_total"));
         assert!(payload.contains("auth_refresh_duration_seconds"));
         assert!(payload.contains("auth_problem_responses_total"));
@@ -434,5 +697,10 @@ mod tests {
         assert!(payload.contains("reason=\"refresh_reuse_detected\""));
         assert!(payload.contains("status=\"429\""));
         assert!(payload.contains("provider=\"sendgrid\""));
+        assert!(payload.contains("reason=\"blocked_source_ip\""));
+        assert!(payload.contains("reason=\"invalid_passkey_response\""));
+        assert!(payload.contains("reason=\"other\""));
+        assert!(payload.contains("reason=\"invalid_or_expired_challenge\""));
+        assert!(payload.contains("reason=\"challenge_user_mismatch\""));
     }
 }

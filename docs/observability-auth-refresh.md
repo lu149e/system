@@ -5,6 +5,9 @@ Este documento define una linea base para dashboards y alertas sobre:
 - `auth.refresh.reuse_detected`
 - `auth.refresh.rejected` (especialmente `reason=token_rotation_error`)
 - picos de `429` en autenticacion
+- picos y ratio alto de decisiones `block` del motor de riesgo de login
+- outcomes de ceremonias passkey (`challenge.issued`, `success`, `rejected`, incluido `auth.passkey.login.rejected`)
+- step-up MFA disparado por riesgo (`auth.mfa.challenge.issued` con `risk_reason`)
 - picos de `403` en `/metrics` por politica de acceso (`metrics-access-denied`)
 - picos de `401` en `/metrics` por bearer faltante/invalido (`metrics-auth-required`)
 
@@ -29,8 +32,19 @@ Se puede implementar con Prometheus (si ya existen metricas) o con consultas sob
   - `GET /metrics`
   - si `METRICS_BEARER_TOKEN` o `METRICS_BEARER_TOKEN_FILE` estan configurados, incluir header `Authorization: Bearer <token>` desde Prometheus
   - si `METRICS_ALLOWED_CIDRS` esta configurado, la IP origen del scraper debe pertenecer a esos rangos
-  - metricas incluidas para refresh:
+  - metricas incluidas para auth runtime:
     - `auth_refresh_requests_total{outcome=success|error}`
+    - `auth_login_risk_decisions_total{decision=allow|block, reason=...}`
+    - `auth_passkey_requests_total{operation=register_start|register_finish|login_start|login_finish, outcome=success|error}`
+    - `auth_passkey_login_rejected_total{reason=...}`
+    - `auth_passkey_register_rejected_total{reason=...}`
+    - `auth_passkey_challenge_janitor_enabled`
+    - `auth_passkey_challenge_prune_interval_seconds`
+    - `auth_passkey_challenge_prune_runs_total{outcome=success|error}`
+    - `auth_passkey_challenge_prune_last_success_unixtime`
+    - `auth_passkey_challenge_prune_last_failure_unixtime`
+    - `auth_passkey_challenge_pruned_total`
+    - `auth_passkey_challenge_prune_errors_total`
     - `auth_refresh_rejected_total{reason=...}`
     - `auth_refresh_duration_seconds{outcome=success|error}`
     - `auth_problem_responses_total{status=..., type=...}`
@@ -103,6 +117,18 @@ scrape_configs:
     - promedio de claims por poll y reclamos tras expiracion para detectar workers trabados o lease tuning agresivo.
 13. **Claim failures de outbox (ventana 10m)**
     - `sum(increase(auth_email_outbox_claim_failures_total[10m]))` para detectar fallos sostenidos de query/claim aunque el worker siga vivo.
+14. **Eventos de ceremonia passkey por tipo**
+    - `auth.passkey.register.challenge.issued`, `auth.passkey.register.success`, `auth.passkey.register.rejected`, `auth.passkey.login.challenge.issued`, `auth.passkey.login.success`, `auth.passkey.login.rejected`.
+15. **Rechazos de registro passkey por reason**
+    - desglose de `metadata.reason` en `auth.passkey.register.rejected` para separar policy (`account_not_active`) de fallos de cliente.
+16. **MFA challenges por `risk_reason`**
+    - distinguir challenges por riesgo real vs challenges normales (`risk_reason` ausente) para tuning de policy.
+17. **Passkey login rejected por reason (runtime metric)**
+    - `sum by (reason) (rate(auth_passkey_login_rejected_total[5m]))` para detectar rapidamente si domina `invalid_or_expired_challenge` (friccion/TTL) o `invalid_passkey_response` (regresion cliente/WebAuthn).
+18. **Passkey login rejected por reason (audit SQL)**
+    - `event_type='auth.passkey.login.rejected'` agrupado por `metadata.reason` para correlacion operacional/forense por minuto.
+19. **Passkey register rejected por reason (runtime metric)**
+    - `sum by (reason) (rate(auth_passkey_register_rejected_total[5m]))` para detectar drift de challenge (`invalid_or_expired_challenge`), mismatch (`challenge_user_mismatch`) o regresiones cliente (`invalid_passkey_response`).
 
 ## Umbrales iniciales (accionables)
 
@@ -117,6 +143,18 @@ scrape_configs:
   - `internal / refresh_total >= 2%` durante 10 minutos.
 - **Alerta WARNING - lockout agresivo / friccion UX**
   - `429` en login/auth por encima de baseline + 3 desviaciones por 15 minutos.
+- **Alerta WARNING - bloqueos de riesgo de login anormalmente altos**
+  - `sum(increase(auth_login_risk_decisions_total{decision="block"}[10m])) >= 50`, o
+  - `auth:login_risk_block_ratio_10m >= 10%` durante 10 minutos.
+- **Alerta WARNING - rechazo elevado de passkey login**
+  - `auth:passkey_login_rejected_ratio_10m >= 20%` por 10m con `>= 20` requests `login_finish`.
+- **Alerta WARNING - rechazo elevado de passkey register finish**
+  - `auth:passkey_register_rejected_ratio_10m >= 25%` por 10m con `>= 10` requests `register_finish`.
+- **Alerta WARNING - pico de mismatch user/flow en passkey register**
+  - `challenge_user_mismatch >= 5` en 10m.
+- **Alerta WARNING - pico de passkey login por reason critica**
+  - `invalid_passkey_response >= 10` en 10m, o
+  - `invalid_or_expired_challenge >= 20` en 10m.
 - **Alerta WARNING - sondeo/bloqueo en endpoint de metricas**
   - `metrics-access-denied >= 20` en 15 minutos.
 - **Alerta WARNING - autenticacion fallida en endpoint de metricas**
@@ -209,6 +247,18 @@ ORDER BY 1;
 - `AuthRefreshInternalErrorBurst` (warning): revisar salud de infraestructura auth (DB, pool, timeouts, errores de transaccion) antes de ajustar logica de autenticacion.
 - `AuthRefreshInternalErrorRatioHigh` (critical): escalar a incidente de disponibilidad; habilitar mitigaciones (degradar paths no criticos, proteger capacidad DB) y comunicar impacto a on-call.
 - `AuthLoginLocked429Spike` (warning): validar que no haya regresion de anti-abuso; recalibrar umbrales de lockout para reducir friccion sin bajar proteccion.
+- `AuthLoginRiskBlockSpike` (warning): investigar si hay ataque activo o reglas demasiado agresivas; revisar `reason` dominante (`blocked_source_ip`, `blocked_user_agent`, `blocked_email_domain`) antes de ajustar policy.
+- `AuthLoginRiskBlockRatioHigh` (warning): tratar como degradacion de UX/precision del motor de riesgo; validar falsos positivos y definir rollback parcial de reglas si compromete conversion legitima.
+- `AuthPasskeyErrorRatioHigh` (warning): revisar configuracion `PASSKEY_RP_ID`/`PASSKEY_RP_ORIGIN`, reloj de nodos, persistencia de `passkey_challenges` y eventos de rechazo (`invalid_passkey_*`) para aislar si es regresion de app o cambio de cliente/browser.
+- `AuthPasskeyLoginRejectedRatioHigh` (warning): revisar distribucion por `reason` en `auth_passkey_login_rejected_total`; si domina `invalid_or_expired_challenge`, priorizar estado/TTL/sincronizacion; si domina `invalid_passkey_response`, priorizar regresion cliente/WebAuthn.
+- `AuthPasskeyLoginRejectedInvalidResponseSpike` (warning): validar cambios recientes en cliente/browser WebAuthn, formatos de payload y compatibilidad de ceremonias en `login_finish`.
+- `AuthPasskeyLoginRejectedInvalidOrExpiredChallengeSpike` (warning): validar caducidad real de challenge, retrasos UX entre start/finish y posibles perdidas de estado entre nodos.
+- `AuthPasskeyRegisterRejectedRatioHigh` (warning): revisar `auth_passkey_register_rejected_total` por `reason`; si domina `challenge_user_mismatch`, validar correlacion de identidad/flow, si domina `invalid_passkey_response`, investigar regresiones de cliente en registro.
+- `AuthPasskeyRegisterRejectedInvalidResponseSpike` (warning): validar cambios recientes de cliente/browser WebAuthn durante registro y compatibilidad de payload `register_finish`.
+- `AuthPasskeyRegisterRejectedChallengeMismatchSpike` (warning): revisar sesiones cruzadas, consistencia `flow_id`-usuario en frontend y posibles condiciones de carrera en tabs/dispositivos durante registro.
+- `AuthPasskeyChallengePruneErrorsSustained` (warning): revisar logs del janitor de passkey, conectividad/transacciones contra DB y saturacion de locks; si persiste, ejecutar poda manual controlada sobre `passkey_challenges` por `expires_at <= now()`.
+- `AuthPasskeyChallengePruneHeartbeatMissing` (warning): validar que el janitor este habilitado/ejecutando en pods (`auth_passkey_challenge_janitor_enabled=1`) y que existan corridas `success` en `auth_passkey_challenge_prune_runs_total`; si no, revisar scheduler loop, runtime stalls y salud DB.
+- `AuthPasskeyChallengePruneHeartbeatStale` (warning): revisar `auth:passkey_prune_last_success_age_seconds` versus `auth_passkey_challenge_prune_interval_seconds`; si supera 3x sostenido, investigar stalls parciales del loop aun cuando no haya errores explícitos.
 - `AuthMetricsAccessDeniedSpike` (warning): confirmar CIDRs permitidos y origen real del scraper (directo/proxy); investigar sondeo externo si no corresponde a scrapers legitimos.
 - `AuthMetricsAuthRequiredSpike` (warning): rotar/validar bearer token del scraper, revisar expiracion/secrets mount y descartar intentos de acceso sin credenciales.
 - `AuthEmailFailureRatioSustained` (warning): validar estado del proveedor (API/status page), credenciales y quotas; revisar codigos de respuesta upstream y decidir failover/cola de contingencia.

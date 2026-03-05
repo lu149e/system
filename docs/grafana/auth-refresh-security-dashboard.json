@@ -206,12 +206,168 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  count(*) FILTER (WHERE event_type = 'auth.refresh.reuse_detected') AS reuse_last_15m,\n  count(*) FILTER (WHERE event_type = 'auth.refresh.rejected' AND metadata->>'reason' = 'token_rotation_error') AS rotation_error_last_15m,\n  count(*) FILTER (WHERE event_type = 'auth.login.locked') AS login_locked_last_15m\nFROM audit_events\nWHERE created_at >= now() - interval '15 minutes';",
+          "rawSql": "SELECT\n  count(*) FILTER (WHERE event_type = 'auth.refresh.reuse_detected') AS reuse_last_15m,\n  count(*) FILTER (WHERE event_type = 'auth.refresh.rejected' AND metadata->>'reason' = 'token_rotation_error') AS rotation_error_last_15m,\n  count(*) FILTER (WHERE event_type = 'auth.login.locked') AS login_locked_last_15m,\n  count(*) FILTER (WHERE event_type = 'auth.passkey.login.success') AS passkey_login_success_last_15m,\n  count(*) FILTER (WHERE event_type = 'auth.passkey.login.rejected') AS passkey_login_rejected_last_15m,\n  count(*) FILTER (WHERE event_type = 'auth.passkey.register.success') AS passkey_register_success_last_15m,\n  count(*) FILTER (WHERE event_type = 'auth.passkey.register.rejected') AS passkey_register_rejected_last_15m,\n  count(*) FILTER (WHERE event_type = 'auth.mfa.challenge.issued' AND COALESCE(metadata->>'risk_reason', '') <> '') AS risk_step_up_mfa_last_15m\nFROM audit_events\nWHERE created_at >= now() - interval '15 minutes';",
           "refId": "A"
         }
       ],
       "title": "Current 15m Snapshot",
       "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('minute', created_at) AS \"time\",\n       event_type AS \"metric\",\n       count(*)::double precision AS \"value\"\nFROM audit_events\nWHERE event_type IN (\n  'auth.passkey.register.challenge.issued',\n  'auth.passkey.register.success',\n  'auth.passkey.register.rejected',\n  'auth.passkey.login.challenge.issued',\n  'auth.passkey.login.success',\n  'auth.passkey.login.rejected'\n)\n  AND $__timeFilter(created_at)\nGROUP BY 1, 2\nORDER BY 1, 2;",
+          "refId": "A"
+        }
+      ],
+      "title": "Passkey Ceremony Events by Type",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('minute', created_at) AS \"time\",\n       COALESCE(metadata->>'reason', 'unknown') AS \"metric\",\n       count(*)::double precision AS \"value\"\nFROM audit_events\nWHERE event_type = 'auth.passkey.register.rejected'\n  AND $__timeFilter(created_at)\nGROUP BY 1, 2\nORDER BY 1, 2;",
+          "refId": "A"
+        }
+      ],
+      "title": "Passkey Register Rejected by Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('minute', created_at) AS \"time\",\n       CASE\n         WHEN COALESCE(metadata->>'risk_reason', '') = '' THEN 'no_risk_reason'\n         ELSE metadata->>'risk_reason'\n       END AS \"metric\",\n       count(*)::double precision AS \"value\"\nFROM audit_events\nWHERE event_type = 'auth.mfa.challenge.issued'\n  AND $__timeFilter(created_at)\nGROUP BY 1, 2\nORDER BY 1, 2;",
+          "refId": "A"
+        }
+      ],
+      "title": "MFA Challenges by Risk Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "postgres",
+        "uid": "${DS_POSTGRES}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 38
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('minute', created_at) AS \"time\",\n       COALESCE(metadata->>'reason', 'unknown') AS \"metric\",\n       count(*)::double precision AS \"value\"\nFROM audit_events\nWHERE event_type = 'auth.passkey.login.rejected'\n  AND $__timeFilter(created_at)\nGROUP BY 1, 2\nORDER BY 1, 2;",
+          "refId": "A"
+        }
+      ],
+      "title": "Passkey Login Rejected by Reason",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",
@@ -233,6 +389,6 @@
   "timezone": "browser",
   "title": "Auth Refresh Security",
   "uid": "auth-refresh-security",
-  "version": 1,
+  "version": 4,
   "weekStart": ""
 }

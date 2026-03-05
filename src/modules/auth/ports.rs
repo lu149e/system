@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use webauthn_rs::prelude::{Passkey, PasskeyAuthentication, PasskeyRegistration};
 
 use crate::modules::auth::domain::{
     EmailOutboxMessage, EmailOutboxPayload, EmailTemplate, MfaChallengeRecord, MfaFactorRecord,
@@ -84,6 +85,25 @@ pub trait LoginAbuseProtector: Send + Sync {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoginRiskDecision {
+    Allow,
+    Block { reason: String },
+    Challenge { reason: String },
+}
+
+#[async_trait]
+pub trait LoginRiskAnalyzer: Send + Sync {
+    async fn evaluate_login(
+        &self,
+        email: &str,
+        user_id: &str,
+        source_ip: Option<&str>,
+        user_agent: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> LoginRiskDecision;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MfaChallengeLookupState {
     Active {
         user_id: String,
@@ -149,6 +169,76 @@ pub trait MfaBackupCodeRepository: Send + Sync {
         code_hash: &str,
         now: DateTime<Utc>,
     ) -> Result<MfaBackupCodeConsumeState, String>;
+}
+
+#[async_trait]
+pub trait PasskeyCredentialRepository: Send + Sync {
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<Passkey>, String>;
+    async fn upsert_for_user(
+        &self,
+        user_id: &str,
+        passkey: Passkey,
+        now: DateTime<Utc>,
+    ) -> Result<(), String>;
+}
+
+#[derive(Clone, Debug)]
+pub struct PasskeyRegistrationChallengeRecord {
+    pub user_id: String,
+    pub state: PasskeyRegistration,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PasskeyAuthenticationChallengeRecord {
+    pub user_id: String,
+    pub state: PasskeyAuthentication,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub enum PasskeyRegistrationChallengeConsumeState {
+    Active(PasskeyRegistrationChallengeRecord),
+    NotFound,
+    Expired,
+}
+
+#[derive(Clone, Debug)]
+pub enum PasskeyAuthenticationChallengeConsumeState {
+    Active(PasskeyAuthenticationChallengeRecord),
+    NotFound,
+    Expired,
+}
+
+#[async_trait]
+pub trait PasskeyChallengeRepository: Send + Sync {
+    async fn issue_registration(
+        &self,
+        flow_id: &str,
+        challenge: PasskeyRegistrationChallengeRecord,
+    ) -> Result<(), String>;
+
+    async fn consume_registration(
+        &self,
+        flow_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<PasskeyRegistrationChallengeConsumeState, String>;
+
+    async fn issue_authentication(
+        &self,
+        flow_id: &str,
+        challenge: PasskeyAuthenticationChallengeRecord,
+    ) -> Result<(), String>;
+
+    async fn consume_authentication(
+        &self,
+        flow_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<PasskeyAuthenticationChallengeConsumeState, String>;
+
+    async fn prune_expired(&self, now: DateTime<Utc>) -> Result<u64, String>;
 }
 
 #[async_trait]

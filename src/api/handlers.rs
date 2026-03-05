@@ -10,14 +10,16 @@ use std::{
     net::{IpAddr, SocketAddr},
     time::Instant,
 };
+use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 
 use crate::{
     api::problem::{from_auth_error, ApiProblem, ProblemDetails},
     health::ComponentState,
     modules::auth::application::{
         AuthError, LoginCommand, LoginResult, LogoutCommand, MfaActivateCommand, MfaDisableCommand,
-        MfaVerifyCommand, PasswordChangeCommand, PasswordForgotCommand, PasswordResetCommand,
-        Principal, RefreshCommand, RegisterCommand, RequestContext, VerifyEmailCommand,
+        MfaVerifyCommand, PasskeyChallenge, PasswordChangeCommand, PasswordForgotCommand,
+        PasswordResetCommand, Principal, RefreshCommand, RegisterCommand, RequestContext,
+        VerifyEmailCommand,
     },
     observability, AppState,
 };
@@ -68,6 +70,30 @@ pub struct MfaDisableRequest {
     pub current_password: String,
     pub totp_code: Option<String>,
     pub backup_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasskeyLoginStartRequest {
+    pub email: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasskeyRegisterFinishRequest {
+    pub flow_id: String,
+    pub credential: RegisterPublicKeyCredential,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasskeyLoginFinishRequest {
+    pub flow_id: String,
+    pub credential: PublicKeyCredential,
+    pub device_info: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PasskeyChallengeResponse {
+    pub flow_id: String,
+    pub options: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -495,6 +521,173 @@ pub async fn mfa_disable(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn passkey_register_start(
+    State(state): State<AppState>,
+    ConnectInfo(connect_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<PasskeyChallengeResponse>, ApiProblem> {
+    let trace_id = trace_id(&headers);
+    let principal = extract_principal(&state, &headers, trace_id.clone()).await?;
+    let ctx = request_context(
+        &headers,
+        trace_id.clone(),
+        state.trust_x_forwarded_for,
+        &state.trusted_proxy_ips,
+        &state.trusted_proxy_cidrs,
+        Some(connect_addr),
+    );
+
+    let result = state
+        .auth_service
+        .passkey_register_start(&principal.user_id, ctx)
+        .await;
+
+    let result = match result {
+        Ok(result) => {
+            observability::record_passkey_request("register_start", "success");
+            result
+        }
+        Err(err) => {
+            observability::record_passkey_request("register_start", "error");
+            return Err(from_auth_error(err, trace_id));
+        }
+    };
+
+    Ok(Json(passkey_challenge_response(result)))
+}
+
+pub async fn passkey_register_finish(
+    State(state): State<AppState>,
+    ConnectInfo(connect_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<PasskeyRegisterFinishRequest>,
+) -> Result<StatusCode, ApiProblem> {
+    let trace_id = trace_id(&headers);
+    let principal = extract_principal(&state, &headers, trace_id.clone()).await?;
+    let ctx = request_context(
+        &headers,
+        trace_id.clone(),
+        state.trust_x_forwarded_for,
+        &state.trusted_proxy_ips,
+        &state.trusted_proxy_cidrs,
+        Some(connect_addr),
+    );
+
+    let result = state
+        .auth_service
+        .passkey_register_finish(
+            &principal.user_id,
+            &payload.flow_id,
+            payload.credential,
+            ctx,
+        )
+        .await;
+
+    match result {
+        Ok(()) => observability::record_passkey_request("register_finish", "success"),
+        Err(err) => {
+            observability::record_passkey_request("register_finish", "error");
+            return Err(from_auth_error(err, trace_id));
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn passkey_login_start(
+    State(state): State<AppState>,
+    ConnectInfo(connect_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<PasskeyLoginStartRequest>,
+) -> Result<Json<PasskeyChallengeResponse>, ApiProblem> {
+    let trace_id = trace_id(&headers);
+    let ctx = request_context(
+        &headers,
+        trace_id.clone(),
+        state.trust_x_forwarded_for,
+        &state.trusted_proxy_ips,
+        &state.trusted_proxy_cidrs,
+        Some(connect_addr),
+    );
+
+    let result = state
+        .auth_service
+        .passkey_login_start(&payload.email, ctx)
+        .await;
+
+    let result = match result {
+        Ok(result) => {
+            observability::record_passkey_request("login_start", "success");
+            result
+        }
+        Err(err) => {
+            observability::record_passkey_request("login_start", "error");
+            return Err(from_auth_error(err, trace_id));
+        }
+    };
+
+    Ok(Json(passkey_challenge_response(result)))
+}
+
+pub async fn passkey_login_finish(
+    State(state): State<AppState>,
+    ConnectInfo(connect_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<PasskeyLoginFinishRequest>,
+) -> Result<Json<LoginResponse>, ApiProblem> {
+    let trace_id = trace_id(&headers);
+    let ctx = request_context(
+        &headers,
+        trace_id.clone(),
+        state.trust_x_forwarded_for,
+        &state.trusted_proxy_ips,
+        &state.trusted_proxy_cidrs,
+        Some(connect_addr),
+    );
+
+    let result = state
+        .auth_service
+        .passkey_login_finish(
+            &payload.flow_id,
+            payload.credential,
+            payload.device_info,
+            ctx,
+        )
+        .await;
+
+    let result = match result {
+        Ok(result) => {
+            observability::record_passkey_request("login_finish", "success");
+            result
+        }
+        Err(err) => {
+            observability::record_passkey_request("login_finish", "error");
+            return Err(from_auth_error(err, trace_id));
+        }
+    };
+
+    match result {
+        LoginResult::Authenticated { tokens, .. } => Ok(Json(LoginResponse {
+            access_token: Some(tokens.access_token),
+            refresh_token: Some(tokens.refresh_token),
+            token_type: Some(tokens.token_type),
+            expires_in: Some(tokens.expires_in),
+            mfa_required: false,
+            challenge_id: None,
+            message: None,
+        })),
+        LoginResult::MfaRequired(challenge) => Ok(Json(LoginResponse {
+            access_token: None,
+            refresh_token: None,
+            token_type: None,
+            expires_in: None,
+            mfa_required: true,
+            challenge_id: Some(challenge.challenge_id),
+            message: Some(challenge.message),
+        })),
+    }
+}
+
 pub async fn login(
     State(state): State<AppState>,
     ConnectInfo(connect_addr): ConnectInfo<SocketAddr>,
@@ -828,6 +1021,13 @@ fn metrics_auth_required(trace_id: String) -> ApiProblem {
     }
 }
 
+fn passkey_challenge_response(challenge: PasskeyChallenge) -> PasskeyChallengeResponse {
+    PasskeyChallengeResponse {
+        flow_id: challenge.flow_id,
+        options: challenge.options,
+    }
+}
+
 fn session_status_label(status: &crate::modules::sessions::domain::SessionStatus) -> &'static str {
     match status {
         crate::modules::sessions::domain::SessionStatus::Active => "active",
@@ -938,6 +1138,7 @@ mod tests {
     use rand::{rngs::OsRng, RngCore};
     use sha1::Sha1;
     use uuid::Uuid;
+    use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 
     use crate::{
         adapters::{
@@ -954,7 +1155,10 @@ mod tests {
         AppState,
     };
 
-    use super::{LoginRequest, MfaVerifyRequest, RefreshRequest};
+    use super::{
+        LoginRequest, MfaVerifyRequest, PasskeyLoginFinishRequest, PasskeyRegisterFinishRequest,
+        RefreshRequest,
+    };
 
     type HmacSha1 = Hmac<Sha1>;
 
@@ -992,6 +1196,10 @@ mod tests {
                             status: "ok".to_string(),
                             detail: None,
                         },
+                        passkey_challenge_janitor: crate::health::ComponentState {
+                            status: "not_configured".to_string(),
+                            detail: None,
+                        },
                     },
                 },
             }
@@ -1018,6 +1226,10 @@ mod tests {
         assert_eq!(body.0.components.app.status, "ok");
         assert_eq!(body.0.components.database.status, "not_configured");
         assert_eq!(body.0.components.redis.status, "not_configured");
+        assert_eq!(
+            body.0.components.passkey_challenge_janitor.status,
+            "not_configured"
+        );
     }
 
     #[tokio::test]
@@ -1323,6 +1535,278 @@ mod tests {
         assert!(payload.contains("auth_refresh_requests_total"));
         assert!(payload.contains("auth_refresh_rejected_total"));
         assert!(payload.contains("auth_refresh_duration_seconds"));
+    }
+
+    #[tokio::test]
+    async fn passkey_login_finish_handler_invalid_challenge_returns_problem_and_metrics() {
+        let harness = build_passkey_harness();
+
+        let rejected = super::passkey_login_finish(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-passkey-login-finish-invalid-challenge"),
+            Json(PasskeyLoginFinishRequest {
+                flow_id: "missing-passkey-flow".to_string(),
+                credential: dummy_passkey_login_credential(),
+                device_info: Some("handler-passkey-device".to_string()),
+            }),
+        )
+        .await
+        .expect_err("passkey login finish should reject invalid challenge");
+
+        assert_eq!(rejected.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            rejected.body.type_url,
+            "https://example.com/problems/invalid-passkey-challenge"
+        );
+        assert_eq!(
+            rejected.body.trace_id,
+            "handler-passkey-login-finish-invalid-challenge"
+        );
+
+        let metrics_response = match super::metrics(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-passkey-login-finish-metrics"),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(_) => panic!("metrics handler should expose runtime metrics"),
+        };
+
+        let metrics_bytes = to_bytes(metrics_response.into_body(), 1024 * 1024)
+            .await
+            .expect("metrics body should be readable");
+        let metrics_payload =
+            String::from_utf8(metrics_bytes.to_vec()).expect("metrics payload should be utf-8");
+
+        assert!(metrics_payload.contains("auth_passkey_requests_total"));
+        assert!(metrics_payload.contains("operation=\"login_finish\",outcome=\"error\""));
+        assert!(metrics_payload.contains("auth_passkey_login_rejected_total"));
+        assert!(metrics_payload.contains("reason=\"invalid_or_expired_challenge\""));
+    }
+
+    #[tokio::test]
+    async fn passkey_register_finish_handler_invalid_challenge_returns_problem_and_metrics() {
+        let harness = build_passkey_harness();
+        let login = login_success(
+            &harness,
+            "handler-passkey-register-finish-invalid-challenge-login",
+        )
+        .await;
+        let access_token = login
+            .access_token
+            .expect("login should issue access token for authenticated endpoints");
+
+        let rejected = super::passkey_register_finish(
+            State(harness.state.clone()),
+            connect_info(),
+            auth_headers(
+                "handler-passkey-register-finish-invalid-challenge",
+                &access_token,
+            ),
+            Json(PasskeyRegisterFinishRequest {
+                flow_id: "missing-passkey-register-flow".to_string(),
+                credential: dummy_passkey_register_credential(),
+            }),
+        )
+        .await
+        .expect_err("passkey register finish should reject invalid challenge");
+
+        assert_eq!(rejected.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            rejected.body.type_url,
+            "https://example.com/problems/invalid-passkey-challenge"
+        );
+
+        let metrics_response = match super::metrics(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-passkey-register-finish-metrics"),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(_) => panic!("metrics handler should expose runtime metrics"),
+        };
+
+        let metrics_bytes = to_bytes(metrics_response.into_body(), 1024 * 1024)
+            .await
+            .expect("metrics body should be readable");
+        let metrics_payload =
+            String::from_utf8(metrics_bytes.to_vec()).expect("metrics payload should be utf-8");
+
+        assert!(metrics_payload.contains("auth_passkey_requests_total"));
+        assert!(metrics_payload.contains("operation=\"register_finish\",outcome=\"error\""));
+        assert!(metrics_payload.contains("auth_passkey_register_rejected_total"));
+        assert!(metrics_payload.contains("reason=\"invalid_or_expired_challenge\""));
+    }
+
+    #[tokio::test]
+    async fn passkey_register_finish_handler_invalid_response_returns_problem_and_metrics() {
+        let harness = build_passkey_harness();
+        let login = login_success(
+            &harness,
+            "handler-passkey-register-finish-invalid-response-login",
+        )
+        .await;
+        let access_token = login
+            .access_token
+            .expect("login should issue access token for authenticated endpoints");
+
+        let start_response = match super::passkey_register_start(
+            State(harness.state.clone()),
+            connect_info(),
+            auth_headers(
+                "handler-passkey-register-start-for-invalid-response",
+                &access_token,
+            ),
+        )
+        .await
+        {
+            Ok(response) => response.0,
+            Err(_) => panic!("passkey register start should issue challenge"),
+        };
+
+        let rejected = super::passkey_register_finish(
+            State(harness.state.clone()),
+            connect_info(),
+            auth_headers(
+                "handler-passkey-register-finish-invalid-response",
+                &access_token,
+            ),
+            Json(PasskeyRegisterFinishRequest {
+                flow_id: start_response.flow_id,
+                credential: dummy_passkey_register_credential(),
+            }),
+        )
+        .await
+        .expect_err("passkey register finish should reject invalid passkey response");
+
+        assert_eq!(rejected.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            rejected.body.type_url,
+            "https://example.com/problems/invalid-passkey-response"
+        );
+
+        let metrics_response = match super::metrics(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-passkey-register-finish-invalid-response-metrics"),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(_) => panic!("metrics handler should expose runtime metrics"),
+        };
+
+        let metrics_bytes = to_bytes(metrics_response.into_body(), 1024 * 1024)
+            .await
+            .expect("metrics body should be readable");
+        let metrics_payload =
+            String::from_utf8(metrics_bytes.to_vec()).expect("metrics payload should be utf-8");
+
+        assert!(metrics_payload.contains("auth_passkey_requests_total"));
+        assert!(metrics_payload.contains("operation=\"register_finish\",outcome=\"error\""));
+        assert!(metrics_payload.contains("auth_passkey_register_rejected_total"));
+        assert!(metrics_payload.contains("reason=\"invalid_passkey_response\""));
+    }
+
+    #[tokio::test]
+    async fn passkey_login_start_handler_rejects_when_passkey_is_disabled() {
+        let harness = build_harness();
+
+        let rejected = super::passkey_login_start(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-passkey-login-start-disabled"),
+            Json(super::PasskeyLoginStartRequest {
+                email: harness.bootstrap_email.clone(),
+            }),
+        )
+        .await
+        .expect_err("passkey login start should reject when passkey is disabled");
+
+        assert_eq!(rejected.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            rejected.body.type_url,
+            "https://example.com/problems/passkey-disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn passkey_register_start_handler_rejects_when_passkey_is_disabled() {
+        let harness = build_harness();
+        let login = login_success(&harness, "handler-passkey-register-start-disabled-login").await;
+        let access_token = login
+            .access_token
+            .expect("login should issue access token for authenticated endpoints");
+
+        let rejected = super::passkey_register_start(
+            State(harness.state.clone()),
+            connect_info(),
+            auth_headers("handler-passkey-register-start-disabled", &access_token),
+        )
+        .await
+        .expect_err("passkey register start should reject when passkey is disabled");
+
+        assert_eq!(rejected.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            rejected.body.type_url,
+            "https://example.com/problems/passkey-disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn passkey_login_finish_handler_rejects_when_passkey_is_disabled() {
+        let harness = build_harness();
+
+        let rejected = super::passkey_login_finish(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-passkey-login-finish-disabled"),
+            Json(PasskeyLoginFinishRequest {
+                flow_id: "disabled-passkey-flow".to_string(),
+                credential: dummy_passkey_login_credential(),
+                device_info: Some("handler-passkey-device".to_string()),
+            }),
+        )
+        .await
+        .expect_err("passkey login finish should reject when passkey is disabled");
+
+        assert_eq!(rejected.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            rejected.body.type_url,
+            "https://example.com/problems/passkey-disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn passkey_register_finish_handler_rejects_when_passkey_is_disabled() {
+        let harness = build_harness();
+        let login = login_success(&harness, "handler-passkey-register-finish-disabled-login").await;
+        let access_token = login
+            .access_token
+            .expect("login should issue access token for authenticated endpoints");
+
+        let rejected = super::passkey_register_finish(
+            State(harness.state.clone()),
+            connect_info(),
+            auth_headers("handler-passkey-register-finish-disabled", &access_token),
+            Json(PasskeyRegisterFinishRequest {
+                flow_id: "disabled-register-flow".to_string(),
+                credential: dummy_passkey_register_credential(),
+            }),
+        )
+        .await
+        .expect_err("passkey register finish should reject when passkey is disabled");
+
+        assert_eq!(rejected.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            rejected.body.type_url,
+            "https://example.com/problems/passkey-disabled"
+        );
     }
 
     #[tokio::test]
@@ -2082,6 +2566,14 @@ mod tests {
         build_harness_from_config(cfg, None, Vec::new())
     }
 
+    fn build_passkey_harness() -> HandlerHarness {
+        let mut cfg = test_config();
+        cfg.passkey_enabled = true;
+        cfg.passkey_rp_id = Some("example.com".to_string());
+        cfg.passkey_rp_origin = Some("https://auth.example.com".to_string());
+        build_harness_from_config(cfg, None, Vec::new())
+    }
+
     fn build_harness_from_config(
         cfg: AppConfig,
         metrics_bearer_token: Option<&str>,
@@ -2098,16 +2590,20 @@ mod tests {
 
         let adapters =
             InMemoryAdapters::bootstrap(&cfg).expect("in-memory adapters should bootstrap");
+        let passkey_webauthn = build_test_passkey_webauthn(&cfg);
 
         let auth_service = Arc::new(
             AuthService::new(
                 Arc::new(adapters.users),
                 Arc::new(adapters.login_abuse),
+                Arc::new(crate::adapters::risk::AllowAllLoginRiskAnalyzer),
                 Arc::new(adapters.verification_tokens),
                 Arc::new(adapters.password_reset_tokens),
                 Arc::new(adapters.mfa_factors),
                 Arc::new(adapters.mfa_challenges),
                 Arc::new(adapters.mfa_backup_codes),
+                Arc::new(adapters.passkeys),
+                Arc::new(adapters.passkey_challenges),
                 Arc::new(adapters.sessions),
                 Arc::new(adapters.refresh_tokens),
                 Arc::new(adapters.audit),
@@ -2130,6 +2626,7 @@ mod tests {
                 cfg.mfa_challenge_max_attempts,
                 cfg.mfa_totp_issuer,
                 cfg.mfa_encryption_key,
+                passkey_webauthn,
                 cfg.jwt_issuer,
                 cfg.jwt_audience,
             )
@@ -2149,7 +2646,13 @@ mod tests {
                         .collect::<Vec<_>>(),
                 )
                 .expect("jwks document should be built"),
-                readiness_checker: crate::health::RuntimeReadinessChecker::inmemory(),
+                readiness_checker: crate::health::RuntimeReadinessChecker::inmemory(Arc::new(
+                    crate::health::PasskeyChallengeJanitorHealth::new(
+                        false,
+                        std::time::Duration::from_secs(60),
+                    ),
+                )),
+                enforce_secure_transport: false,
                 metrics_bearer_token: metrics_bearer_token.map(str::to_string),
                 metrics_allowed_cidrs: metrics_allowed_cidrs
                     .into_iter()
@@ -2208,6 +2711,7 @@ mod tests {
             Ok(adapters) => adapters,
             Err(_) => return None,
         };
+        let passkey_webauthn = build_test_passkey_webauthn(&cfg);
         let jwt = match JwtEdDsaService::new(
             cfg.jwt_keys.clone(),
             cfg.jwt_primary_kid.clone(),
@@ -2221,11 +2725,14 @@ mod tests {
         let auth_service = match AuthService::new(
             Arc::new(adapters.users),
             Arc::new(in_memory_adapters.login_abuse),
+            Arc::new(crate::adapters::risk::AllowAllLoginRiskAnalyzer),
             Arc::new(adapters.verification_tokens),
             Arc::new(adapters.password_reset_tokens),
             Arc::new(adapters.mfa_factors),
             Arc::new(adapters.mfa_challenges),
             Arc::new(adapters.mfa_backup_codes),
+            Arc::new(adapters.passkeys),
+            Arc::new(adapters.passkey_challenges),
             Arc::new(adapters.sessions),
             Arc::new(adapters.refresh_tokens),
             Arc::new(adapters.audit),
@@ -2240,6 +2747,7 @@ mod tests {
             cfg.mfa_challenge_max_attempts,
             cfg.mfa_totp_issuer,
             cfg.mfa_encryption_key,
+            passkey_webauthn,
             cfg.jwt_issuer,
             cfg.jwt_audience,
         ) {
@@ -2250,6 +2758,10 @@ mod tests {
             adapters.pool.clone(),
             None,
             std::time::Duration::from_millis(500),
+            Arc::new(crate::health::PasskeyChallengeJanitorHealth::new(
+                false,
+                std::time::Duration::from_secs(60),
+            )),
         );
 
         Some(HandlerHarness {
@@ -2266,6 +2778,7 @@ mod tests {
                 )
                 .expect("jwks document should be built"),
                 readiness_checker,
+                enforce_secure_transport: false,
                 metrics_bearer_token: metrics_bearer_token.map(str::to_string),
                 metrics_allowed_cidrs: metrics_allowed_cidrs
                     .into_iter()
@@ -2338,6 +2851,11 @@ mod tests {
         AppConfig {
             bind_addr: "127.0.0.1:0".to_string(),
             auth_runtime: AuthRuntime::InMemory,
+            enforce_secure_transport: false,
+            passkey_enabled: false,
+            passkey_rp_id: None,
+            passkey_rp_origin: None,
+            passkey_challenge_prune_interval_seconds: 60,
             jwt_keys: vec![crate::config::JwtKeyConfig {
                 kid: "handler-tests-ed25519-v1".to_string(),
                 private_key_pem: Some(TEST_PRIVATE_KEY_PEM.to_string()),
@@ -2374,6 +2892,13 @@ mod tests {
             login_abuse_strikes_prefix: "handler:test:strikes".to_string(),
             login_abuse_redis_fail_mode: LoginAbuseRedisFailMode::FailClosed,
             login_abuse_bucket_mode: LoginAbuseBucketMode::EmailAndIp,
+            login_risk_mode: crate::config::LoginRiskMode::AllowAll,
+            login_risk_blocked_cidrs: Vec::new(),
+            login_risk_blocked_user_agent_substrings: Vec::new(),
+            login_risk_blocked_email_domains: Vec::new(),
+            login_risk_challenge_cidrs: Vec::new(),
+            login_risk_challenge_user_agent_substrings: Vec::new(),
+            login_risk_challenge_email_domains: Vec::new(),
             email_metrics_latency_enabled: false,
             email_provider: crate::config::EmailProviderConfig::Noop,
             email_delivery_mode: crate::config::EmailDeliveryMode::Inline,
@@ -2403,6 +2928,65 @@ mod tests {
         let mut key_bytes = [0_u8; 32];
         OsRng.fill_bytes(&mut key_bytes);
         BASE64_STANDARD.encode(key_bytes)
+    }
+
+    fn build_test_passkey_webauthn(cfg: &AppConfig) -> Option<webauthn_rs::prelude::Webauthn> {
+        if !cfg.passkey_enabled {
+            return None;
+        }
+
+        let rp_id = cfg
+            .passkey_rp_id
+            .as_deref()
+            .expect("passkey rp id should be configured in tests");
+        let rp_origin = cfg
+            .passkey_rp_origin
+            .as_deref()
+            .expect("passkey rp origin should be configured in tests");
+
+        let rp_origin = webauthn_rs::prelude::Url::parse(rp_origin)
+            .expect("passkey rp origin should parse in tests");
+        let webauthn = webauthn_rs::prelude::WebauthnBuilder::new(rp_id, &rp_origin)
+            .expect("passkey webauthn builder should initialize in tests")
+            .build()
+            .expect("passkey webauthn should build in tests");
+
+        Some(webauthn)
+    }
+
+    fn dummy_passkey_login_credential() -> PublicKeyCredential {
+        serde_json::from_str(
+            r#"{
+  "id": "dummy-credential",
+  "rawId": "",
+  "response": {
+    "authenticatorData": "",
+    "clientDataJSON": "",
+    "signature": "",
+    "userHandle": null
+  },
+  "extensions": {},
+  "type": "public-key"
+}"#,
+        )
+        .expect("dummy passkey credential should deserialize in tests")
+    }
+
+    fn dummy_passkey_register_credential() -> RegisterPublicKeyCredential {
+        serde_json::from_str(
+            r#"{
+  "id": "dummy-register-credential",
+  "rawId": "",
+  "response": {
+    "attestationObject": "",
+    "clientDataJSON": "",
+    "transports": null
+  },
+  "extensions": {},
+  "type": "public-key"
+}"#,
+        )
+        .expect("dummy passkey register credential should deserialize in tests")
     }
 
     fn totp_code_for_step(secret: &[u8], step: u64) -> Option<String> {

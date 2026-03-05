@@ -20,6 +20,42 @@ groups:
           /
           clamp_min(sum(rate(auth_refresh_requests_total[10m])), 0.0001)
 
+      - record: auth:login_risk_block_ratio_10m
+        expr: |
+          sum(rate(auth_login_risk_decisions_total{decision="block"}[10m]))
+          /
+          clamp_min(sum(rate(auth_login_risk_decisions_total[10m])), 0.0001)
+
+      - record: auth:passkey_error_ratio_10m
+        expr: |
+          sum(rate(auth_passkey_requests_total{outcome="error"}[10m]))
+          /
+          clamp_min(sum(rate(auth_passkey_requests_total[10m])), 0.0001)
+
+      - record: auth:passkey_login_rejected_ratio_10m
+        expr: |
+          sum(rate(auth_passkey_login_rejected_total[10m]))
+          /
+          clamp_min(sum(rate(auth_passkey_requests_total{operation="login_finish"}[10m])), 0.0001)
+
+      - record: auth:passkey_register_rejected_ratio_10m
+        expr: |
+          sum(rate(auth_passkey_register_rejected_total[10m]))
+          /
+          clamp_min(sum(rate(auth_passkey_requests_total{operation="register_finish"}[10m])), 0.0001)
+
+      - record: auth:passkey_prune_errors_10m
+        expr: |
+          sum(increase(auth_passkey_challenge_prune_errors_total[10m]))
+
+      - record: auth:passkey_prune_success_runs_15m
+        expr: |
+          sum(increase(auth_passkey_challenge_prune_runs_total{outcome="success"}[15m]))
+
+      - record: auth:passkey_prune_last_success_age_seconds
+        expr: |
+          clamp_min(time() - max(auth_passkey_challenge_prune_last_success_unixtime), 0)
+
       - record: auth:email_failure_ratio_10m
         expr: |
           sum(rate(auth_email_delivery_total{provider!="noop",outcome="failure"}[10m]))
@@ -109,6 +145,172 @@ groups:
         annotations:
           summary: "Login locked (429) spike"
           description: "Spike de respuestas 429 por login lock en 15m. Revisar calibracion de anti-abuso y posible ataque."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthLoginRiskBlockSpike
+        expr: sum(increase(auth_login_risk_decisions_total{decision="block"}[10m])) >= 50
+        for: 5m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Login risk block spike"
+          description: "Pico de decisiones block del motor de riesgo de login. Revisar reglas activas, origenes y posible campana de ATO."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthLoginRiskBlockRatioHigh
+        expr: auth:login_risk_block_ratio_10m >= 0.1
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Login risk block ratio high"
+          description: "El ratio de bloqueos del motor de riesgo de login supera 10% por 10m. Validar tuning para reducir falsos positivos o contener abuso activo."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthPasskeyErrorRatioHigh
+        expr: |
+          auth:passkey_error_ratio_10m >= 0.2
+          and
+          sum(increase(auth_passkey_requests_total[10m])) >= 25
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Passkey request error ratio high"
+          description: "El ratio de errores en endpoints passkey supera 20% por 10m con volumen relevante. Revisar RP_ID/RP_ORIGIN, challenge state y regresiones de ceremonia WebAuthn."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthPasskeyLoginRejectedRatioHigh
+        expr: |
+          auth:passkey_login_rejected_ratio_10m >= 0.2
+          and
+          sum(increase(auth_passkey_requests_total{operation="login_finish"}[10m])) >= 20
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Passkey login rejected ratio high"
+          description: "El ratio de rechazos de passkey login supera 20% por 10m con volumen relevante. Revisar desbalance por reason (`invalid_or_expired_challenge` vs `invalid_passkey_response`) y calidad de ceremonia WebAuthn."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthPasskeyLoginRejectedInvalidResponseSpike
+        expr: |
+          sum(increase(auth_passkey_login_rejected_total{reason="invalid_passkey_response"}[10m])) >= 10
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Passkey login invalid response spike"
+          description: "Pico de rechazos `invalid_passkey_response` en passkey login. Posible regresion de cliente/browser, cambio incompatible WebAuthn o mismatch de payload."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthPasskeyLoginRejectedInvalidOrExpiredChallengeSpike
+        expr: |
+          sum(increase(auth_passkey_login_rejected_total{reason="invalid_or_expired_challenge"}[10m])) >= 20
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Passkey login invalid/expired challenge spike"
+          description: "Pico de rechazos `invalid_or_expired_challenge` en passkey login. Revisar TTL de challenge, drift de reloj, perdidas de estado o latencia entre start/finish."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthPasskeyRegisterRejectedRatioHigh
+        expr: |
+          auth:passkey_register_rejected_ratio_10m >= 0.25
+          and
+          sum(increase(auth_passkey_requests_total{operation="register_finish"}[10m])) >= 10
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Passkey register rejected ratio high"
+          description: "El ratio de rechazos en passkey register finish supera 25% por 10m con volumen relevante. Revisar reasons dominantes (`challenge_user_mismatch`, `invalid_or_expired_challenge`, `invalid_passkey_response`)."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthPasskeyRegisterRejectedInvalidResponseSpike
+        expr: |
+          sum(increase(auth_passkey_register_rejected_total{reason="invalid_passkey_response"}[10m])) >= 5
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Passkey register invalid response spike"
+          description: "Pico de rechazos `invalid_passkey_response` en passkey register finish. Posible regresion de cliente/browser WebAuthn o incompatibilidad de payload de registro."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthPasskeyRegisterRejectedChallengeMismatchSpike
+        expr: |
+          sum(increase(auth_passkey_register_rejected_total{reason="challenge_user_mismatch"}[10m])) >= 5
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Passkey register challenge-user mismatch spike"
+          description: "Pico de rechazos `challenge_user_mismatch` en passkey register finish. Revisar correlacion user/flow en clientes, sesiones cruzadas o anomalías de integracion front-end."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthPasskeyChallengePruneErrorsSustained
+        expr: auth:passkey_prune_errors_10m >= 5
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Passkey challenge prune errors sustained"
+          description: "El janitor de passkey challenges acumula errores de poda por 10m. Revisar conectividad DB/locks y riesgo de crecimiento de estado transitorio WebAuthn."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthPasskeyChallengePruneHeartbeatMissing
+        expr: |
+          auth_passkey_challenge_janitor_enabled == 1
+          and
+          auth:passkey_prune_success_runs_15m < 1
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Passkey janitor success heartbeat missing"
+          description: "No se observan ejecuciones exitosas del janitor de passkey challenges en 15m mientras esta habilitado. Revisar scheduler/task loop y salud de runtime/DB."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthPasskeyChallengePruneHeartbeatStale
+        expr: |
+          auth_passkey_challenge_janitor_enabled == 1
+          and
+          sum(auth_passkey_challenge_prune_runs_total{outcome="success"}) > 0
+          and
+          auth:passkey_prune_last_success_age_seconds
+          > clamp_min(max(auth_passkey_challenge_prune_interval_seconds) * 3, 60)
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Passkey janitor success heartbeat stale"
+          description: "El ultimo success del janitor supera 3x el intervalo configurado de poda. Revisar stalls del loop de janitor, bloqueo de runtime o degradacion de DB."
           runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
           dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
 

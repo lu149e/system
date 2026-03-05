@@ -41,6 +41,8 @@ Optional variables (included only when set):
 - `VERIFY_EMAIL_URL_BASE`
 - `PASSWORD_RESET_URL_BASE`
 
+Login risk controls (`LOGIN_RISK_MODE`, `LOGIN_RISK_BLOCKED_*`, `LOGIN_RISK_CHALLENGE_*`) and passkey runtime flags (`PASSKEY_ENABLED`, `PASSKEY_RP_ID`, `PASSKEY_RP_ORIGIN`, `PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS`) are non-secret settings and should be managed through ConfigMap/overlay values, not secret manifests.
+
 Quick generation helpers:
 
 ```bash
@@ -127,6 +129,13 @@ INGRESS_HOST='auth.example.com' \
 TLS_SECRET_NAME='auth-api-tls' \
 POSTGRES_CIDR='10.20.30.0/24' \
 REDIS_CIDR='10.20.40.0/24' \
+ENFORCE_SECURE_TRANSPORT='true' \
+LOGIN_RISK_MODE='baseline' \
+# PASSKEY_ENABLED='true' \
+# PASSKEY_RP_ID='example.com' \
+# PASSKEY_RP_ORIGIN='https://auth.example.com' \
+# LOGIN_RISK_BLOCKED_CIDRS='203.0.113.0/24' \
+# LOGIN_RISK_CHALLENGE_CIDRS='198.51.100.0/24' \
 ./scripts/generate-production-overlay.sh
 ```
 
@@ -160,6 +169,15 @@ STRICT_DEPLOY_VALIDATION=true ./scripts/validate-deploy-readiness.sh
 # Optional security inputs (default true):
 # - enforce_database_tls
 # - enforce_redis_tls
+# - enforce_secure_transport
+# Login risk inputs:
+# - login_risk_mode (allow_all|baseline; default baseline)
+# - login_risk_blocked_cidrs (optional CSV)
+# - login_risk_blocked_user_agent_substrings (optional CSV)
+# - login_risk_blocked_email_domains (optional CSV)
+# - login_risk_challenge_cidrs (optional CSV)
+# - login_risk_challenge_user_agent_substrings (optional CSV)
+# - login_risk_challenge_email_domains (optional CSV)
 ```
 
    - Signature gate: verifies `ghcr.io/lu149e/system@<digest>` with Cosign keyless against GitHub OIDC issuer and release workflow identity.
@@ -200,6 +218,10 @@ JWT_PUBLIC_KEY_PEM="$(cat /path/to/v2-public.pem)" \
 # Optional inputs:
 # - enforce_database_tls=true (default)
 # - enforce_redis_tls=true (default)
+# - enforce_secure_transport=true (default)
+# - login_risk_mode=baseline (default)
+# - login_risk_blocked_cidrs / login_risk_blocked_user_agent_substrings / login_risk_blocked_email_domains (optional CSV)
+# - login_risk_challenge_cidrs / login_risk_challenge_user_agent_substrings / login_risk_challenge_email_domains (optional CSV)
 # - apply_changes=false (default; non-destructive dry-run mode)
 # - allow_client_dry_run_fallback=false (default; only for simulation when API server is unreachable)
 # - namespace=auth
@@ -304,6 +326,7 @@ After applying `deployment.yaml`, `service.yaml`, and `ingress.yaml`:
 ## Runtime Assumptions
 
 - TLS is terminated at ingress/load balancer; the app serves HTTP inside the cluster.
+- Set `ENFORCE_SECURE_TRANSPORT=true` in production overlays to reject auth traffic that is not marked `x-forwarded-proto=https` by trusted proxies.
 - Health endpoints are `GET /healthz` (liveness/startup) and `GET /readyz` (readiness).
 - Metrics endpoint is `GET /metrics` and should be protected with `METRICS_BEARER_TOKEN` and/or network policy.
 - App is expected to run behind trusted proxies only when `TRUST_X_FORWARDED_FOR=true` and trusted proxy ranges are configured.

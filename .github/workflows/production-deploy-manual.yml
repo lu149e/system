@@ -41,6 +41,61 @@ on:
         required: true
         default: true
         type: boolean
+      enforce_secure_transport:
+        description: "Set ENFORCE_SECURE_TRANSPORT in generated production overlay"
+        required: true
+        default: true
+        type: boolean
+      passkey_enabled:
+        description: "Set PASSKEY_ENABLED in generated production overlay"
+        required: true
+        default: false
+        type: boolean
+      passkey_rp_id:
+        description: "Optional PASSKEY_RP_ID (required when passkey_enabled=true)"
+        required: false
+        type: string
+      passkey_rp_origin:
+        description: "Optional PASSKEY_RP_ORIGIN (required when passkey_enabled=true)"
+        required: false
+        type: string
+      passkey_challenge_prune_interval_seconds:
+        description: "Set PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS in generated production overlay"
+        required: true
+        default: "60"
+        type: string
+      login_risk_mode:
+        description: "Set LOGIN_RISK_MODE in generated production overlay"
+        required: true
+        default: baseline
+        type: choice
+        options:
+          - allow_all
+          - baseline
+      login_risk_blocked_cidrs:
+        description: "Optional CSV for LOGIN_RISK_BLOCKED_CIDRS"
+        required: false
+        type: string
+      login_risk_blocked_user_agent_substrings:
+        description: "Optional CSV for LOGIN_RISK_BLOCKED_USER_AGENT_SUBSTRINGS"
+        required: false
+        type: string
+      login_risk_blocked_email_domains:
+        description: "Optional CSV for LOGIN_RISK_BLOCKED_EMAIL_DOMAINS"
+        required: false
+        type: string
+      login_risk_challenge_cidrs:
+        description: "Optional CSV for LOGIN_RISK_CHALLENGE_CIDRS"
+        required: false
+        type: string
+      login_risk_challenge_user_agent_substrings:
+        description: "Optional CSV for LOGIN_RISK_CHALLENGE_USER_AGENT_SUBSTRINGS"
+        required: false
+        type: string
+      login_risk_challenge_email_domains:
+        description: "Optional CSV for LOGIN_RISK_CHALLENGE_EMAIL_DOMAINS"
+        required: false
+        type: string
       apply_changes:
         description: "Apply rendered manifests to the cluster after dry-run"
         required: true
@@ -153,6 +208,18 @@ jobs:
           REDIS_CIDR: ${{ github.event.inputs.redis_cidr }}
           ENFORCE_DATABASE_TLS: ${{ github.event.inputs.enforce_database_tls }}
           ENFORCE_REDIS_TLS: ${{ github.event.inputs.enforce_redis_tls }}
+          ENFORCE_SECURE_TRANSPORT: ${{ github.event.inputs.enforce_secure_transport }}
+          PASSKEY_ENABLED: ${{ github.event.inputs.passkey_enabled }}
+          PASSKEY_RP_ID: ${{ github.event.inputs.passkey_rp_id }}
+          PASSKEY_RP_ORIGIN: ${{ github.event.inputs.passkey_rp_origin }}
+          PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS: ${{ github.event.inputs.passkey_challenge_prune_interval_seconds }}
+          LOGIN_RISK_MODE: ${{ github.event.inputs.login_risk_mode }}
+          LOGIN_RISK_BLOCKED_CIDRS: ${{ github.event.inputs.login_risk_blocked_cidrs }}
+          LOGIN_RISK_BLOCKED_USER_AGENT_SUBSTRINGS: ${{ github.event.inputs.login_risk_blocked_user_agent_substrings }}
+          LOGIN_RISK_BLOCKED_EMAIL_DOMAINS: ${{ github.event.inputs.login_risk_blocked_email_domains }}
+          LOGIN_RISK_CHALLENGE_CIDRS: ${{ github.event.inputs.login_risk_challenge_cidrs }}
+          LOGIN_RISK_CHALLENGE_USER_AGENT_SUBSTRINGS: ${{ github.event.inputs.login_risk_challenge_user_agent_substrings }}
+          LOGIN_RISK_CHALLENGE_EMAIL_DOMAINS: ${{ github.event.inputs.login_risk_challenge_email_domains }}
         run: ./scripts/generate-production-overlay.sh
 
       - name: Run deploy readiness validation (strict)
