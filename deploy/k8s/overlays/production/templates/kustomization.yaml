@@ -5,6 +5,7 @@ resources:
 patches:
   - path: ingress-production.patch.yaml
   - path: networkpolicy-production-egress.patch.yaml
+  - path: configmap-runtime-security.patch.yaml
 images:
   - name: ghcr.io/lu149e/system
     newName: ghcr.io/lu149e/system

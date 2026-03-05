@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auth-api-config
+  namespace: auth
+data:
+  ENFORCE_DATABASE_TLS: "__PRODUCTION_ENFORCE_DATABASE_TLS__"
+  ENFORCE_REDIS_TLS: "__PRODUCTION_ENFORCE_REDIS_TLS__"

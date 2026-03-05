@@ -157,6 +157,9 @@ STRICT_DEPLOY_VALIDATION=true ./scripts/validate-deploy-readiness.sh
 # - tls_secret_name
 # - postgres_cidr
 # - redis_cidr
+# Optional security inputs (default true):
+# - enforce_database_tls
+# - enforce_redis_tls
 ```
 
    - Signature gate: verifies `ghcr.io/lu149e/system@<digest>` with Cosign keyless against GitHub OIDC issuer and release workflow identity.
@@ -195,6 +198,8 @@ JWT_PUBLIC_KEY_PEM="$(cat /path/to/v2-public.pem)" \
 # - postgres_cidr
 # - redis_cidr
 # Optional inputs:
+# - enforce_database_tls=true (default)
+# - enforce_redis_tls=true (default)
 # - apply_changes=false (default; non-destructive dry-run mode)
 # - allow_client_dry_run_fallback=false (default; only for simulation when API server is unreachable)
 # - namespace=auth
@@ -211,6 +216,7 @@ JWT_PUBLIC_KEY_PEM="$(cat /path/to/v2-public.pem)" \
 
 ```bash
 kubectl apply -f artifacts/production-secrets/auth-api-secrets.yaml
+kubectl apply -f artifacts/production-secrets/auth-jwt-keys.yaml
 kubectl apply -k artifacts/production-overlay/generated
 ```
 

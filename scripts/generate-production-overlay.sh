@@ -6,6 +6,9 @@ TEMPLATES_DIR="${ROOT_DIR}/deploy/k8s/overlays/production/templates"
 GENERATED_DIR="${ROOT_DIR}/artifacts/production-overlay/generated"
 BASE_KUSTOMIZE_DIR="${ROOT_DIR}/deploy/k8s"
 
+ENFORCE_DATABASE_TLS="${ENFORCE_DATABASE_TLS:-true}"
+ENFORCE_REDIS_TLS="${ENFORCE_REDIS_TLS:-true}"
+
 required_vars=(
   IMAGE_DIGEST
   INGRESS_HOST
@@ -49,6 +52,14 @@ validate_tls_secret_name() {
   fi
 }
 
+validate_boolean_flag() {
+  local field_name="$1"
+  local value="$2"
+  if [[ "${value}" != "true" && "${value}" != "false" ]]; then
+    fail "${field_name} must be either 'true' or 'false'"
+  fi
+}
+
 validate_cidr_with_python() {
   local field_name="$1"
   local value="$2"
@@ -85,6 +96,8 @@ replace_tokens() {
   content="${content//__PRODUCTION_TLS_SECRET_NAME__/${TLS_SECRET_NAME}}"
   content="${content//__PRODUCTION_POSTGRES_CIDR__/${POSTGRES_CIDR}}"
   content="${content//__PRODUCTION_REDIS_CIDR__/${REDIS_CIDR}}"
+  content="${content//__PRODUCTION_ENFORCE_DATABASE_TLS__/${ENFORCE_DATABASE_TLS}}"
+  content="${content//__PRODUCTION_ENFORCE_REDIS_TLS__/${ENFORCE_REDIS_TLS}}"
 
   printf '%s\n' "${content}" >"${output_file}"
 }
@@ -116,6 +129,8 @@ main() {
   validate_image_digest
   validate_ingress_host
   validate_tls_secret_name
+  validate_boolean_flag "ENFORCE_DATABASE_TLS" "${ENFORCE_DATABASE_TLS}"
+  validate_boolean_flag "ENFORCE_REDIS_TLS" "${ENFORCE_REDIS_TLS}"
   validate_cidr_with_python "POSTGRES_CIDR" "${POSTGRES_CIDR}"
   validate_cidr_with_python "REDIS_CIDR" "${REDIS_CIDR}"
 
@@ -123,6 +138,7 @@ main() {
   [[ -f "${TEMPLATES_DIR}/kustomization.yaml" ]] || fail "missing template: ${TEMPLATES_DIR}/kustomization.yaml"
   [[ -f "${TEMPLATES_DIR}/ingress-production.patch.yaml" ]] || fail "missing template: ${TEMPLATES_DIR}/ingress-production.patch.yaml"
   [[ -f "${TEMPLATES_DIR}/networkpolicy-production-egress.patch.yaml" ]] || fail "missing template: ${TEMPLATES_DIR}/networkpolicy-production-egress.patch.yaml"
+  [[ -f "${TEMPLATES_DIR}/configmap-runtime-security.patch.yaml" ]] || fail "missing template: ${TEMPLATES_DIR}/configmap-runtime-security.patch.yaml"
   [[ -d "${BASE_KUSTOMIZE_DIR}" ]] || fail "missing base kustomize directory: ${BASE_KUSTOMIZE_DIR}"
 
   mkdir -p "${GENERATED_DIR}"
@@ -133,6 +149,7 @@ main() {
   replace_tokens "${TEMPLATES_DIR}/kustomization.yaml" "${GENERATED_DIR}/kustomization.yaml" "${base_kustomize_relpath}"
   replace_tokens "${TEMPLATES_DIR}/ingress-production.patch.yaml" "${GENERATED_DIR}/ingress-production.patch.yaml" "${base_kustomize_relpath}"
   replace_tokens "${TEMPLATES_DIR}/networkpolicy-production-egress.patch.yaml" "${GENERATED_DIR}/networkpolicy-production-egress.patch.yaml" "${base_kustomize_relpath}"
+  replace_tokens "${TEMPLATES_DIR}/configmap-runtime-security.patch.yaml" "${GENERATED_DIR}/configmap-runtime-security.patch.yaml" "${base_kustomize_relpath}"
 
   echo "Generated production overlay in ${GENERATED_DIR}"
 }

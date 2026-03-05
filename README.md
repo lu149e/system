@@ -398,6 +398,9 @@ Pasos recomendados:
   - `ubuntu-latest` (default): runner hospedado de GitHub.
   - `self-hosted-auth-local`: runner self-hosted con labels `self-hosted,linux,x64,auth-local`.
 - Inputs obligatorios: `image_digest`, `ingress_host`, `tls_secret_name`, `postgres_cidr`, `redis_cidr`.
+- Inputs de seguridad runtime (opcionales, default `true`):
+  - `enforce_database_tls`
+  - `enforce_redis_tls`
 - Secrets requeridos para generar manifiestos de runtime:
   - `PROD_AUTH_DATABASE_URL`, `PROD_AUTH_REDIS_URL`, `PROD_AUTH_REFRESH_TOKEN_PEPPER`, `PROD_AUTH_MFA_ENCRYPTION_KEY_BASE64`, `PROD_AUTH_JWT_KEYSET`, `PROD_AUTH_JWT_PRIMARY_KID`.
   - `PROD_AUTH_JWT_PRIVATE_KEY_PEM`, `PROD_AUTH_JWT_PUBLIC_KEY_PEM` (para generar `auth-jwt-keys`).
@@ -418,6 +421,8 @@ Pasos recomendados:
   - `self-hosted-auth-local`: runner self-hosted con labels `self-hosted,linux,x64,auth-local`.
 - Inputs obligatorios: `image_digest`, `ingress_host`, `tls_secret_name`, `postgres_cidr`, `redis_cidr`.
 - Inputs operativos:
+  - `enforce_database_tls` (boolean, default `true`): valor aplicado a `ENFORCE_DATABASE_TLS` en overlay generado.
+  - `enforce_redis_tls` (boolean, default `true`): valor aplicado a `ENFORCE_REDIS_TLS` en overlay generado.
   - `apply_changes` (boolean, default `false`): en `false` ejecuta solo dry-run server-side; en `true` aplica manifiestos al cluster.
   - `allow_client_dry_run_fallback` (boolean, default `false`): solo para simulacion; si el server-side dry-run no puede contactar el API server y `apply_changes=false`, permite continuar sin el gate de `kubectl --dry-run=server`.
   - `namespace` (default `auth`): namespace destino para dry-run/apply/smoke.

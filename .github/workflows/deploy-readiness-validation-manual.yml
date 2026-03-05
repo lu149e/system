@@ -36,6 +36,16 @@ on:
         description: "Redis egress CIDR"
         required: true
         type: string
+      enforce_database_tls:
+        description: "Set ENFORCE_DATABASE_TLS in generated production overlay"
+        required: true
+        default: true
+        type: boolean
+      enforce_redis_tls:
+        description: "Set ENFORCE_REDIS_TLS in generated production overlay"
+        required: true
+        default: true
+        type: boolean
 
 jobs:
   deploy-readiness-validation:
@@ -88,6 +98,8 @@ jobs:
           TLS_SECRET_NAME: ${{ github.event.inputs.tls_secret_name }}
           POSTGRES_CIDR: ${{ github.event.inputs.postgres_cidr }}
           REDIS_CIDR: ${{ github.event.inputs.redis_cidr }}
+          ENFORCE_DATABASE_TLS: ${{ github.event.inputs.enforce_database_tls }}
+          ENFORCE_REDIS_TLS: ${{ github.event.inputs.enforce_redis_tls }}
         run: ./scripts/generate-production-overlay.sh
 
       - name: Run deploy readiness validation
