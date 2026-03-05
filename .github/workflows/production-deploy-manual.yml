@@ -294,7 +294,19 @@ jobs:
             sleep 1
           done
 
-          curl -fsS "http://127.0.0.1:18080/readyz" > artifacts/production-deploy/smoke-readyz.log
+          ready_ok="false"
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:18080/readyz" > artifacts/production-deploy/smoke-readyz.log; then
+              ready_ok="true"
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "${ready_ok}" != "true" ]; then
+            echo "Readiness endpoint did not return 200 within retry window." >&2
+            exit 1
+          fi
 
       - name: Publish deployment mode summary
         if: always()
