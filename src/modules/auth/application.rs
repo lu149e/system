@@ -452,6 +452,20 @@ impl AuthService {
 
         let user = self.users.find_by_email(&email).await;
         if let Some(user) = user {
+            if user.status != UserStatus::Active {
+                let fake_token = self.refresh_crypto.generate_refresh_token().await;
+                let _ = self.refresh_crypto.hash_refresh_token(&fake_token).await;
+                self.audit_password_forgot_accepted(
+                    &email,
+                    Some(user.id.as_str()),
+                    "existing_not_active",
+                    &ctx,
+                    now,
+                )
+                .await;
+                return Ok(password_forgot_accepted_response());
+            }
+
             self.issue_password_reset_token(&user.id, &user.email, &ctx)
                 .await?;
             self.audit_password_forgot_accepted(
@@ -509,6 +523,23 @@ impl AuthService {
                 return Err(AuthError::InvalidPasswordResetToken);
             }
         };
+
+        let user = self.users.find_by_id(&user_id).await;
+        let Some(user) = user else {
+            self.audit_password_reset_rejected("user_not_found", Some(user_id.as_str()), &ctx, now)
+                .await;
+            return Err(AuthError::InvalidPasswordResetToken);
+        };
+        if user.status != UserStatus::Active {
+            self.audit_password_reset_rejected(
+                "account_not_active",
+                Some(user_id.as_str()),
+                &ctx,
+                now,
+            )
+            .await;
+            return Err(AuthError::InvalidPasswordResetToken);
+        }
 
         let password_hash = hash_password(&cmd.new_password).map_err(|_| AuthError::Internal)?;
         if self
@@ -1492,7 +1523,7 @@ impl AuthService {
                 self.audit_login_rejected(&reason, email, Some(user_id), ctx)
                     .await;
                 crate::observability::record_login_risk_decision("block", &reason);
-                self.try_lock_login(email, ctx.ip.as_deref(), ctx, now)
+                self.try_lock_login_for_risk(email, ctx.ip.as_deref(), &reason, ctx, now)
                     .await;
                 Err(AuthError::InvalidCredentials)
             }
@@ -1509,8 +1540,14 @@ impl AuthService {
                         "block",
                         "challenge_without_mfa",
                     );
-                    self.try_lock_login(email, ctx.ip.as_deref(), ctx, now)
-                        .await;
+                    self.try_lock_login_for_risk(
+                        email,
+                        ctx.ip.as_deref(),
+                        "challenge_without_mfa",
+                        ctx,
+                        now,
+                    )
+                    .await;
                     return Err(AuthError::InvalidCredentials);
                 }
 
@@ -2099,6 +2136,7 @@ impl AuthService {
         ctx: &RequestContext,
         now: chrono::DateTime<Utc>,
     ) {
+        crate::observability::record_password_forgot_accepted(outcome);
         self.audit
             .append(AuditEvent {
                 event_type: "auth.password.forgot.accepted".to_string(),
@@ -2117,6 +2155,7 @@ impl AuthService {
         ctx: &RequestContext,
         now: chrono::DateTime<Utc>,
     ) {
+        crate::observability::record_password_reset_rejected(reason);
         self.audit
             .append(AuditEvent {
                 event_type: "auth.password.reset.rejected".to_string(),
@@ -2312,11 +2351,49 @@ impl AuthService {
         ctx: &RequestContext,
         now: chrono::DateTime<Utc>,
     ) {
-        if let Some(lock_until) = self
-            .login_abuse
-            .register_failure(email, source_ip, now)
-            .await
-        {
+        self.apply_login_failure_penalty(email, source_ip, 1, ctx, now)
+            .await;
+    }
+
+    async fn try_lock_login_for_risk(
+        &self,
+        email: &str,
+        source_ip: Option<&str>,
+        reason: &str,
+        ctx: &RequestContext,
+        now: chrono::DateTime<Utc>,
+    ) {
+        let (profile, penalty_units) = login_risk_penalty_profile(reason);
+        crate::observability::record_login_risk_penalty(profile, reason, penalty_units as u64);
+
+        self.apply_login_failure_penalty(email, source_ip, penalty_units, ctx, now)
+            .await;
+    }
+
+    async fn apply_login_failure_penalty(
+        &self,
+        email: &str,
+        source_ip: Option<&str>,
+        penalty_units: u32,
+        ctx: &RequestContext,
+        now: chrono::DateTime<Utc>,
+    ) {
+        let mut lock_until: Option<chrono::DateTime<Utc>> = None;
+
+        for _ in 0..penalty_units.max(1) {
+            if let Some(candidate) = self
+                .login_abuse
+                .register_failure(email, source_ip, now)
+                .await
+            {
+                lock_until = Some(match lock_until {
+                    Some(current) if current > candidate => current,
+                    _ => candidate,
+                });
+            }
+        }
+
+        if let Some(lock_until) = lock_until {
             let retry_after_seconds = (lock_until - now).num_seconds().max(1);
             self.audit_login_locked(email, ctx, retry_after_seconds)
                 .await;
@@ -2389,6 +2466,15 @@ fn session_status_label(status: &SessionStatus) -> &'static str {
         SessionStatus::Active => "active",
         SessionStatus::Revoked => "revoked",
         SessionStatus::Compromised => "compromised",
+    }
+}
+
+fn login_risk_penalty_profile(reason: &str) -> (&'static str, u32) {
+    match reason {
+        "blocked_source_ip" => ("aggressive", 5),
+        "blocked_user_agent" | "blocked_email_domain" => ("elevated", 3),
+        "challenge_without_mfa" => ("elevated", 2),
+        _ => ("standard", 1),
     }
 }
 
@@ -2550,6 +2636,7 @@ mod tests {
         },
         config::{AppConfig, AuthRuntime, LoginAbuseBucketMode, LoginAbuseRedisFailMode},
         modules::{
+            auth::domain::PasswordResetTokenRecord,
             auth::ports::{
                 LoginRiskAnalyzer, LoginRiskDecision, PasskeyAuthenticationChallengeRecord,
                 PasskeyRegistrationChallengeRecord, UserRepository,
@@ -2560,8 +2647,8 @@ mod tests {
 
     use super::{
         AuthError, AuthService, LoginCommand, LoginResult, MfaActivateCommand, MfaVerifyCommand,
-        Passkey, PasswordChangeCommand, PublicKeyCredential, RefreshCommand,
-        RegisterPublicKeyCredential, RequestContext,
+        Passkey, PasswordChangeCommand, PasswordForgotCommand, PasswordResetCommand,
+        PublicKeyCredential, RefreshCommand, RegisterPublicKeyCredential, RequestContext,
     };
 
     const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIMn3Wcxxd4JzzjbshVFXz8jSGuF9ErqngPTzYhbfm6hd\n-----END PRIVATE KEY-----\n";
@@ -2823,6 +2910,109 @@ mod tests {
             .await
             .expect("login with new password should succeed");
         let _ = assert_authenticated(new_login);
+    }
+
+    #[tokio::test]
+    async fn password_forgot_pending_user_accepts_without_token_issue() {
+        let harness = build_harness();
+        let pending_user = harness
+            .users
+            .create_pending_user("forgot-pending@example.com", "dummy-hash")
+            .await
+            .expect("pending user creation should succeed")
+            .expect("pending user should be created");
+
+        let result = harness
+            .service
+            .password_forgot(
+                PasswordForgotCommand {
+                    email: pending_user.email.clone(),
+                },
+                test_context("password-forgot-pending-user"),
+            )
+            .await;
+
+        assert!(result.is_ok());
+
+        let events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit lock should be available");
+
+        let accepted = events
+            .iter()
+            .find(|event| {
+                event.event_type == "auth.password.forgot.accepted"
+                    && event.trace_id == "password-forgot-pending-user"
+            })
+            .expect("password forgot accepted event should exist");
+        assert_eq!(accepted.metadata["outcome"], "existing_not_active");
+
+        let issued_for_trace = events.iter().any(|event| {
+            event.event_type == "auth.password.forgot.token_issued"
+                && event.trace_id == "password-forgot-pending-user"
+        });
+        assert!(!issued_for_trace);
+    }
+
+    #[tokio::test]
+    async fn password_reset_pending_user_token_is_rejected() {
+        let harness = build_harness();
+        let pending_user = harness
+            .users
+            .create_pending_user("reset-pending@example.com", "dummy-hash")
+            .await
+            .expect("pending user creation should succeed")
+            .expect("pending user should be created");
+
+        let now = Utc::now();
+        let reset_token = "pending-user-reset-token";
+        let token_hash = harness
+            .service
+            .refresh_crypto
+            .hash_refresh_token(reset_token)
+            .await;
+        harness
+            .service
+            .password_reset_tokens
+            .issue(PasswordResetTokenRecord {
+                id: Uuid::new_v4().to_string(),
+                user_id: pending_user.id.clone(),
+                token_hash,
+                expires_at: now + chrono::Duration::seconds(300),
+                used_at: None,
+                created_at: now,
+            })
+            .await
+            .expect("password reset token should be issued");
+
+        let result = harness
+            .service
+            .password_reset(
+                PasswordResetCommand {
+                    token: reset_token.to_string(),
+                    new_password: generated_test_password(),
+                },
+                test_context("password-reset-pending-user"),
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::InvalidPasswordResetToken)));
+
+        let events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit lock should be available");
+        let rejected = events
+            .iter()
+            .find(|event| {
+                event.event_type == "auth.password.reset.rejected"
+                    && event.trace_id == "password-reset-pending-user"
+            })
+            .expect("password reset rejected event should exist");
+        assert_eq!(rejected.metadata["reason"], "account_not_active");
     }
 
     #[tokio::test]
@@ -3193,6 +3383,30 @@ mod tests {
             }
             LoginResult::Authenticated { .. } => panic!("step-up challenge should be required"),
         }
+    }
+
+    #[test]
+    fn login_risk_penalty_profiles_are_stable() {
+        assert_eq!(
+            super::login_risk_penalty_profile("blocked_source_ip"),
+            ("aggressive", 5)
+        );
+        assert_eq!(
+            super::login_risk_penalty_profile("blocked_user_agent"),
+            ("elevated", 3)
+        );
+        assert_eq!(
+            super::login_risk_penalty_profile("blocked_email_domain"),
+            ("elevated", 3)
+        );
+        assert_eq!(
+            super::login_risk_penalty_profile("challenge_without_mfa"),
+            ("elevated", 2)
+        );
+        assert_eq!(
+            super::login_risk_penalty_profile("unknown_reason"),
+            ("standard", 1)
+        );
     }
 
     #[tokio::test]
