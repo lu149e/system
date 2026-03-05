@@ -9,6 +9,7 @@ use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, 
 use rand::{rngs::OsRng, RngCore};
 use sha2::Sha256;
 use uuid::Uuid;
+use webauthn_rs::prelude::Passkey;
 
 use crate::{
     config::{AppConfig, LoginAbuseBucketMode},
@@ -22,9 +23,12 @@ use crate::{
             ports::{
                 LoginAbuseProtector, LoginGateDecision, MfaBackupCodeConsumeState,
                 MfaBackupCodeRepository, MfaChallengeFailureState, MfaChallengeLookupState,
-                MfaChallengeRepository, MfaFactorRepository, PasswordResetTokenConsumeState,
-                PasswordResetTokenRepository, UserRepository, VerificationTokenConsumeState,
-                VerificationTokenRepository,
+                MfaChallengeRepository, MfaFactorRepository,
+                PasskeyAuthenticationChallengeConsumeState, PasskeyAuthenticationChallengeRecord,
+                PasskeyChallengeRepository, PasskeyCredentialRepository,
+                PasskeyRegistrationChallengeConsumeState, PasskeyRegistrationChallengeRecord,
+                PasswordResetTokenConsumeState, PasswordResetTokenRepository, UserRepository,
+                VerificationTokenConsumeState, VerificationTokenRepository,
             },
         },
         sessions::{
@@ -49,6 +53,8 @@ pub struct InMemoryAdapters {
     pub mfa_factors: InMemoryMfaFactorRepository,
     pub mfa_challenges: InMemoryMfaChallengeRepository,
     pub mfa_backup_codes: InMemoryMfaBackupCodeRepository,
+    pub passkeys: InMemoryPasskeyCredentialRepository,
+    pub passkey_challenges: InMemoryPasskeyChallengeRepository,
     pub sessions: InMemorySessionRepository,
     pub refresh_tokens: InMemoryRefreshTokenRepository,
     pub audit: InMemoryAuditRepository,
@@ -91,6 +97,8 @@ impl InMemoryAdapters {
             mfa_factors: InMemoryMfaFactorRepository::new(),
             mfa_challenges: InMemoryMfaChallengeRepository::new(),
             mfa_backup_codes: InMemoryMfaBackupCodeRepository::new(),
+            passkeys: InMemoryPasskeyCredentialRepository::new(),
+            passkey_challenges: InMemoryPasskeyChallengeRepository::new(),
             sessions: InMemorySessionRepository::new(),
             refresh_tokens: InMemoryRefreshTokenRepository::new(),
             audit: InMemoryAuditRepository::new(),
@@ -540,6 +548,166 @@ impl MfaBackupCodeRepository for InMemoryMfaBackupCodeRepository {
 
         record.used_at = Some(now);
         Ok(MfaBackupCodeConsumeState::Consumed)
+    }
+}
+
+pub struct InMemoryPasskeyCredentialRepository {
+    passkeys_by_user: Mutex<HashMap<String, Vec<Passkey>>>,
+}
+
+impl InMemoryPasskeyCredentialRepository {
+    fn new() -> Self {
+        Self {
+            passkeys_by_user: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl PasskeyCredentialRepository for InMemoryPasskeyCredentialRepository {
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<Passkey>, String> {
+        let passkeys = self
+            .passkeys_by_user
+            .lock()
+            .map_err(|_| "passkey storage unavailable".to_string())?
+            .get(user_id)
+            .cloned()
+            .unwrap_or_default();
+
+        Ok(passkeys)
+    }
+
+    async fn upsert_for_user(
+        &self,
+        user_id: &str,
+        passkey: Passkey,
+        _now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let mut passkeys_by_user = self
+            .passkeys_by_user
+            .lock()
+            .map_err(|_| "passkey storage unavailable".to_string())?;
+        let passkeys = passkeys_by_user.entry(user_id.to_string()).or_default();
+
+        if let Some(existing_passkey) = passkeys
+            .iter_mut()
+            .find(|existing_passkey| existing_passkey.cred_id() == passkey.cred_id())
+        {
+            *existing_passkey = passkey;
+            return Ok(());
+        }
+
+        passkeys.push(passkey);
+        Ok(())
+    }
+}
+
+pub struct InMemoryPasskeyChallengeRepository {
+    registration_by_flow: Mutex<HashMap<String, PasskeyRegistrationChallengeRecord>>,
+    authentication_by_flow: Mutex<HashMap<String, PasskeyAuthenticationChallengeRecord>>,
+}
+
+impl InMemoryPasskeyChallengeRepository {
+    fn new() -> Self {
+        Self {
+            registration_by_flow: Mutex::new(HashMap::new()),
+            authentication_by_flow: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl PasskeyChallengeRepository for InMemoryPasskeyChallengeRepository {
+    async fn issue_registration(
+        &self,
+        flow_id: &str,
+        challenge: PasskeyRegistrationChallengeRecord,
+    ) -> Result<(), String> {
+        let mut guard = self
+            .registration_by_flow
+            .lock()
+            .map_err(|_| "passkey registration challenge storage unavailable".to_string())?;
+        guard.retain(|_, existing| existing.user_id != challenge.user_id);
+        guard.insert(flow_id.to_string(), challenge);
+        Ok(())
+    }
+
+    async fn consume_registration(
+        &self,
+        flow_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<PasskeyRegistrationChallengeConsumeState, String> {
+        let mut guard = self
+            .registration_by_flow
+            .lock()
+            .map_err(|_| "passkey registration challenge storage unavailable".to_string())?;
+        let Some(challenge) = guard.remove(flow_id) else {
+            return Ok(PasskeyRegistrationChallengeConsumeState::NotFound);
+        };
+
+        if challenge.expires_at <= now {
+            return Ok(PasskeyRegistrationChallengeConsumeState::Expired);
+        }
+
+        Ok(PasskeyRegistrationChallengeConsumeState::Active(challenge))
+    }
+
+    async fn issue_authentication(
+        &self,
+        flow_id: &str,
+        challenge: PasskeyAuthenticationChallengeRecord,
+    ) -> Result<(), String> {
+        let mut guard = self
+            .authentication_by_flow
+            .lock()
+            .map_err(|_| "passkey authentication challenge storage unavailable".to_string())?;
+        guard.retain(|_, existing| existing.user_id != challenge.user_id);
+        guard.insert(flow_id.to_string(), challenge);
+        Ok(())
+    }
+
+    async fn consume_authentication(
+        &self,
+        flow_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<PasskeyAuthenticationChallengeConsumeState, String> {
+        let mut guard = self
+            .authentication_by_flow
+            .lock()
+            .map_err(|_| "passkey authentication challenge storage unavailable".to_string())?;
+        let Some(challenge) = guard.remove(flow_id) else {
+            return Ok(PasskeyAuthenticationChallengeConsumeState::NotFound);
+        };
+
+        if challenge.expires_at <= now {
+            return Ok(PasskeyAuthenticationChallengeConsumeState::Expired);
+        }
+
+        Ok(PasskeyAuthenticationChallengeConsumeState::Active(
+            challenge,
+        ))
+    }
+
+    async fn prune_expired(&self, now: DateTime<Utc>) -> Result<u64, String> {
+        let mut registration_guard = self
+            .registration_by_flow
+            .lock()
+            .map_err(|_| "passkey registration challenge storage unavailable".to_string())?;
+        let registration_before = registration_guard.len();
+        registration_guard.retain(|_, challenge| challenge.expires_at > now);
+        let registration_pruned = registration_before.saturating_sub(registration_guard.len());
+        drop(registration_guard);
+
+        let mut authentication_guard = self
+            .authentication_by_flow
+            .lock()
+            .map_err(|_| "passkey authentication challenge storage unavailable".to_string())?;
+        let authentication_before = authentication_guard.len();
+        authentication_guard.retain(|_, challenge| challenge.expires_at > now);
+        let authentication_pruned =
+            authentication_before.saturating_sub(authentication_guard.len());
+
+        Ok((registration_pruned + authentication_pruned) as u64)
     }
 }
 

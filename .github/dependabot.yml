@@ -1,0 +1,77 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "04:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 20
+    rebase-strategy: "auto"
+    labels:
+      - "dependencies"
+      - "security"
+      - "rust"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      cargo-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      cargo-major:
+        patterns:
+          - "*"
+        update-types:
+          - "major"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "04:20"
+      timezone: "UTC"
+    open-pull-requests-limit: 10
+    rebase-strategy: "auto"
+    labels:
+      - "dependencies"
+      - "security"
+      - "github-actions"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      actions-major:
+        patterns:
+          - "*"
+        update-types:
+          - "major"
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "04:40"
+      timezone: "UTC"
+    open-pull-requests-limit: 10
+    rebase-strategy: "auto"
+    labels:
+      - "dependencies"
+      - "security"
+      - "docker"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      docker-base-images:
+        patterns:
+          - "*"

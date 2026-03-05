@@ -1,6 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::PgPool;
 
@@ -34,6 +38,112 @@ impl ComponentState {
             detail: Some(detail),
         }
     }
+
+    fn degraded(detail: String) -> Self {
+        Self {
+            status: "degraded".to_string(),
+            detail: Some(detail),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PasskeyChallengeJanitorTimeline {
+    last_success_at: Option<DateTime<Utc>>,
+    last_failure_at: Option<DateTime<Utc>>,
+    last_failure_detail: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct PasskeyChallengeJanitorHealth {
+    enabled: bool,
+    stale_after: chrono::Duration,
+    timeline: Mutex<PasskeyChallengeJanitorTimeline>,
+}
+
+impl PasskeyChallengeJanitorHealth {
+    pub fn new(enabled: bool, stale_after: Duration) -> Self {
+        let stale_after =
+            chrono::Duration::from_std(stale_after).unwrap_or_else(|_| chrono::Duration::hours(24));
+        Self {
+            enabled,
+            stale_after,
+            timeline: Mutex::new(PasskeyChallengeJanitorTimeline::default()),
+        }
+    }
+
+    pub fn record_success(&self, now: DateTime<Utc>) {
+        if let Ok(mut timeline) = self.timeline.lock() {
+            timeline.last_success_at = Some(now);
+        }
+    }
+
+    pub fn record_failure(&self, now: DateTime<Utc>, detail: String) {
+        if let Ok(mut timeline) = self.timeline.lock() {
+            timeline.last_failure_at = Some(now);
+            timeline.last_failure_detail = Some(detail);
+        }
+    }
+
+    fn as_component_state(&self) -> ComponentState {
+        if !self.enabled {
+            return ComponentState::not_configured();
+        }
+
+        let Ok(timeline) = self.timeline.lock() else {
+            return ComponentState::degraded(
+                "passkey janitor health state is unavailable".to_string(),
+            );
+        };
+
+        let last_success_at = timeline.last_success_at;
+        let last_failure_at = timeline.last_failure_at;
+        let last_failure_detail = timeline.last_failure_detail.clone();
+
+        if last_success_at.is_none() && last_failure_at.is_none() {
+            return ComponentState {
+                status: "starting".to_string(),
+                detail: Some("waiting for first passkey janitor execution".to_string()),
+            };
+        }
+
+        let last_success_display = last_success_at
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_else(|| "never".to_string());
+        let last_failure_display = last_failure_at
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_else(|| "never".to_string());
+        let last_failure_detail_display = last_failure_detail
+            .unwrap_or_else(|| "none".to_string())
+            .replace('\n', " ");
+        let detail = format!(
+            "last_success_at={last_success_display}; last_failure_at={last_failure_display}; last_failure_detail={last_failure_detail_display}"
+        );
+
+        if let Some(last_failure_at) = last_failure_at {
+            let failure_is_newer_than_success = last_success_at
+                .map(|success| last_failure_at > success)
+                .unwrap_or(true);
+            if failure_is_newer_than_success {
+                return ComponentState::degraded(detail);
+            }
+        }
+
+        if let Some(last_success_at) = last_success_at {
+            let staleness = Utc::now().signed_duration_since(last_success_at);
+            if staleness > self.stale_after {
+                return ComponentState::degraded(format!(
+                    "{detail}; stale_for_seconds={}",
+                    staleness.num_seconds().max(0)
+                ));
+            }
+        }
+
+        ComponentState {
+            status: "ok".to_string(),
+            detail: Some(detail),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -41,6 +151,7 @@ pub struct ReadinessComponents {
     pub app: ComponentState,
     pub database: ComponentState,
     pub redis: ComponentState,
+    pub passkey_challenge_janitor: ComponentState,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -119,14 +230,18 @@ pub struct RuntimeReadinessChecker {
     runtime: AuthRuntime,
     timeout: Duration,
     dependencies: Vec<Arc<dyn DependencyProbe>>,
+    passkey_challenge_janitor_health: Arc<PasskeyChallengeJanitorHealth>,
 }
 
 impl RuntimeReadinessChecker {
-    pub fn inmemory() -> Arc<dyn ReadinessChecker> {
+    pub fn inmemory(
+        passkey_challenge_janitor_health: Arc<PasskeyChallengeJanitorHealth>,
+    ) -> Arc<dyn ReadinessChecker> {
         Arc::new(Self {
             runtime: AuthRuntime::InMemory,
             timeout: Duration::from_secs(1),
             dependencies: Vec::new(),
+            passkey_challenge_janitor_health,
         })
     }
 
@@ -134,6 +249,7 @@ impl RuntimeReadinessChecker {
         pool: PgPool,
         redis_client: Option<redis::Client>,
         timeout: Duration,
+        passkey_challenge_janitor_health: Arc<PasskeyChallengeJanitorHealth>,
     ) -> Arc<dyn ReadinessChecker> {
         let mut dependencies: Vec<Arc<dyn DependencyProbe>> = Vec::new();
         dependencies.push(Arc::new(PostgresProbe { pool }));
@@ -146,6 +262,7 @@ impl RuntimeReadinessChecker {
             runtime: AuthRuntime::PostgresRedis,
             timeout,
             dependencies,
+            passkey_challenge_janitor_health,
         })
     }
 }
@@ -157,6 +274,7 @@ impl ReadinessChecker for RuntimeReadinessChecker {
             app: ComponentState::ok(),
             database: ComponentState::not_configured(),
             redis: ComponentState::not_configured(),
+            passkey_challenge_janitor: ComponentState::not_configured(),
         };
         let mut is_ready = true;
 
@@ -182,6 +300,9 @@ impl ReadinessChecker for RuntimeReadinessChecker {
             }
         }
 
+        components.passkey_challenge_janitor =
+            self.passkey_challenge_janitor_health.as_component_state();
+
         let payload = ReadinessPayload {
             status: if is_ready {
                 "ok".to_string()
@@ -196,5 +317,71 @@ impl ReadinessChecker for RuntimeReadinessChecker {
         };
 
         ReadinessReport { is_ready, payload }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PasskeyChallengeJanitorHealth, RuntimeReadinessChecker};
+    use chrono::{Duration, Utc};
+    use std::sync::Arc;
+    use std::time::Duration as StdDuration;
+
+    #[test]
+    fn passkey_janitor_reports_not_configured_when_disabled() {
+        let health = PasskeyChallengeJanitorHealth::new(false, StdDuration::from_secs(60));
+
+        let state = health.as_component_state();
+
+        assert_eq!(state.status, "not_configured");
+        assert!(state.detail.is_none());
+    }
+
+    #[test]
+    fn passkey_janitor_reports_degraded_when_failure_is_newer_than_success() {
+        let health = PasskeyChallengeJanitorHealth::new(true, StdDuration::from_secs(60));
+        let now = Utc::now();
+        health.record_success(now - Duration::seconds(30));
+        health.record_failure(now, "db timeout".to_string());
+
+        let state = health.as_component_state();
+
+        assert_eq!(state.status, "degraded");
+        assert!(state
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("db timeout"));
+    }
+
+    #[tokio::test]
+    async fn readiness_payload_includes_passkey_janitor_component() {
+        let checker = RuntimeReadinessChecker::inmemory(Arc::new(
+            PasskeyChallengeJanitorHealth::new(true, StdDuration::from_secs(60)),
+        ));
+
+        let report = checker.check().await;
+
+        assert!(report.is_ready);
+        assert_eq!(
+            report.payload.components.passkey_challenge_janitor.status,
+            "starting"
+        );
+    }
+
+    #[test]
+    fn passkey_janitor_reports_degraded_when_success_is_stale() {
+        let health = PasskeyChallengeJanitorHealth::new(true, StdDuration::from_secs(60));
+        let now = Utc::now();
+        health.record_success(now - Duration::seconds(180));
+
+        let state = health.as_component_state();
+
+        assert_eq!(state.status, "degraded");
+        assert!(state
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("stale_for_seconds="));
     }
 }

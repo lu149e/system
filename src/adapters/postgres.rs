@@ -1,8 +1,10 @@
 use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use uuid::Uuid;
+use webauthn_rs::prelude::{Passkey, PasskeyAuthentication, PasskeyRegistration};
 
 use crate::{
     adapters::outbox::PostgresEmailOutboxRepository,
@@ -17,6 +19,9 @@ use crate::{
             ports::{
                 MfaBackupCodeConsumeState, MfaBackupCodeRepository, MfaChallengeFailureState,
                 MfaChallengeLookupState, MfaChallengeRepository, MfaFactorRepository,
+                PasskeyAuthenticationChallengeConsumeState, PasskeyAuthenticationChallengeRecord,
+                PasskeyChallengeRepository, PasskeyCredentialRepository,
+                PasskeyRegistrationChallengeConsumeState, PasskeyRegistrationChallengeRecord,
                 PasswordResetTokenConsumeState, PasswordResetTokenRepository, UserRepository,
                 VerificationTokenConsumeState, VerificationTokenRepository,
             },
@@ -41,6 +46,8 @@ pub struct PostgresAdapters {
     pub mfa_factors: PostgresMfaFactorRepository,
     pub mfa_challenges: PostgresMfaChallengeRepository,
     pub mfa_backup_codes: PostgresMfaBackupCodeRepository,
+    pub passkeys: PostgresPasskeyCredentialRepository,
+    pub passkey_challenges: PostgresPasskeyChallengeRepository,
     pub sessions: PostgresSessionRepository,
     pub refresh_tokens: PostgresRefreshTokenRepository,
     pub audit: PostgresAuditRepository,
@@ -67,6 +74,8 @@ impl PostgresAdapters {
             mfa_factors: PostgresMfaFactorRepository { pool: pool.clone() },
             mfa_challenges: PostgresMfaChallengeRepository { pool: pool.clone() },
             mfa_backup_codes: PostgresMfaBackupCodeRepository { pool: pool.clone() },
+            passkeys: PostgresPasskeyCredentialRepository { pool: pool.clone() },
+            passkey_challenges: PostgresPasskeyChallengeRepository { pool: pool.clone() },
             sessions: PostgresSessionRepository { pool: pool.clone() },
             refresh_tokens: PostgresRefreshTokenRepository { pool: pool.clone() },
             audit: PostgresAuditRepository { pool: pool.clone() },
@@ -877,6 +886,280 @@ impl MfaBackupCodeRepository for PostgresMfaBackupCodeRepository {
 }
 
 #[derive(Clone)]
+pub struct PostgresPasskeyCredentialRepository {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl PasskeyCredentialRepository for PostgresPasskeyCredentialRepository {
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<Passkey>, String> {
+        let rows = sqlx::query(
+            "SELECT passkey_data
+             FROM passkey_credentials
+             WHERE user_id = $1::uuid
+             ORDER BY created_at ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| "passkey credential fetch failed".to_string())?;
+
+        let mut passkeys = Vec::with_capacity(rows.len());
+        for row in rows {
+            let passkey_data: serde_json::Value = row
+                .try_get("passkey_data")
+                .map_err(|_| "invalid passkey payload".to_string())?;
+            let passkey: Passkey = serde_json::from_value(passkey_data)
+                .map_err(|_| "invalid passkey payload".to_string())?;
+            passkeys.push(passkey);
+        }
+
+        Ok(passkeys)
+    }
+
+    async fn upsert_for_user(
+        &self,
+        user_id: &str,
+        passkey: Passkey,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let credential_id = passkey_credential_key(&passkey);
+        let passkey_data = serde_json::to_value(&passkey)
+            .map_err(|_| "passkey serialization failed".to_string())?;
+
+        sqlx::query(
+            "INSERT INTO passkey_credentials (user_id, credential_id, passkey_data, created_at, updated_at)
+             VALUES ($1::uuid, $2, $3::jsonb, $4, $4)
+             ON CONFLICT (user_id, credential_id)
+             DO UPDATE SET
+               passkey_data = EXCLUDED.passkey_data,
+               updated_at = EXCLUDED.updated_at",
+        )
+        .bind(user_id)
+        .bind(credential_id)
+        .bind(passkey_data)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| {
+            if let sqlx::Error::Database(database_error) = &error {
+                if database_error.code().as_deref() == Some("23505") {
+                    return "passkey credential already registered".to_string();
+                }
+            }
+
+            "passkey credential upsert failed".to_string()
+        })?;
+
+        Ok(())
+    }
+}
+
+fn passkey_credential_key(passkey: &Passkey) -> String {
+    URL_SAFE_NO_PAD.encode(passkey.cred_id().as_ref())
+}
+
+#[derive(Clone)]
+pub struct PostgresPasskeyChallengeRepository {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl PasskeyChallengeRepository for PostgresPasskeyChallengeRepository {
+    async fn issue_registration(
+        &self,
+        flow_id: &str,
+        challenge: PasskeyRegistrationChallengeRecord,
+    ) -> Result<(), String> {
+        let challenge_state = serde_json::to_value(&challenge.state)
+            .map_err(|_| "passkey registration challenge serialization failed".to_string())?;
+
+        let mut tx =
+            self.pool.begin().await.map_err(|_| {
+                "passkey registration challenge transaction begin failed".to_string()
+            })?;
+
+        sqlx::query(
+            "DELETE FROM passkey_challenges
+             WHERE user_id = $1::uuid AND challenge_type = 'registration'",
+        )
+        .bind(&challenge.user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "passkey registration challenge cleanup failed".to_string())?;
+
+        sqlx::query(
+            "INSERT INTO passkey_challenges (flow_id, user_id, challenge_type, challenge_state, expires_at, created_at)
+             VALUES ($1, $2::uuid, 'registration', $3::jsonb, $4, $5)",
+        )
+        .bind(flow_id)
+        .bind(&challenge.user_id)
+        .bind(challenge_state)
+        .bind(challenge.expires_at)
+        .bind(challenge.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "passkey registration challenge insert failed".to_string())?;
+
+        tx.commit()
+            .await
+            .map_err(|_| "passkey registration challenge transaction commit failed".to_string())?;
+
+        Ok(())
+    }
+
+    async fn consume_registration(
+        &self,
+        flow_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<PasskeyRegistrationChallengeConsumeState, String> {
+        let row = sqlx::query(
+            "DELETE FROM passkey_challenges
+             WHERE flow_id = $1 AND challenge_type = 'registration'
+             RETURNING user_id::text AS user_id, challenge_state, created_at, expires_at",
+        )
+        .bind(flow_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| "passkey registration challenge consume failed".to_string())?;
+
+        let Some(row) = row else {
+            return Ok(PasskeyRegistrationChallengeConsumeState::NotFound);
+        };
+
+        let user_id: String = row
+            .try_get("user_id")
+            .map_err(|_| "invalid passkey registration challenge user".to_string())?;
+        let challenge_state: serde_json::Value = row
+            .try_get("challenge_state")
+            .map_err(|_| "invalid passkey registration challenge payload".to_string())?;
+        let created_at: DateTime<Utc> = row
+            .try_get("created_at")
+            .map_err(|_| "invalid passkey registration challenge timestamp".to_string())?;
+        let expires_at: DateTime<Utc> = row
+            .try_get("expires_at")
+            .map_err(|_| "invalid passkey registration challenge expiration".to_string())?;
+
+        if expires_at <= now {
+            return Ok(PasskeyRegistrationChallengeConsumeState::Expired);
+        }
+
+        let state: PasskeyRegistration = serde_json::from_value(challenge_state)
+            .map_err(|_| "invalid passkey registration challenge payload".to_string())?;
+
+        Ok(PasskeyRegistrationChallengeConsumeState::Active(
+            PasskeyRegistrationChallengeRecord {
+                user_id,
+                state,
+                created_at,
+                expires_at,
+            },
+        ))
+    }
+
+    async fn issue_authentication(
+        &self,
+        flow_id: &str,
+        challenge: PasskeyAuthenticationChallengeRecord,
+    ) -> Result<(), String> {
+        let challenge_state = serde_json::to_value(&challenge.state)
+            .map_err(|_| "passkey authentication challenge serialization failed".to_string())?;
+
+        let mut tx =
+            self.pool.begin().await.map_err(|_| {
+                "passkey authentication challenge transaction begin failed".to_string()
+            })?;
+
+        sqlx::query(
+            "DELETE FROM passkey_challenges
+             WHERE user_id = $1::uuid AND challenge_type = 'authentication'",
+        )
+        .bind(&challenge.user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "passkey authentication challenge cleanup failed".to_string())?;
+
+        sqlx::query(
+            "INSERT INTO passkey_challenges (flow_id, user_id, challenge_type, challenge_state, expires_at, created_at)
+             VALUES ($1, $2::uuid, 'authentication', $3::jsonb, $4, $5)",
+        )
+        .bind(flow_id)
+        .bind(&challenge.user_id)
+        .bind(challenge_state)
+        .bind(challenge.expires_at)
+        .bind(challenge.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "passkey authentication challenge insert failed".to_string())?;
+
+        tx.commit().await.map_err(|_| {
+            "passkey authentication challenge transaction commit failed".to_string()
+        })?;
+
+        Ok(())
+    }
+
+    async fn consume_authentication(
+        &self,
+        flow_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<PasskeyAuthenticationChallengeConsumeState, String> {
+        let row = sqlx::query(
+            "DELETE FROM passkey_challenges
+             WHERE flow_id = $1 AND challenge_type = 'authentication'
+             RETURNING user_id::text AS user_id, challenge_state, created_at, expires_at",
+        )
+        .bind(flow_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| "passkey authentication challenge consume failed".to_string())?;
+
+        let Some(row) = row else {
+            return Ok(PasskeyAuthenticationChallengeConsumeState::NotFound);
+        };
+
+        let user_id: String = row
+            .try_get("user_id")
+            .map_err(|_| "invalid passkey authentication challenge user".to_string())?;
+        let challenge_state: serde_json::Value = row
+            .try_get("challenge_state")
+            .map_err(|_| "invalid passkey authentication challenge payload".to_string())?;
+        let created_at: DateTime<Utc> = row
+            .try_get("created_at")
+            .map_err(|_| "invalid passkey authentication challenge timestamp".to_string())?;
+        let expires_at: DateTime<Utc> = row
+            .try_get("expires_at")
+            .map_err(|_| "invalid passkey authentication challenge expiration".to_string())?;
+
+        if expires_at <= now {
+            return Ok(PasskeyAuthenticationChallengeConsumeState::Expired);
+        }
+
+        let state: PasskeyAuthentication = serde_json::from_value(challenge_state)
+            .map_err(|_| "invalid passkey authentication challenge payload".to_string())?;
+
+        Ok(PasskeyAuthenticationChallengeConsumeState::Active(
+            PasskeyAuthenticationChallengeRecord {
+                user_id,
+                state,
+                created_at,
+                expires_at,
+            },
+        ))
+    }
+
+    async fn prune_expired(&self, now: DateTime<Utc>) -> Result<u64, String> {
+        let deleted = sqlx::query("DELETE FROM passkey_challenges WHERE expires_at <= $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|_| "passkey challenge prune failed".to_string())?;
+
+        Ok(deleted.rows_affected())
+    }
+}
+
+#[derive(Clone)]
 pub struct PostgresSessionRepository {
     pool: PgPool,
 }
@@ -1284,7 +1567,8 @@ mod tests {
         ports::{RefreshRotationState, RefreshTokenRepository},
     };
 
-    use super::PostgresRefreshTokenRepository;
+    use super::{PostgresPasskeyChallengeRepository, PostgresRefreshTokenRepository};
+    use crate::modules::auth::ports::PasskeyChallengeRepository;
 
     #[tokio::test]
     async fn postgres_refresh_rotate_strong_returns_not_found_when_current_missing() {
@@ -1455,6 +1739,59 @@ mod tests {
         assert!(next.revoked_at.is_none());
     }
 
+    #[tokio::test]
+    async fn postgres_passkey_prune_expired_deletes_only_expired_rows() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresPasskeyChallengeRepository { pool: pool.clone() };
+
+        let now = Utc::now();
+        let user_id = create_user(&pool).await;
+        let flow_prefix = format!("passkey-prune-{}", uuid::Uuid::new_v4());
+        let expired_flow = format!("{flow_prefix}-expired");
+        let edge_flow = format!("{flow_prefix}-edge");
+        let active_flow = format!("{flow_prefix}-active");
+
+        sqlx::query(
+            "INSERT INTO passkey_challenges (flow_id, user_id, challenge_type, challenge_state, expires_at, created_at)
+             VALUES ($1, $2, 'registration', '{}'::jsonb, $3, $4),
+                    ($5, $2, 'authentication', '{}'::jsonb, $6, $4),
+                    ($7, $2, 'registration', '{}'::jsonb, $8, $4)",
+        )
+        .bind(&expired_flow)
+        .bind(user_id)
+        .bind(now - Duration::seconds(5))
+        .bind(now)
+        .bind(&edge_flow)
+        .bind(now)
+        .bind(&active_flow)
+        .bind(now + Duration::seconds(300))
+        .execute(&pool)
+        .await
+        .expect("passkey challenges should be inserted");
+
+        let deleted = repo
+            .prune_expired(now)
+            .await
+            .expect("prune should execute successfully");
+        assert_eq!(deleted, 2);
+
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM passkey_challenges WHERE flow_id LIKE $1")
+                .bind(format!("{flow_prefix}%"))
+                .fetch_one(&pool)
+                .await
+                .expect("remaining count should be queryable");
+        assert_eq!(remaining, 1);
+
+        let second_deleted = repo
+            .prune_expired(now)
+            .await
+            .expect("second prune should execute successfully");
+        assert_eq!(second_deleted, 0);
+    }
+
     async fn test_pool() -> Option<PgPool> {
         if let Some(database_url) = non_empty_env("AUTH_TEST_DATABASE_URL") {
             return Some(
@@ -1505,20 +1842,8 @@ mod tests {
 
     async fn create_user_and_session(pool: &PgPool) -> String {
         let now = Utc::now();
-        let user_id = uuid::Uuid::new_v4();
+        let user_id = create_user(pool).await;
         let session_id = uuid::Uuid::new_v4();
-
-        sqlx::query(
-            "INSERT INTO users (id, email, status, created_at, updated_at)
-             VALUES ($1, $2, 'active', $3, $4)",
-        )
-        .bind(user_id)
-        .bind(format!("postgres-refresh-test-{}@example.com", user_id))
-        .bind(now)
-        .bind(now)
-        .execute(pool)
-        .await
-        .expect("test user should be inserted");
 
         sqlx::query(
             "INSERT INTO sessions (id, user_id, device_info, ip, status, created_at, last_seen_at)
@@ -1534,6 +1859,25 @@ mod tests {
         .expect("test session should be inserted");
 
         session_id.to_string()
+    }
+
+    async fn create_user(pool: &PgPool) -> uuid::Uuid {
+        let now = Utc::now();
+        let user_id = uuid::Uuid::new_v4();
+
+        sqlx::query(
+            "INSERT INTO users (id, email, status, created_at, updated_at)
+             VALUES ($1, $2, 'active', $3, $4)",
+        )
+        .bind(user_id)
+        .bind(format!("postgres-refresh-test-{}@example.com", user_id))
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("test user should be inserted");
+
+        user_id
     }
 
     fn refresh_record(

@@ -12,6 +12,7 @@ use serde_json::json;
 use sha1::Sha1;
 use thiserror::Error;
 use uuid::Uuid;
+use webauthn_rs::prelude::{Passkey, PublicKeyCredential, RegisterPublicKeyCredential, Webauthn};
 
 use crate::modules::{
     audit::{domain::AuditEvent, ports::AuditRepository},
@@ -21,11 +22,14 @@ use crate::modules::{
             VerificationTokenRecord,
         },
         ports::{
-            LoginAbuseProtector, LoginGateDecision, MfaBackupCodeConsumeState,
-            MfaBackupCodeRepository, MfaChallengeFailureState, MfaChallengeLookupState,
-            MfaChallengeRepository, MfaFactorRepository, PasswordResetTokenConsumeState,
-            PasswordResetTokenRepository, TransactionalEmailSender, UserRepository,
-            VerificationTokenConsumeState, VerificationTokenRepository,
+            LoginAbuseProtector, LoginGateDecision, LoginRiskAnalyzer, LoginRiskDecision,
+            MfaBackupCodeConsumeState, MfaBackupCodeRepository, MfaChallengeFailureState,
+            MfaChallengeLookupState, MfaChallengeRepository, MfaFactorRepository,
+            PasskeyAuthenticationChallengeConsumeState, PasskeyAuthenticationChallengeRecord,
+            PasskeyChallengeRepository, PasskeyCredentialRepository,
+            PasskeyRegistrationChallengeConsumeState, PasskeyRegistrationChallengeRecord,
+            PasswordResetTokenConsumeState, PasswordResetTokenRepository, TransactionalEmailSender,
+            UserRepository, VerificationTokenConsumeState, VerificationTokenRepository,
         },
     },
     sessions::{
@@ -44,11 +48,14 @@ type HmacSha1 = Hmac<Sha1>;
 pub struct AuthService {
     users: Arc<dyn UserRepository>,
     login_abuse: Arc<dyn LoginAbuseProtector>,
+    login_risk: Arc<dyn LoginRiskAnalyzer>,
     verification_tokens: Arc<dyn VerificationTokenRepository>,
     password_reset_tokens: Arc<dyn PasswordResetTokenRepository>,
     mfa_factors: Arc<dyn MfaFactorRepository>,
     mfa_challenges: Arc<dyn MfaChallengeRepository>,
     mfa_backup_codes: Arc<dyn MfaBackupCodeRepository>,
+    passkeys: Arc<dyn PasskeyCredentialRepository>,
+    passkey_challenges: Arc<dyn PasskeyChallengeRepository>,
     sessions: Arc<dyn SessionRepository>,
     refresh_tokens: Arc<dyn RefreshTokenRepository>,
     audit: Arc<dyn AuditRepository>,
@@ -65,6 +72,7 @@ pub struct AuthService {
     mfa_encryption_key: [u8; 32],
     jwt_issuer: String,
     jwt_audience: String,
+    passkey_webauthn: Option<Webauthn>,
     dummy_password_hash: Option<String>,
 }
 
@@ -103,6 +111,12 @@ pub enum AuthError {
     LoginLocked { retry_after_seconds: i64 },
     #[error("account is not active")]
     AccountNotActive,
+    #[error("passkey authentication is disabled")]
+    PasskeyDisabled,
+    #[error("invalid or expired passkey challenge")]
+    InvalidPasskeyChallenge,
+    #[error("invalid passkey response")]
+    InvalidPasskeyResponse,
     #[error("invalid token")]
     InvalidToken,
     #[error("token expired")]
@@ -229,6 +243,12 @@ pub struct MfaChallengeRequired {
     pub message: String,
 }
 
+#[derive(Clone, Serialize)]
+pub struct PasskeyChallenge {
+    pub flow_id: String,
+    pub options: serde_json::Value,
+}
+
 #[derive(Clone)]
 pub enum LoginResult {
     Authenticated {
@@ -249,11 +269,14 @@ impl AuthService {
     pub fn new(
         users: Arc<dyn UserRepository>,
         login_abuse: Arc<dyn LoginAbuseProtector>,
+        login_risk: Arc<dyn LoginRiskAnalyzer>,
         verification_tokens: Arc<dyn VerificationTokenRepository>,
         password_reset_tokens: Arc<dyn PasswordResetTokenRepository>,
         mfa_factors: Arc<dyn MfaFactorRepository>,
         mfa_challenges: Arc<dyn MfaChallengeRepository>,
         mfa_backup_codes: Arc<dyn MfaBackupCodeRepository>,
+        passkeys: Arc<dyn PasskeyCredentialRepository>,
+        passkey_challenges: Arc<dyn PasskeyChallengeRepository>,
         sessions: Arc<dyn SessionRepository>,
         refresh_tokens: Arc<dyn RefreshTokenRepository>,
         audit: Arc<dyn AuditRepository>,
@@ -268,6 +291,7 @@ impl AuthService {
         mfa_challenge_max_attempts: u32,
         mfa_totp_issuer: String,
         mfa_encryption_key_base64: String,
+        passkey_webauthn: Option<Webauthn>,
         jwt_issuer: String,
         jwt_audience: String,
     ) -> anyhow::Result<Self> {
@@ -285,11 +309,14 @@ impl AuthService {
         Ok(Self {
             users,
             login_abuse,
+            login_risk,
             verification_tokens,
             password_reset_tokens,
             mfa_factors,
             mfa_challenges,
             mfa_backup_codes,
+            passkeys,
+            passkey_challenges,
             sessions,
             refresh_tokens,
             audit,
@@ -306,6 +333,7 @@ impl AuthService {
             mfa_encryption_key,
             jwt_issuer,
             jwt_audience,
+            passkey_webauthn,
             dummy_password_hash: build_dummy_password_hash(),
         })
     }
@@ -913,6 +941,383 @@ impl AuthService {
         Ok(())
     }
 
+    pub async fn passkey_register_start(
+        &self,
+        user_id: &str,
+        ctx: RequestContext,
+    ) -> Result<PasskeyChallenge, AuthError> {
+        let webauthn = self.passkey_webauthn()?;
+        let user = self
+            .users
+            .find_by_id(user_id)
+            .await
+            .ok_or(AuthError::InvalidCredentials)?;
+        if user.status != UserStatus::Active {
+            self.audit_passkey_register_rejected(
+                "account_not_active",
+                Some(user.id.as_str()),
+                None,
+                &ctx,
+            )
+            .await;
+            return Err(AuthError::InvalidCredentials);
+        }
+        let user_uuid = Uuid::parse_str(&user.id).map_err(|_| AuthError::Internal)?;
+
+        let existing_passkeys = self.load_passkeys_for_user(&user.id).await?;
+        let exclude_credentials = if existing_passkeys.is_empty() {
+            None
+        } else {
+            Some(
+                existing_passkeys
+                    .iter()
+                    .map(|passkey| passkey.cred_id().clone())
+                    .collect(),
+            )
+        };
+
+        let (options, state) = webauthn
+            .start_passkey_registration(user_uuid, &user.email, &user.email, exclude_credentials)
+            .map_err(|_| AuthError::Internal)?;
+        let flow_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        self.passkey_challenges
+            .issue_registration(
+                &flow_id,
+                PasskeyRegistrationChallengeRecord {
+                    user_id: user.id.clone(),
+                    state,
+                    created_at: now,
+                    expires_at: self.passkey_challenge_expires_at(now),
+                },
+            )
+            .await
+            .map_err(|_| AuthError::Internal)?;
+
+        self.audit
+            .append(AuditEvent {
+                event_type: "auth.passkey.register.challenge.issued".to_string(),
+                actor_user_id: Some(user.id),
+                trace_id: ctx.trace_id,
+                metadata: json!({"ip": ctx.ip, "user_agent": ctx.user_agent}),
+                created_at: now,
+            })
+            .await;
+
+        Ok(PasskeyChallenge {
+            flow_id,
+            options: serde_json::to_value(options).map_err(|_| AuthError::Internal)?,
+        })
+    }
+
+    pub async fn passkey_register_finish(
+        &self,
+        user_id: &str,
+        flow_id: &str,
+        credential: RegisterPublicKeyCredential,
+        ctx: RequestContext,
+    ) -> Result<(), AuthError> {
+        let webauthn = self.passkey_webauthn()?;
+        let pending = match self
+            .passkey_challenges
+            .consume_registration(flow_id, Utc::now())
+            .await
+            .map_err(|_| AuthError::Internal)?
+        {
+            PasskeyRegistrationChallengeConsumeState::Active(challenge) => challenge,
+            PasskeyRegistrationChallengeConsumeState::NotFound
+            | PasskeyRegistrationChallengeConsumeState::Expired => {
+                self.audit_passkey_register_rejected(
+                    "invalid_or_expired_challenge",
+                    Some(user_id),
+                    Some(flow_id),
+                    &ctx,
+                )
+                .await;
+                return Err(AuthError::InvalidPasskeyChallenge);
+            }
+        };
+
+        if pending.user_id != user_id {
+            self.audit_passkey_register_rejected(
+                "challenge_user_mismatch",
+                Some(user_id),
+                Some(flow_id),
+                &ctx,
+            )
+            .await;
+            return Err(AuthError::InvalidPasskeyChallenge);
+        }
+
+        let user = self
+            .users
+            .find_by_id(user_id)
+            .await
+            .ok_or(AuthError::InvalidCredentials)?;
+        if user.status != UserStatus::Active {
+            self.audit_passkey_register_rejected(
+                "account_not_active",
+                Some(user_id),
+                Some(flow_id),
+                &ctx,
+            )
+            .await;
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        let passkey = webauthn
+            .finish_passkey_registration(&credential, &pending.state)
+            .map_err(|_| AuthError::InvalidPasskeyResponse);
+        let passkey = match passkey {
+            Ok(passkey) => passkey,
+            Err(err) => {
+                self.audit_passkey_register_rejected(
+                    "invalid_passkey_response",
+                    Some(user_id),
+                    Some(flow_id),
+                    &ctx,
+                )
+                .await;
+                return Err(err);
+            }
+        };
+        self.upsert_passkey_for_user(user_id, passkey).await?;
+
+        self.audit
+            .append(AuditEvent {
+                event_type: "auth.passkey.register.success".to_string(),
+                actor_user_id: Some(user_id.to_string()),
+                trace_id: ctx.trace_id,
+                metadata: json!({"ip": ctx.ip, "user_agent": ctx.user_agent, "challenge_created_at": pending.created_at}),
+                created_at: Utc::now(),
+            })
+            .await;
+
+        Ok(())
+    }
+
+    pub async fn passkey_login_start(
+        &self,
+        email: &str,
+        ctx: RequestContext,
+    ) -> Result<PasskeyChallenge, AuthError> {
+        let webauthn = self.passkey_webauthn()?;
+        let email = email.to_ascii_lowercase();
+        let now = Utc::now();
+
+        match self.login_abuse.check(&email, ctx.ip.as_deref(), now).await {
+            LoginGateDecision::Allowed => {}
+            LoginGateDecision::Locked { until } => {
+                let retry_after_seconds = (until - now).num_seconds().max(1);
+                self.audit_login_locked(&email, &ctx, retry_after_seconds)
+                    .await;
+                return Err(AuthError::LoginLocked {
+                    retry_after_seconds,
+                });
+            }
+        }
+
+        let user = self.users.find_by_email(&email).await;
+        if user.is_none() {
+            self.audit_login_failed(&email, &ctx).await;
+            self.try_lock_login(&email, ctx.ip.as_deref(), &ctx, now)
+                .await;
+            return Err(AuthError::InvalidCredentials);
+        }
+        let user = user.expect("checked is_some");
+
+        if user.status != UserStatus::Active {
+            self.audit_login_rejected("account_not_active", &email, Some(user.id.as_str()), &ctx)
+                .await;
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        let passkeys = self.load_passkeys_for_user(&user.id).await?;
+        if passkeys.is_empty() {
+            self.audit_login_rejected(
+                "passkey_not_registered",
+                &email,
+                Some(user.id.as_str()),
+                &ctx,
+            )
+            .await;
+            self.try_lock_login(&email, ctx.ip.as_deref(), &ctx, now)
+                .await;
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        let (options, state) = webauthn
+            .start_passkey_authentication(&passkeys)
+            .map_err(|_| AuthError::InvalidPasskeyResponse)?;
+        let flow_id = Uuid::new_v4().to_string();
+        self.passkey_challenges
+            .issue_authentication(
+                &flow_id,
+                PasskeyAuthenticationChallengeRecord {
+                    user_id: user.id.clone(),
+                    state,
+                    created_at: now,
+                    expires_at: self.passkey_challenge_expires_at(now),
+                },
+            )
+            .await
+            .map_err(|_| AuthError::Internal)?;
+
+        self.audit
+            .append(AuditEvent {
+                event_type: "auth.passkey.login.challenge.issued".to_string(),
+                actor_user_id: Some(user.id),
+                trace_id: ctx.trace_id,
+                metadata: json!({"ip": ctx.ip, "user_agent": ctx.user_agent}),
+                created_at: now,
+            })
+            .await;
+
+        Ok(PasskeyChallenge {
+            flow_id,
+            options: serde_json::to_value(options).map_err(|_| AuthError::Internal)?,
+        })
+    }
+
+    pub async fn passkey_login_finish(
+        &self,
+        flow_id: &str,
+        credential: PublicKeyCredential,
+        device_info: Option<String>,
+        ctx: RequestContext,
+    ) -> Result<LoginResult, AuthError> {
+        let webauthn = self.passkey_webauthn()?;
+        let pending = match self
+            .passkey_challenges
+            .consume_authentication(flow_id, Utc::now())
+            .await
+            .map_err(|_| AuthError::Internal)?
+        {
+            PasskeyAuthenticationChallengeConsumeState::Active(challenge) => challenge,
+            PasskeyAuthenticationChallengeConsumeState::NotFound
+            | PasskeyAuthenticationChallengeConsumeState::Expired => {
+                self.audit_passkey_login_rejected(
+                    "invalid_or_expired_challenge",
+                    None,
+                    Some(flow_id),
+                    &ctx,
+                )
+                .await;
+                return Err(AuthError::InvalidPasskeyChallenge);
+            }
+        };
+
+        let user = self
+            .users
+            .find_by_id(&pending.user_id)
+            .await
+            .ok_or(AuthError::InvalidCredentials)?;
+        if user.status != UserStatus::Active {
+            self.audit_passkey_login_rejected(
+                "account_not_active",
+                Some(user.id.as_str()),
+                Some(flow_id),
+                &ctx,
+            )
+            .await;
+            self.audit_login_rejected(
+                "account_not_active",
+                &user.email,
+                Some(user.id.as_str()),
+                &ctx,
+            )
+            .await;
+            self.try_lock_login(&user.email, ctx.ip.as_deref(), &ctx, Utc::now())
+                .await;
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        let mut passkeys = self.load_passkeys_for_user(&user.id).await?;
+        if passkeys.is_empty() {
+            self.audit_passkey_login_rejected(
+                "passkey_not_registered",
+                Some(user.id.as_str()),
+                Some(flow_id),
+                &ctx,
+            )
+            .await;
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        let auth_result = match webauthn.finish_passkey_authentication(&credential, &pending.state)
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.audit_passkey_login_rejected(
+                    "invalid_passkey_response",
+                    Some(user.id.as_str()),
+                    Some(flow_id),
+                    &ctx,
+                )
+                .await;
+                self.audit_login_failed(&user.email, &ctx).await;
+                self.try_lock_login(&user.email, ctx.ip.as_deref(), &ctx, Utc::now())
+                    .await;
+                return Err(AuthError::InvalidCredentials);
+            }
+        };
+
+        let mut updated_passkeys = Vec::new();
+        for passkey in &mut passkeys {
+            if passkey.update_credential(&auth_result).is_some() {
+                updated_passkeys.push(passkey.clone());
+            }
+        }
+        for updated_passkey in updated_passkeys {
+            self.upsert_passkey_for_user(&user.id, updated_passkey)
+                .await?;
+        }
+
+        let mfa_enabled = self
+            .mfa_factors
+            .find_by_user_id(&user.id)
+            .await
+            .map(|factor| factor.enabled_at.is_some())
+            .unwrap_or(false);
+        let now = Utc::now();
+        let forced_step_up_reason = self
+            .evaluate_login_risk_policy(&user.email, &user.id, mfa_enabled, &ctx, now)
+            .await?;
+
+        self.login_abuse
+            .register_success(&user.email, ctx.ip.as_deref())
+            .await;
+
+        if let Some(reason) = forced_step_up_reason.as_deref() {
+            return self
+                .issue_mfa_challenge(
+                    &user.id,
+                    device_info,
+                    &ctx,
+                    now,
+                    "Additional verification required",
+                    Some(reason),
+                )
+                .await;
+        }
+
+        let (tokens, principal) = self
+            .issue_session_tokens(&user.id, device_info, &ctx, now)
+            .await?;
+
+        self.audit
+            .append(AuditEvent {
+                event_type: "auth.passkey.login.success".to_string(),
+                actor_user_id: Some(user.id),
+                trace_id: ctx.trace_id,
+                metadata: json!({"session_id": principal.session_id, "ip": ctx.ip, "user_agent": ctx.user_agent, "challenge_created_at": pending.created_at}),
+                created_at: Utc::now(),
+            })
+            .await;
+
+        Ok(LoginResult::Authenticated { tokens, principal })
+    }
+
     pub async fn login(
         &self,
         cmd: LoginCommand,
@@ -920,6 +1325,7 @@ impl AuthService {
     ) -> Result<LoginResult, AuthError> {
         let email = cmd.email.to_ascii_lowercase();
         let now = Utc::now();
+        let device_info = cmd.device_info.clone();
 
         match self.login_abuse.check(&email, ctx.ip.as_deref(), now).await {
             LoginGateDecision::Allowed => {}
@@ -969,47 +1375,40 @@ impl AuthService {
             return Err(AuthError::AccountNotActive);
         }
 
+        let mfa_enabled = self
+            .mfa_factors
+            .find_by_user_id(&user.id)
+            .await
+            .map(|factor| factor.enabled_at.is_some())
+            .unwrap_or(false);
+        let forced_step_up_reason = self
+            .evaluate_login_risk_policy(&email, &user.id, mfa_enabled, &ctx, now)
+            .await?;
+
         self.login_abuse
             .register_success(&email, ctx.ip.as_deref())
             .await;
 
-        if let Some(factor) = self.mfa_factors.find_by_user_id(&user.id).await {
-            if factor.enabled_at.is_some() {
-                let challenge_id = self.refresh_crypto.generate_refresh_token().await;
-                let challenge_hash = self.refresh_crypto.hash_refresh_token(&challenge_id).await;
-                self.mfa_challenges
-                    .issue(MfaChallengeRecord {
-                        id: Uuid::new_v4().to_string(),
-                        user_id: user.id.clone(),
-                        challenge_hash,
-                        device_info: cmd.device_info,
-                        failed_attempts: 0,
-                        expires_at: now + Duration::seconds(self.mfa_challenge_ttl_seconds),
-                        used_at: None,
-                        created_at: now,
-                    })
-                    .await
-                    .map_err(|_| AuthError::Internal)?;
-
-                self.audit
-                    .append(AuditEvent {
-                        event_type: "auth.mfa.challenge.issued".to_string(),
-                        actor_user_id: Some(user.id),
-                        trace_id: ctx.trace_id,
-                        metadata: json!({"ip": ctx.ip, "user_agent": ctx.user_agent}),
-                        created_at: now,
-                    })
-                    .await;
-
-                return Ok(LoginResult::MfaRequired(MfaChallengeRequired {
-                    challenge_id,
-                    message: "Multi-factor authentication required".to_string(),
-                }));
-            }
+        if mfa_enabled {
+            let message = if forced_step_up_reason.is_some() {
+                "Additional verification required"
+            } else {
+                "Multi-factor authentication required"
+            };
+            return self
+                .issue_mfa_challenge(
+                    &user.id,
+                    device_info,
+                    &ctx,
+                    now,
+                    message,
+                    forced_step_up_reason.as_deref(),
+                )
+                .await;
         }
 
         let (tokens, principal) = self
-            .issue_session_tokens(&user.id, cmd.device_info, &ctx, now)
+            .issue_session_tokens(&user.id, device_info, &ctx, now)
             .await?;
 
         self.audit
@@ -1023,6 +1422,102 @@ impl AuthService {
             .await;
 
         Ok(LoginResult::Authenticated { tokens, principal })
+    }
+
+    async fn issue_mfa_challenge(
+        &self,
+        user_id: &str,
+        device_info: Option<String>,
+        ctx: &RequestContext,
+        now: chrono::DateTime<Utc>,
+        message: &str,
+        risk_reason: Option<&str>,
+    ) -> Result<LoginResult, AuthError> {
+        let challenge_id = self.refresh_crypto.generate_refresh_token().await;
+        let challenge_hash = self.refresh_crypto.hash_refresh_token(&challenge_id).await;
+        self.mfa_challenges
+            .issue(MfaChallengeRecord {
+                id: Uuid::new_v4().to_string(),
+                user_id: user_id.to_string(),
+                challenge_hash,
+                device_info,
+                failed_attempts: 0,
+                expires_at: now + Duration::seconds(self.mfa_challenge_ttl_seconds),
+                used_at: None,
+                created_at: now,
+            })
+            .await
+            .map_err(|_| AuthError::Internal)?;
+
+        self.audit
+            .append(AuditEvent {
+                event_type: "auth.mfa.challenge.issued".to_string(),
+                actor_user_id: Some(user_id.to_string()),
+                trace_id: ctx.trace_id.clone(),
+                metadata: json!({"ip": ctx.ip, "user_agent": ctx.user_agent, "risk_reason": risk_reason}),
+                created_at: now,
+            })
+            .await;
+
+        Ok(LoginResult::MfaRequired(MfaChallengeRequired {
+            challenge_id,
+            message: message.to_string(),
+        }))
+    }
+
+    async fn evaluate_login_risk_policy(
+        &self,
+        email: &str,
+        user_id: &str,
+        mfa_enabled: bool,
+        ctx: &RequestContext,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<String>, AuthError> {
+        match self
+            .login_risk
+            .evaluate_login(
+                email,
+                user_id,
+                ctx.ip.as_deref(),
+                ctx.user_agent.as_deref(),
+                now,
+            )
+            .await
+        {
+            LoginRiskDecision::Allow => {
+                crate::observability::record_login_risk_decision("allow", "none");
+                Ok(None)
+            }
+            LoginRiskDecision::Block { reason } => {
+                self.audit_login_rejected(&reason, email, Some(user_id), ctx)
+                    .await;
+                crate::observability::record_login_risk_decision("block", &reason);
+                self.try_lock_login(email, ctx.ip.as_deref(), ctx, now)
+                    .await;
+                Err(AuthError::InvalidCredentials)
+            }
+            LoginRiskDecision::Challenge { reason } => {
+                if !mfa_enabled {
+                    self.audit_login_rejected(
+                        "risk_challenge_unavailable",
+                        email,
+                        Some(user_id),
+                        ctx,
+                    )
+                    .await;
+                    crate::observability::record_login_risk_decision(
+                        "block",
+                        "challenge_without_mfa",
+                    );
+                    self.try_lock_login(email, ctx.ip.as_deref(), ctx, now)
+                        .await;
+                    return Err(AuthError::InvalidCredentials);
+                }
+
+                crate::observability::record_login_risk_decision("challenge", &reason);
+                Ok(Some(reason))
+            }
+        }
     }
 
     async fn issue_session_tokens(
@@ -1412,6 +1907,37 @@ impl AuthService {
         ))
     }
 
+    fn passkey_webauthn(&self) -> Result<&Webauthn, AuthError> {
+        self.passkey_webauthn
+            .as_ref()
+            .ok_or(AuthError::PasskeyDisabled)
+    }
+
+    fn passkey_challenge_expires_at(
+        &self,
+        challenge_created_at: chrono::DateTime<Utc>,
+    ) -> chrono::DateTime<Utc> {
+        challenge_created_at + Duration::seconds(self.mfa_challenge_ttl_seconds.max(1))
+    }
+
+    async fn load_passkeys_for_user(&self, user_id: &str) -> Result<Vec<Passkey>, AuthError> {
+        self.passkeys
+            .list_for_user(user_id)
+            .await
+            .map_err(|_| AuthError::Internal)
+    }
+
+    async fn upsert_passkey_for_user(
+        &self,
+        user_id: &str,
+        passkey: Passkey,
+    ) -> Result<(), AuthError> {
+        self.passkeys
+            .upsert_for_user(user_id, passkey, Utc::now())
+            .await
+            .map_err(|_| AuthError::InvalidPasskeyResponse)
+    }
+
     pub async fn logout(&self, cmd: LogoutCommand, ctx: RequestContext) {
         let now = Utc::now();
         self.sessions.revoke_session(&cmd.session_id).await;
@@ -1723,6 +2249,44 @@ impl AuthService {
             .await;
     }
 
+    async fn audit_passkey_login_rejected(
+        &self,
+        reason: &str,
+        actor_user_id: Option<&str>,
+        flow_id: Option<&str>,
+        ctx: &RequestContext,
+    ) {
+        crate::observability::record_passkey_login_rejected(reason);
+        self.audit
+            .append(AuditEvent {
+                event_type: "auth.passkey.login.rejected".to_string(),
+                actor_user_id: actor_user_id.map(str::to_string),
+                trace_id: ctx.trace_id.clone(),
+                metadata: json!({"reason": reason, "flow_id": flow_id, "ip": ctx.ip, "user_agent": ctx.user_agent}),
+                created_at: Utc::now(),
+            })
+            .await;
+    }
+
+    async fn audit_passkey_register_rejected(
+        &self,
+        reason: &str,
+        actor_user_id: Option<&str>,
+        flow_id: Option<&str>,
+        ctx: &RequestContext,
+    ) {
+        crate::observability::record_passkey_register_rejected(reason);
+        self.audit
+            .append(AuditEvent {
+                event_type: "auth.passkey.register.rejected".to_string(),
+                actor_user_id: actor_user_id.map(str::to_string),
+                trace_id: ctx.trace_id.clone(),
+                metadata: json!({"reason": reason, "flow_id": flow_id, "ip": ctx.ip, "user_agent": ctx.user_agent}),
+                created_at: Utc::now(),
+            })
+            .await;
+    }
+
     async fn audit_login_rejected(
         &self,
         reason: &str,
@@ -1978,6 +2542,7 @@ mod tests {
     use chrono::{DateTime, Utc};
     use rand::{rngs::OsRng, RngCore};
     use uuid::Uuid;
+    use webauthn_rs::prelude::{PasskeyAuthentication, PasskeyRegistration};
 
     use crate::{
         adapters::inmemory::{
@@ -1985,14 +2550,18 @@ mod tests {
         },
         config::{AppConfig, AuthRuntime, LoginAbuseBucketMode, LoginAbuseRedisFailMode},
         modules::{
-            auth::ports::UserRepository,
+            auth::ports::{
+                LoginRiskAnalyzer, LoginRiskDecision, PasskeyAuthenticationChallengeRecord,
+                PasskeyRegistrationChallengeRecord, UserRepository,
+            },
             tokens::{domain::RefreshTokenRecord, ports::RefreshRotationState},
         },
     };
 
     use super::{
         AuthError, AuthService, LoginCommand, LoginResult, MfaActivateCommand, MfaVerifyCommand,
-        PasswordChangeCommand, RefreshCommand, RequestContext,
+        Passkey, PasswordChangeCommand, PublicKeyCredential, RefreshCommand,
+        RegisterPublicKeyCredential, RequestContext,
     };
 
     const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIMn3Wcxxd4JzzjbshVFXz8jSGuF9ErqngPTzYhbfm6hd\n-----END PRIVATE KEY-----\n";
@@ -2001,6 +2570,8 @@ mod tests {
     struct TestHarness {
         service: AuthService,
         users: Arc<dyn UserRepository>,
+        passkeys: Arc<dyn crate::modules::auth::ports::PasskeyCredentialRepository>,
+        passkey_challenges: Arc<dyn crate::modules::auth::ports::PasskeyChallengeRepository>,
         audit: Arc<InMemoryAuditRepository>,
         bootstrap_email: String,
         bootstrap_password: String,
@@ -2079,6 +2650,48 @@ mod tests {
 
     struct AlwaysFailRotateRefreshTokenRepository {
         inner: Arc<dyn crate::modules::tokens::ports::RefreshTokenRepository>,
+    }
+
+    #[derive(Default)]
+    struct AlwaysBlockLoginRiskAnalyzer;
+
+    #[derive(Default)]
+    struct IpChallengeLoginRiskAnalyzer;
+
+    #[async_trait]
+    impl LoginRiskAnalyzer for AlwaysBlockLoginRiskAnalyzer {
+        async fn evaluate_login(
+            &self,
+            _email: &str,
+            _user_id: &str,
+            _source_ip: Option<&str>,
+            _user_agent: Option<&str>,
+            _now: DateTime<Utc>,
+        ) -> LoginRiskDecision {
+            LoginRiskDecision::Block {
+                reason: "test_block".to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LoginRiskAnalyzer for IpChallengeLoginRiskAnalyzer {
+        async fn evaluate_login(
+            &self,
+            _email: &str,
+            _user_id: &str,
+            source_ip: Option<&str>,
+            _user_agent: Option<&str>,
+            _now: DateTime<Utc>,
+        ) -> LoginRiskDecision {
+            if source_ip == Some("198.51.100.10") {
+                LoginRiskDecision::Challenge {
+                    reason: "test_challenge".to_string(),
+                }
+            } else {
+                LoginRiskDecision::Allow
+            }
+        }
     }
 
     impl AlwaysFailRotateRefreshTokenRepository {
@@ -2210,6 +2823,376 @@ mod tests {
             .await
             .expect("login with new password should succeed");
         let _ = assert_authenticated(new_login);
+    }
+
+    #[tokio::test]
+    async fn passkey_login_finish_invalid_challenge_emits_passkey_rejected_audit_reason() {
+        let mut harness = build_harness();
+        enable_passkey_for_harness(&mut harness);
+
+        let result = harness
+            .service
+            .passkey_login_finish(
+                "missing-flow-id",
+                dummy_passkey_login_credential(),
+                Some("unit-device".to_string()),
+                test_context("passkey-login-finish-missing-flow"),
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::InvalidPasskeyChallenge)));
+
+        let events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit lock should be available");
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "auth.passkey.login.rejected")
+            .expect("passkey rejected audit event should exist");
+        assert_eq!(event.metadata["reason"], "invalid_or_expired_challenge");
+        assert_eq!(event.metadata["flow_id"], "missing-flow-id");
+        assert_eq!(
+            event.trace_id,
+            "passkey-login-finish-missing-flow".to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn passkey_register_start_account_not_active_emits_rejected_audit_reason() {
+        let mut harness = build_harness();
+        enable_passkey_for_harness(&mut harness);
+
+        let pending_user = harness
+            .users
+            .create_pending_user("pending-register-passkey@example.com", "dummy-hash")
+            .await
+            .expect("pending user creation should succeed")
+            .expect("pending user should be created");
+
+        let result = harness
+            .service
+            .passkey_register_start(
+                &pending_user.id,
+                test_context("passkey-register-start-account-not-active"),
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+
+        let events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit lock should be available");
+        let event = events
+            .iter()
+            .find(|event| {
+                event.event_type == "auth.passkey.register.rejected"
+                    && event.trace_id == "passkey-register-start-account-not-active"
+            })
+            .expect("passkey register rejected audit event should exist");
+        assert_eq!(event.metadata["reason"], "account_not_active");
+    }
+
+    #[tokio::test]
+    async fn passkey_register_finish_invalid_challenge_emits_rejected_audit_reason() {
+        let mut harness = build_harness();
+        enable_passkey_for_harness(&mut harness);
+
+        let user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+
+        let result = harness
+            .service
+            .passkey_register_finish(
+                &user.id,
+                "missing-register-flow",
+                dummy_passkey_register_credential(),
+                test_context("passkey-register-finish-missing-flow"),
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::InvalidPasskeyChallenge)));
+        assert_passkey_register_rejected_audit(
+            &harness,
+            "invalid_or_expired_challenge",
+            "missing-register-flow",
+            "passkey-register-finish-missing-flow",
+        );
+    }
+
+    #[tokio::test]
+    async fn passkey_register_finish_invalid_response_emits_rejected_audit_reason() {
+        let mut harness = build_harness();
+        enable_passkey_for_harness(&mut harness);
+
+        let user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+        let flow_id = format!("flow-invalid-register-response-{}", Uuid::new_v4());
+        issue_test_passkey_registration_challenge(&harness, &flow_id, &user.id).await;
+
+        let result = harness
+            .service
+            .passkey_register_finish(
+                &user.id,
+                &flow_id,
+                dummy_passkey_register_credential(),
+                test_context("passkey-register-finish-invalid-response"),
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::InvalidPasskeyResponse)));
+        assert_passkey_register_rejected_audit(
+            &harness,
+            "invalid_passkey_response",
+            &flow_id,
+            "passkey-register-finish-invalid-response",
+        );
+    }
+
+    #[tokio::test]
+    async fn passkey_register_finish_user_mismatch_emits_rejected_audit_reason() {
+        let mut harness = build_harness();
+        enable_passkey_for_harness(&mut harness);
+
+        let bootstrap_user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+        let flow_id = format!("flow-register-user-mismatch-{}", Uuid::new_v4());
+        issue_test_passkey_registration_challenge(&harness, &flow_id, &bootstrap_user.id).await;
+
+        let other_user = harness
+            .users
+            .create_pending_user("passkey-mismatch@example.com", "dummy-hash")
+            .await
+            .expect("pending user creation should succeed")
+            .expect("pending user should be created");
+
+        let result = harness
+            .service
+            .passkey_register_finish(
+                &other_user.id,
+                &flow_id,
+                dummy_passkey_register_credential(),
+                test_context("passkey-register-finish-user-mismatch"),
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::InvalidPasskeyChallenge)));
+        assert_passkey_register_rejected_audit(
+            &harness,
+            "challenge_user_mismatch",
+            &flow_id,
+            "passkey-register-finish-user-mismatch",
+        );
+    }
+
+    #[tokio::test]
+    async fn passkey_login_finish_account_not_active_emits_passkey_rejected_audit_reason() {
+        let mut harness = build_harness();
+        enable_passkey_for_harness(&mut harness);
+
+        let pending_user = harness
+            .users
+            .create_pending_user("pending-passkey@example.com", "dummy-hash")
+            .await
+            .expect("pending user creation should succeed")
+            .expect("pending user should be created");
+        let flow_id = format!("flow-pending-{}", Uuid::new_v4());
+        issue_test_passkey_authentication_challenge(&harness, &flow_id, &pending_user.id).await;
+
+        let result = harness
+            .service
+            .passkey_login_finish(
+                &flow_id,
+                dummy_passkey_login_credential(),
+                Some("unit-device".to_string()),
+                test_context("passkey-login-finish-account-not-active"),
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+        assert_passkey_login_rejected_audit(
+            &harness,
+            "account_not_active",
+            &flow_id,
+            "passkey-login-finish-account-not-active",
+        );
+    }
+
+    #[tokio::test]
+    async fn passkey_login_finish_without_registered_passkey_emits_rejected_audit_reason() {
+        let mut harness = build_harness();
+        enable_passkey_for_harness(&mut harness);
+
+        let user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+        let flow_id = format!("flow-no-passkey-{}", Uuid::new_v4());
+        issue_test_passkey_authentication_challenge(&harness, &flow_id, &user.id).await;
+
+        let result = harness
+            .service
+            .passkey_login_finish(
+                &flow_id,
+                dummy_passkey_login_credential(),
+                Some("unit-device".to_string()),
+                test_context("passkey-login-finish-no-passkey"),
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+        assert_passkey_login_rejected_audit(
+            &harness,
+            "passkey_not_registered",
+            &flow_id,
+            "passkey-login-finish-no-passkey",
+        );
+    }
+
+    #[tokio::test]
+    async fn passkey_login_finish_invalid_response_emits_rejected_audit_reason() {
+        let mut harness = build_harness();
+        enable_passkey_for_harness(&mut harness);
+
+        let user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+        harness
+            .passkeys
+            .upsert_for_user(&user.id, dummy_passkey(), Utc::now())
+            .await
+            .expect("dummy passkey should be inserted");
+
+        let flow_id = format!("flow-invalid-passkey-response-{}", Uuid::new_v4());
+        issue_test_passkey_authentication_challenge(&harness, &flow_id, &user.id).await;
+
+        let result = harness
+            .service
+            .passkey_login_finish(
+                &flow_id,
+                dummy_passkey_login_credential(),
+                Some("unit-device".to_string()),
+                test_context("passkey-login-finish-invalid-response"),
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+        assert_passkey_login_rejected_audit(
+            &harness,
+            "invalid_passkey_response",
+            &flow_id,
+            "passkey-login-finish-invalid-response",
+        );
+    }
+
+    #[tokio::test]
+    async fn login_risk_block_returns_invalid_credentials() {
+        let harness = build_harness_with_login_risk(Arc::new(AlwaysBlockLoginRiskAnalyzer));
+
+        let result = harness
+            .service
+            .login(
+                LoginCommand {
+                    email: harness.bootstrap_email.clone(),
+                    password: harness.bootstrap_password.clone(),
+                    device_info: Some("risk-block-device".to_string()),
+                },
+                test_context("login-risk-block"),
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+    }
+
+    #[tokio::test]
+    async fn login_risk_challenge_without_mfa_returns_invalid_credentials() {
+        let harness = build_harness_with_login_risk(Arc::new(IpChallengeLoginRiskAnalyzer));
+
+        let result = harness
+            .service
+            .login(
+                LoginCommand {
+                    email: harness.bootstrap_email.clone(),
+                    password: harness.bootstrap_password.clone(),
+                    device_info: Some("risk-challenge-device".to_string()),
+                },
+                RequestContext {
+                    trace_id: "login-risk-challenge-no-mfa".to_string(),
+                    ip: Some("198.51.100.10".to_string()),
+                    user_agent: Some("unit-test".to_string()),
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+    }
+
+    #[tokio::test]
+    async fn login_risk_challenge_requires_step_up_when_mfa_enabled() {
+        let harness = build_harness_with_login_risk(Arc::new(IpChallengeLoginRiskAnalyzer));
+        let user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+
+        let enroll = harness
+            .service
+            .mfa_enroll(&user.id, test_context("risk-challenge-mfa-enroll"))
+            .await
+            .expect("mfa enroll should succeed");
+        let activate_code = current_totp_code(&enroll.secret);
+        harness
+            .service
+            .mfa_activate(
+                MfaActivateCommand {
+                    user_id: user.id,
+                    totp_code: activate_code,
+                },
+                test_context("risk-challenge-mfa-activate"),
+            )
+            .await
+            .expect("mfa activation should succeed");
+
+        let result = harness
+            .service
+            .login(
+                LoginCommand {
+                    email: harness.bootstrap_email.clone(),
+                    password: harness.bootstrap_password.clone(),
+                    device_info: Some("risk-challenge-mfa-device".to_string()),
+                },
+                RequestContext {
+                    trace_id: "login-risk-challenge-mfa".to_string(),
+                    ip: Some("198.51.100.10".to_string()),
+                    user_agent: Some("unit-test".to_string()),
+                },
+            )
+            .await
+            .expect("risk challenge should return step-up challenge");
+
+        match result {
+            LoginResult::MfaRequired(challenge) => {
+                assert!(!challenge.challenge_id.is_empty());
+                assert_eq!(challenge.message, "Additional verification required");
+            }
+            LoginResult::Authenticated { .. } => panic!("step-up challenge should be required"),
+        }
     }
 
     #[tokio::test]
@@ -3211,7 +4194,26 @@ mod tests {
         build_harness_with_refresh_factory(|refresh_tokens| refresh_tokens)
     }
 
+    fn build_harness_with_login_risk(login_risk: Arc<dyn LoginRiskAnalyzer>) -> TestHarness {
+        build_harness_with_factories(|refresh_tokens| refresh_tokens, login_risk)
+    }
+
     fn build_harness_with_refresh_factory<F>(refresh_factory: F) -> TestHarness
+    where
+        F: FnOnce(
+            Arc<dyn crate::modules::tokens::ports::RefreshTokenRepository>,
+        ) -> Arc<dyn crate::modules::tokens::ports::RefreshTokenRepository>,
+    {
+        build_harness_with_factories(
+            refresh_factory,
+            Arc::new(crate::adapters::risk::AllowAllLoginRiskAnalyzer),
+        )
+    }
+
+    fn build_harness_with_factories<F>(
+        refresh_factory: F,
+        login_risk: Arc<dyn LoginRiskAnalyzer>,
+    ) -> TestHarness
     where
         F: FnOnce(
             Arc<dyn crate::modules::tokens::ports::RefreshTokenRepository>,
@@ -3243,6 +4245,10 @@ mod tests {
             as Arc<dyn crate::modules::auth::ports::MfaChallengeRepository>;
         let mfa_backup_codes = Arc::new(adapters.mfa_backup_codes)
             as Arc<dyn crate::modules::auth::ports::MfaBackupCodeRepository>;
+        let passkeys = Arc::new(adapters.passkeys)
+            as Arc<dyn crate::modules::auth::ports::PasskeyCredentialRepository>;
+        let passkey_challenges = Arc::new(adapters.passkey_challenges)
+            as Arc<dyn crate::modules::auth::ports::PasskeyChallengeRepository>;
         let sessions = Arc::new(adapters.sessions)
             as Arc<dyn crate::modules::sessions::ports::SessionRepository>;
         let base_refresh_tokens = Arc::new(adapters.refresh_tokens)
@@ -3266,11 +4272,14 @@ mod tests {
         let service = AuthService::new(
             users.clone(),
             login_abuse,
+            login_risk,
             verification_tokens,
             password_reset_tokens,
             mfa_factors,
             mfa_challenges,
             mfa_backup_codes,
+            passkeys.clone(),
+            passkey_challenges.clone(),
             sessions,
             refresh_tokens,
             audit,
@@ -3285,6 +4294,7 @@ mod tests {
             cfg.mfa_challenge_max_attempts,
             cfg.mfa_totp_issuer,
             cfg.mfa_encryption_key,
+            None,
             cfg.jwt_issuer,
             cfg.jwt_audience,
         )
@@ -3293,6 +4303,8 @@ mod tests {
         TestHarness {
             service,
             users,
+            passkeys,
+            passkey_challenges,
             audit: audit_repo,
             bootstrap_email,
             bootstrap_password,
@@ -3311,6 +4323,11 @@ mod tests {
         AppConfig {
             bind_addr: "127.0.0.1:0".to_string(),
             auth_runtime: AuthRuntime::InMemory,
+            enforce_secure_transport: false,
+            passkey_enabled: false,
+            passkey_rp_id: None,
+            passkey_rp_origin: None,
+            passkey_challenge_prune_interval_seconds: 60,
             jwt_keys: vec![crate::config::JwtKeyConfig {
                 kid: "auth-tests-ed25519-v1".to_string(),
                 private_key_pem: Some(TEST_PRIVATE_KEY_PEM.to_string()),
@@ -3347,6 +4364,13 @@ mod tests {
             login_abuse_strikes_prefix: "test:strikes".to_string(),
             login_abuse_redis_fail_mode: LoginAbuseRedisFailMode::FailClosed,
             login_abuse_bucket_mode: LoginAbuseBucketMode::EmailAndIp,
+            login_risk_mode: crate::config::LoginRiskMode::AllowAll,
+            login_risk_blocked_cidrs: Vec::new(),
+            login_risk_blocked_user_agent_substrings: Vec::new(),
+            login_risk_blocked_email_domains: Vec::new(),
+            login_risk_challenge_cidrs: Vec::new(),
+            login_risk_challenge_user_agent_substrings: Vec::new(),
+            login_risk_challenge_email_domains: Vec::new(),
             email_metrics_latency_enabled: false,
             email_provider: crate::config::EmailProviderConfig::Noop,
             email_delivery_mode: crate::config::EmailDeliveryMode::Inline,
@@ -3390,5 +4414,203 @@ mod tests {
         let mut key_bytes = [0_u8; 32];
         OsRng.fill_bytes(&mut key_bytes);
         BASE64_STANDARD.encode(key_bytes)
+    }
+
+    fn enable_passkey_for_harness(harness: &mut TestHarness) {
+        let rp_origin = webauthn_rs::prelude::Url::parse("https://auth.example.com")
+            .expect("passkey test rp origin should be valid");
+        let webauthn = webauthn_rs::prelude::WebauthnBuilder::new("example.com", &rp_origin)
+            .expect("passkey test webauthn builder should initialize")
+            .build()
+            .expect("passkey test webauthn should build");
+        harness.service.passkey_webauthn = Some(webauthn);
+    }
+
+    fn dummy_passkey_login_credential() -> PublicKeyCredential {
+        serde_json::from_str(
+            r#"{
+  "id": "dummy-credential",
+  "rawId": "",
+  "response": {
+    "authenticatorData": "",
+    "clientDataJSON": "",
+    "signature": "",
+    "userHandle": null
+  },
+  "extensions": {},
+  "type": "public-key"
+}"#,
+        )
+        .expect("dummy passkey login credential should deserialize")
+    }
+
+    fn dummy_passkey_register_credential() -> RegisterPublicKeyCredential {
+        serde_json::from_str(
+            r#"{
+  "id": "dummy-register-credential",
+  "rawId": "",
+  "response": {
+    "attestationObject": "",
+    "clientDataJSON": "",
+    "transports": null
+  },
+  "extensions": {},
+  "type": "public-key"
+}"#,
+        )
+        .expect("dummy passkey register credential should deserialize")
+    }
+
+    fn dummy_passkey() -> Passkey {
+        serde_json::from_str(
+            r#"{
+  "cred": {
+    "cred_id": "AQID",
+    "cred": {
+      "type_": "EDDSA",
+      "key": {
+        "EC_OKP": {
+          "curve": "ED25519",
+          "x": ""
+        }
+      }
+    },
+    "counter": 0,
+    "transports": null,
+    "user_verified": true,
+    "backup_eligible": false,
+    "backup_state": false,
+    "registration_policy": "required",
+    "extensions": {},
+    "attestation": {
+      "data": "None",
+      "metadata": "None"
+    },
+    "attestation_format": "none"
+  }
+}"#,
+        )
+        .expect("dummy passkey should deserialize")
+    }
+
+    fn dummy_passkey_authentication_state() -> PasskeyAuthentication {
+        serde_json::from_str(
+            r#"{
+  "ast": {
+    "credentials": [],
+    "policy": "required",
+    "challenge": "",
+    "appid": null,
+    "allow_backup_eligible_upgrade": false
+  }
+}"#,
+        )
+        .expect("dummy passkey authentication state should deserialize")
+    }
+
+    fn dummy_passkey_registration_state() -> PasskeyRegistration {
+        serde_json::from_str(
+            r#"{
+  "rs": {
+    "policy": "required",
+    "exclude_credentials": [],
+    "challenge": "",
+    "credential_algorithms": ["EDDSA"],
+    "require_resident_key": false,
+    "authenticator_attachment": null,
+    "extensions": {},
+    "allow_synchronised_authenticators": true
+  }
+}"#,
+        )
+        .expect("dummy passkey registration state should deserialize")
+    }
+
+    async fn issue_test_passkey_authentication_challenge(
+        harness: &TestHarness,
+        flow_id: &str,
+        user_id: &str,
+    ) {
+        let now = Utc::now();
+        harness
+            .passkey_challenges
+            .issue_authentication(
+                flow_id,
+                PasskeyAuthenticationChallengeRecord {
+                    user_id: user_id.to_string(),
+                    state: dummy_passkey_authentication_state(),
+                    created_at: now,
+                    expires_at: now + chrono::Duration::seconds(300),
+                },
+            )
+            .await
+            .expect("test passkey challenge should be issued");
+    }
+
+    async fn issue_test_passkey_registration_challenge(
+        harness: &TestHarness,
+        flow_id: &str,
+        user_id: &str,
+    ) {
+        let now = Utc::now();
+        harness
+            .passkey_challenges
+            .issue_registration(
+                flow_id,
+                PasskeyRegistrationChallengeRecord {
+                    user_id: user_id.to_string(),
+                    state: dummy_passkey_registration_state(),
+                    created_at: now,
+                    expires_at: now + chrono::Duration::seconds(300),
+                },
+            )
+            .await
+            .expect("test passkey registration challenge should be issued");
+    }
+
+    fn assert_passkey_login_rejected_audit(
+        harness: &TestHarness,
+        reason: &str,
+        flow_id: &str,
+        trace_id: &str,
+    ) {
+        let events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit lock should be available");
+        let event = events
+            .iter()
+            .find(|event| {
+                event.event_type == "auth.passkey.login.rejected"
+                    && event.trace_id == trace_id
+                    && event.metadata["reason"] == reason
+            })
+            .expect("passkey rejected audit event should exist");
+
+        assert_eq!(event.metadata["flow_id"], flow_id);
+    }
+
+    fn assert_passkey_register_rejected_audit(
+        harness: &TestHarness,
+        reason: &str,
+        flow_id: &str,
+        trace_id: &str,
+    ) {
+        let events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit lock should be available");
+        let event = events
+            .iter()
+            .find(|event| {
+                event.event_type == "auth.passkey.register.rejected"
+                    && event.trace_id == trace_id
+                    && event.metadata["reason"] == reason
+            })
+            .expect("passkey register rejected audit event should exist");
+
+        assert_eq!(event.metadata["flow_id"], flow_id);
     }
 }

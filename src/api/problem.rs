@@ -108,6 +108,27 @@ pub fn from_auth_error(
             "https://example.com/problems/mfa-not-enabled".to_string(),
             None,
         ),
+        AuthError::PasskeyDisabled => (
+            StatusCode::FORBIDDEN,
+            "Passkey disabled".to_string(),
+            "Passkey authentication is not enabled for this service".to_string(),
+            "https://example.com/problems/passkey-disabled".to_string(),
+            None,
+        ),
+        AuthError::InvalidPasskeyChallenge => (
+            StatusCode::UNAUTHORIZED,
+            "Invalid passkey challenge".to_string(),
+            "Passkey challenge is invalid or expired".to_string(),
+            "https://example.com/problems/invalid-passkey-challenge".to_string(),
+            None,
+        ),
+        AuthError::InvalidPasskeyResponse => (
+            StatusCode::UNAUTHORIZED,
+            "Invalid passkey response".to_string(),
+            "Provided passkey response is invalid".to_string(),
+            "https://example.com/problems/invalid-passkey-response".to_string(),
+            None,
+        ),
         AuthError::SessionNotFound => (
             StatusCode::NOT_FOUND,
             "Session not found".to_string(),
@@ -135,10 +156,10 @@ pub fn from_auth_error(
             Some(retry_after_seconds),
         ),
         AuthError::AccountNotActive => (
-            StatusCode::FORBIDDEN,
-            "Account not active".to_string(),
-            "Account status does not allow login".to_string(),
-            "https://example.com/problems/account-not-active".to_string(),
+            StatusCode::UNAUTHORIZED,
+            "Invalid credentials".to_string(),
+            "Authentication failed".to_string(),
+            "https://example.com/problems/invalid-credentials".to_string(),
             None,
         ),
         AuthError::InvalidToken => (
@@ -247,6 +268,71 @@ mod tests {
         assert_eq!(
             response.headers().get(header::RETRY_AFTER),
             Some(&axum::http::HeaderValue::from_static("90"))
+        );
+    }
+
+    #[test]
+    fn account_not_active_maps_to_generic_invalid_credentials_contract() {
+        let problem = from_auth_error(
+            AuthError::AccountNotActive,
+            "trace-account-not-active".to_string(),
+        );
+
+        assert_eq!(problem.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(problem.body.status, 401);
+        assert_eq!(problem.body.title, "Invalid credentials");
+        assert_eq!(problem.body.detail, "Authentication failed");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/invalid-credentials"
+        );
+    }
+
+    #[test]
+    fn passkey_disabled_maps_to_expected_problem_contract() {
+        let problem = from_auth_error(
+            AuthError::PasskeyDisabled,
+            "trace-passkey-disabled".to_string(),
+        );
+
+        assert_eq!(problem.status, StatusCode::FORBIDDEN);
+        assert_eq!(problem.body.status, 403);
+        assert_eq!(problem.body.title, "Passkey disabled");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/passkey-disabled"
+        );
+    }
+
+    #[test]
+    fn invalid_passkey_challenge_maps_to_expected_problem_contract() {
+        let problem = from_auth_error(
+            AuthError::InvalidPasskeyChallenge,
+            "trace-passkey-challenge".to_string(),
+        );
+
+        assert_eq!(problem.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(problem.body.status, 401);
+        assert_eq!(problem.body.title, "Invalid passkey challenge");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/invalid-passkey-challenge"
+        );
+    }
+
+    #[test]
+    fn invalid_passkey_response_maps_to_expected_problem_contract() {
+        let problem = from_auth_error(
+            AuthError::InvalidPasskeyResponse,
+            "trace-passkey-response".to_string(),
+        );
+
+        assert_eq!(problem.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(problem.body.status, 401);
+        assert_eq!(problem.body.title, "Invalid passkey response");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/invalid-passkey-response"
         );
     }
 }

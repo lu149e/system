@@ -9,7 +9,7 @@ Base tecnica para API de autenticacion en Rust con Axum/Tokio, arquitectura hexa
 - `src/modules/sessions`: modelo de sesion y reglas de revocacion/compromiso.
 - `src/modules/tokens`: JWT access token, refresh token opaco, rotacion y reuse detection.
 - `src/modules/audit`: evento de auditoria obligatorio con `trace_id`.
-- `src/adapters/postgres.rs`: adapters SQLx para `users/credentials`, MFA (`mfa_factors/challenges/backup_codes`), `sessions`, `refresh_tokens`, `audit_events`.
+- `src/adapters/postgres.rs`: adapters SQLx para `users/credentials`, MFA (`mfa_factors/challenges/backup_codes`), passkeys (`passkey_credentials`), `sessions`, `refresh_tokens`, `audit_events`.
 - `src/adapters/outbox.rs`: adapter persistente de outbox de email (enqueue/fetch-due/mark-sent/mark-failed) y worker dispatcher.
 - `src/adapters/redis.rs`: adapter Redis para lockout y ventana de intentos por email/IP.
 - `src/adapters/inmemory.rs`: fallback de desarrollo, deshabilitado por defecto.
@@ -28,6 +28,9 @@ Base tecnica para API de autenticacion en Rust con Axum/Tokio, arquitectura hexa
 - `migrations/0013_harden_outbox_replay_apply_audit_constraints.sql`: agrega constraints DB para exigir actor/ticket validos en filas `is_apply=true`.
 - `migrations/0014_enforce_outbox_replay_audit_append_only.sql`: aplica guardas DB (triggers) para bloquear `UPDATE/DELETE` y mantener `outbox_replay_audit` append-only.
 - `migrations/0015_allow_outbox_replay_audit_controlled_maintenance_override.sql`: mantiene default append-only y habilita override break-glass por sesion solo para mantenimiento controlado.
+- `migrations/0016_require_outbox_replay_audit_maintenance_role.sql`: requiere rol de mantenimiento para override controlado en replay auditado.
+- `migrations/0017_add_passkey_credentials.sql`: agrega persistencia de credenciales passkey por usuario y unicidad global de `credential_id`.
+- `migrations/0018_add_passkey_challenges.sql`: agrega persistencia server-side del estado transitorio de challenges WebAuthn (`registration`/`authentication`) para despliegues multi-instancia.
 
 ## Endpoints v1 implementados
 
@@ -38,6 +41,10 @@ Base tecnica para API de autenticacion en Rust con Axum/Tokio, arquitectura hexa
 - `POST /v1/auth/mfa/activate`
 - `POST /v1/auth/mfa/verify`
 - `POST /v1/auth/mfa/disable`
+- `POST /v1/auth/passkey/register/start`
+- `POST /v1/auth/passkey/register/finish`
+- `POST /v1/auth/passkey/login/start`
+- `POST /v1/auth/passkey/login/finish`
 - `POST /v1/auth/password/forgot`
 - `POST /v1/auth/password/reset`
 - `POST /v1/auth/password/change`
@@ -55,6 +62,7 @@ Base tecnica para API de autenticacion en Rust con Axum/Tokio, arquitectura hexa
 Notas de contrato:
 
 - `POST /v1/auth/login` devuelve tokens cuando MFA no aplica, o `mfa_required=true` con `challenge_id` cuando MFA esta habilitado.
+- `GET /readyz` incluye componente `passkey_challenge_janitor` con estado del janitor (`not_configured`, `starting`, `ok`, `degraded`) y detalle con ultimo `last_success_at`/`last_failure_at`; cuando no hay corridas exitosas recientes, el componente pasa a `degraded` por stale heartbeat.
 
 ## Variables de entorno
 
@@ -66,6 +74,11 @@ Notas de contrato:
 - `METRICS_BEARER_TOKEN_FILE` (opcional; ruta de archivo con bearer token para `GET /metrics`; no puede coexistir con `METRICS_BEARER_TOKEN`)
 - `METRICS_ALLOWED_CIDRS` (opcional; lista CSV de CIDRs permitidos para `GET /metrics`, ejemplo: `10.10.0.0/16,127.0.0.0/8`)
 - `TRUST_X_FORWARDED_FOR` (opcional, default `false`; habilitar solo detras de proxy confiable)
+- `ENFORCE_SECURE_TRANSPORT` (opcional, default `false`; si `true`, exige `x-forwarded-proto=https` desde proxy confiable para endpoints `/v1/auth/*`)
+- `PASSKEY_ENABLED` (opcional, default `false`; habilita flujos de registro/login con WebAuthn passkeys)
+- `PASSKEY_RP_ID` (requerido cuando `PASSKEY_ENABLED=true`; relying party id WebAuthn, ej. `example.com`)
+- `PASSKEY_RP_ORIGIN` (requerido cuando `PASSKEY_ENABLED=true`; origin HTTPS del RP, ej. `https://auth.example.com`)
+- `PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS` (opcional, default `60`; intervalo del janitor que poda challenges passkey expirados)
 - `TRUSTED_PROXY_IPS` (opcional; lista separada por comas de IPs exactas confiables)
 - `TRUSTED_PROXY_CIDRS` (opcional; lista separada por comas de CIDR confiables)
 - `DATABASE_URL` (requerido cuando `AUTH_RUNTIME=postgres_redis`)
@@ -122,6 +135,13 @@ Notas de contrato:
 - `LOGIN_ABUSE_STRIKES_PREFIX` (opcional, default `auth:login-abuse:strikes`)
 - `LOGIN_ABUSE_REDIS_FAIL_MODE` (opcional, default `fail_closed`; valores: `fail_closed`, `fail_open`)
 - `LOGIN_ABUSE_BUCKET_MODE` (opcional, default `email_and_ip`; valores: `ip_only`, `email_and_ip`)
+- `LOGIN_RISK_MODE` (opcional, default `allow_all`; valores: `allow_all`, `baseline`)
+- `LOGIN_RISK_BLOCKED_CIDRS` (opcional; lista CSV de CIDRs a bloquear en login cuando `LOGIN_RISK_MODE=baseline`)
+- `LOGIN_RISK_BLOCKED_USER_AGENT_SUBSTRINGS` (opcional; lista CSV de substrings de user-agent a bloquear en login cuando `LOGIN_RISK_MODE=baseline`)
+- `LOGIN_RISK_BLOCKED_EMAIL_DOMAINS` (opcional; lista CSV de dominios de email a bloquear en login cuando `LOGIN_RISK_MODE=baseline`)
+- `LOGIN_RISK_CHALLENGE_CIDRS` (opcional; lista CSV de CIDRs que fuerzan step-up MFA cuando `LOGIN_RISK_MODE=baseline`)
+- `LOGIN_RISK_CHALLENGE_USER_AGENT_SUBSTRINGS` (opcional; lista CSV de substrings de user-agent que fuerzan step-up MFA cuando `LOGIN_RISK_MODE=baseline`)
+- `LOGIN_RISK_CHALLENGE_EMAIL_DOMAINS` (opcional; lista CSV de dominios de email que fuerzan step-up MFA cuando `LOGIN_RISK_MODE=baseline`)
 - `AUTH_TEST_DATABASE_URL` (opcional; URL de PostgreSQL para ejecutar pruebas de integracion del adapter Postgres)
 
 ## Ejemplo de entorno (seguro por defecto)
@@ -134,6 +154,10 @@ METRICS_BEARER_TOKEN=replace_with_long_random_token
 # METRICS_BEARER_TOKEN_FILE=/var/run/secrets/auth/metrics_token
 METRICS_ALLOWED_CIDRS=10.10.0.0/16
 TRUST_X_FORWARDED_FOR=false
+ENFORCE_SECURE_TRANSPORT=false
+# PASSKEY_ENABLED=true
+# PASSKEY_RP_ID=example.com
+# PASSKEY_RP_ORIGIN=https://auth.example.com
 TRUSTED_PROXY_IPS=10.0.0.10,10.0.0.11
 TRUSTED_PROXY_CIDRS=10.0.1.0/24
 DATABASE_URL=postgres://auth_user:change_me@localhost:5432/auth
@@ -175,6 +199,13 @@ LOGIN_ABUSE_LOCK_PREFIX=auth:login-abuse:lock
 LOGIN_ABUSE_STRIKES_PREFIX=auth:login-abuse:strikes
 LOGIN_ABUSE_REDIS_FAIL_MODE=fail_closed
 LOGIN_ABUSE_BUCKET_MODE=email_and_ip
+LOGIN_RISK_MODE=allow_all
+# LOGIN_RISK_BLOCKED_CIDRS=203.0.113.0/24,2001:db8::/32
+# LOGIN_RISK_BLOCKED_USER_AGENT_SUBSTRINGS=selenium,headless
+# LOGIN_RISK_BLOCKED_EMAIL_DOMAINS=disposable.example
+# LOGIN_RISK_CHALLENGE_CIDRS=198.51.100.0/24
+# LOGIN_RISK_CHALLENGE_USER_AGENT_SUBSTRINGS=webdriver,automation
+# LOGIN_RISK_CHALLENGE_EMAIL_DOMAINS=highrisk.example
 ```
 
 ## Ejemplo de entorno (produccion con transporte endurecido)
@@ -237,19 +268,26 @@ EMAIL_OUTBOX_BACKOFF_MAX_MS=60000
 - Filas en `processing` no se reclaman de nuevo hasta que vence el lease; si un worker queda colgado, esas filas vuelven a ser reclamables al expirar el lease.
 - Politica de dispatcher outbox: polling cada `EMAIL_OUTBOX_POLL_INTERVAL_MS`, lote `EMAIL_OUTBOX_BATCH_SIZE`, lease `EMAIL_OUTBOX_LEASE_MS`, reintentos con backoff exponencial acotado entre `EMAIL_OUTBOX_BACKOFF_BASE_MS` y `EMAIL_OUTBOX_BACKOFF_MAX_MS`, hasta `EMAIL_OUTBOX_MAX_ATTEMPTS`.
 - Para despliegues multi-instancia, mantener `EMAIL_OUTBOX_LEASE_MS` por encima del tiempo tipico de envio (incluyendo retries del proveedor) para minimizar duplicados por expiracion prematura del lease.
+- Las credenciales passkey quedan persistidas en Postgres (`passkey_credentials`) y sobreviven reinicios/rotaciones de pods.
+- En `AUTH_RUNTIME=postgres_redis`, el estado transitorio de challenge WebAuthn (`register/login start -> finish`) se persiste en Postgres (`passkey_challenges`) con expiracion y consumo one-time, permitiendo despliegues multi-instancia sin session-affinity forzada.
+- Cuando `PASSKEY_ENABLED=true`, un janitor en background poda challenges passkey expirados cada 60s para evitar crecimiento indefinido de `passkey_challenges`.
+- En `AUTH_RUNTIME=inmemory`, los challenges siguen siendo efimeros por proceso (solo desarrollo).
 - Politica de retries SendGrid: hasta `1 + SENDGRID_MAX_RETRIES` intentos por email, con backoff exponencial acotado (`min(SENDGRID_RETRY_BASE_DELAY_MS * 2^(n-1), SENDGRID_RETRY_MAX_DELAY_MS)`) y jitter uniforme por intento en el rango `[backoff * (1 - j), min(backoff * (1 + j), SENDGRID_RETRY_MAX_DELAY_MS)]`, donde `j = SENDGRID_RETRY_JITTER_PERCENT / 100`.
 - Solo se reintenta en fallos transitorios (`429`, `5xx` y errores de transporte/timeout). Respuestas `4xx` no transitorias fallan sin retry.
 - Si defines `METRICS_ALLOWED_CIDRS`, `/metrics` solo responde a clientes dentro de esos rangos (ademas del bearer si aplica).
 - El endpoint `/.well-known/jwks.json` publica todas las claves publicas activas configuradas (Ed25519), cada una con `kid` unico.
 - Runbook operativo de rotacion JWT (introduccion, switch de primaria, convivencia, retiro y rollback): `docs/jwt-key-rotation-runbook.md`.
+- Roadmap in-house para elevar auth a nivel FAANG (30/60/90, epicas y criterios de salida): `docs/inhouse-faang-auth-roadmap.md`.
 - Por defecto no se confia en `x-forwarded-for`; habilitalo solo si el edge/proxy limpia ese header.
 - Si `TRUST_X_FORWARDED_FOR=true`, debes definir `TRUSTED_PROXY_IPS` o `TRUSTED_PROXY_CIDRS`; la app solo toma `x-forwarded-for` cuando el socket remoto coincide con un proxy confiable.
+- Si `ENFORCE_SECURE_TRANSPORT=true`, los endpoints `/v1/auth/*` rechazan requests sin `x-forwarded-proto=https` emitido por proxy confiable.
 - Si `ENFORCE_DATABASE_TLS=true`, el startup falla si `DATABASE_URL` no explicita transporte seguro (`sslmode=require|verify-ca|verify-full` o equivalente `ssl=true`).
 - Si `ENFORCE_REDIS_TLS=true`, el startup falla si `REDIS_URL` no usa `rediss://` o `tls=true`.
 - El lockout de login soporta `LOGIN_ABUSE_BUCKET_MODE`:
   - `ip_only`: bucket `email|ip`.
   - `email_and_ip`: bucket dual `email|any` + `email|ip`.
 - Lockout aplica backoff progresivo por bucket: parte de `LOGIN_LOCKOUT_SECONDS`, duplica por reincidencia y limita en `LOGIN_LOCKOUT_MAX_SECONDS`.
+- Si `LOGIN_RISK_MODE=baseline`, el login evalua reglas de riesgo de bloqueo (`LOGIN_RISK_BLOCKED_*`) y de step-up (`LOGIN_RISK_CHALLENGE_*`). Bloqueos responden contrato externo neutro; step-up exige MFA cuando hay factor habilitado.
 - Registro usa respuesta neutra para reducir enumeracion de cuentas.
 - Verify-email usa token one-time hasheado en DB y TTL configurable.
 - Reemision de verify-email invalida tokens pendientes previos del mismo usuario.
@@ -303,6 +341,17 @@ EMAIL_OUTBOX_BACKOFF_MAX_MS=60000
 - Si `METRICS_ALLOWED_CIDRS` esta configurado, la IP origen resuelta del scraper debe estar dentro de esos CIDRs.
 - Metricas de refresh instrumentadas en runtime:
   - `auth_refresh_requests_total{outcome=...}`
+  - `auth_passkey_requests_total{operation=register_start|register_finish|login_start|login_finish,outcome=success|error}`
+  - `auth_passkey_login_rejected_total{reason=invalid_or_expired_challenge|account_not_active|passkey_not_registered|invalid_passkey_response|other}`
+  - `auth_passkey_register_rejected_total{reason=invalid_or_expired_challenge|challenge_user_mismatch|account_not_active|invalid_passkey_response|other}`
+  - `auth_passkey_challenge_janitor_enabled`
+  - `auth_passkey_challenge_prune_interval_seconds`
+  - `auth_passkey_challenge_prune_runs_total{outcome=success|error}`
+  - `auth_passkey_challenge_prune_last_success_unixtime`
+  - `auth_passkey_challenge_prune_last_failure_unixtime`
+  - `auth_passkey_challenge_pruned_total`
+  - `auth_passkey_challenge_prune_errors_total`
+  - `auth_login_risk_decisions_total{decision=allow|block|challenge,reason=...}`
   - `auth_refresh_rejected_total{reason=...}`
   - `auth_refresh_duration_seconds{outcome=...}`
   - `auth_problem_responses_total{status=...,type=...}`
@@ -401,6 +450,15 @@ Pasos recomendados:
 - Inputs de seguridad runtime (opcionales, default `true`):
   - `enforce_database_tls`
   - `enforce_redis_tls`
+  - `enforce_secure_transport`
+- Inputs de riesgo login (runtime):
+  - `login_risk_mode` (`allow_all` o `baseline`, default `baseline`)
+  - `login_risk_blocked_cidrs` (CSV opcional)
+  - `login_risk_blocked_user_agent_substrings` (CSV opcional)
+  - `login_risk_blocked_email_domains` (CSV opcional)
+  - `login_risk_challenge_cidrs` (CSV opcional)
+  - `login_risk_challenge_user_agent_substrings` (CSV opcional)
+  - `login_risk_challenge_email_domains` (CSV opcional)
 - Secrets requeridos para generar manifiestos de runtime:
   - `PROD_AUTH_DATABASE_URL`, `PROD_AUTH_REDIS_URL`, `PROD_AUTH_REFRESH_TOKEN_PEPPER`, `PROD_AUTH_MFA_ENCRYPTION_KEY_BASE64`, `PROD_AUTH_JWT_KEYSET`, `PROD_AUTH_JWT_PRIMARY_KID`.
   - `PROD_AUTH_JWT_PRIVATE_KEY_PEM`, `PROD_AUTH_JWT_PUBLIC_KEY_PEM` (para generar `auth-jwt-keys`).
@@ -423,6 +481,10 @@ Pasos recomendados:
 - Inputs operativos:
   - `enforce_database_tls` (boolean, default `true`): valor aplicado a `ENFORCE_DATABASE_TLS` en overlay generado.
   - `enforce_redis_tls` (boolean, default `true`): valor aplicado a `ENFORCE_REDIS_TLS` en overlay generado.
+  - `enforce_secure_transport` (boolean, default `true`): valor aplicado a `ENFORCE_SECURE_TRANSPORT` en overlay generado.
+  - `login_risk_mode` (choice, default `baseline`): valor aplicado a `LOGIN_RISK_MODE`.
+  - `login_risk_blocked_cidrs` / `login_risk_blocked_user_agent_substrings` / `login_risk_blocked_email_domains` (string CSV opcional): valores aplicados a `LOGIN_RISK_BLOCKED_*`.
+  - `login_risk_challenge_cidrs` / `login_risk_challenge_user_agent_substrings` / `login_risk_challenge_email_domains` (string CSV opcional): valores aplicados a `LOGIN_RISK_CHALLENGE_*`.
   - `apply_changes` (boolean, default `false`): en `false` ejecuta solo dry-run server-side; en `true` aplica manifiestos al cluster.
   - `allow_client_dry_run_fallback` (boolean, default `false`): solo para simulacion; si el server-side dry-run no puede contactar el API server y `apply_changes=false`, permite continuar sin el gate de `kubectl --dry-run=server`.
   - `namespace` (default `auth`): namespace destino para dry-run/apply/smoke.
@@ -560,10 +622,11 @@ Pasos recomendados:
 - El job de CI ejecuta `cargo audit --ignore RUSTSEC-2023-0071` por una limitacion del metapaquete `sqlx` que incluye crates de drivers no usados (MySQL) en `Cargo.lock`.
 - Alcance real de esta API: solo PostgreSQL (`sqlx` con feature `postgres` + `default-features=false`).
 - Riesgo residual: bajo para este servicio (no se usa MySQL en runtime), pero debe revisarse al actualizar `sqlx`.
+- Dependabot queda configurado en `.github/dependabot.yml` para updates diarios de `cargo`, `github-actions` y `docker` (versiones + security advisories), con PRs agrupadas por tipo de cambio para reducir ruido operativo.
 
 ## Siguientes pasos
 
 1. Calibrar umbrales/ventanas por bucket (`email|any` vs `email|ip`) con datos reales de trafico y fraude.
 2. Materializar dashboards en Grafana/monitoring usando `docs/observability-auth-refresh.md` y validar umbrales en staging.
-3. Activar branch protection exigiendo jobs `quality`, `supply-chain` y `observability` en PRs.
+3. Activar branch protection exigiendo jobs `quality`, `supply-chain`, `observability` y `dependency-review` en PRs.
 4. Conectar reglas `docs/alerts/auth-refresh-alert-rules.yaml` + routing `docs/alertmanager/auth-routing-example.yaml` al stack real.

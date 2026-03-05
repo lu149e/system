@@ -6,6 +6,11 @@ use std::{collections::HashSet, net::IpAddr};
 pub struct AppConfig {
     pub bind_addr: String,
     pub auth_runtime: AuthRuntime,
+    pub enforce_secure_transport: bool,
+    pub passkey_enabled: bool,
+    pub passkey_rp_id: Option<String>,
+    pub passkey_rp_origin: Option<String>,
+    pub passkey_challenge_prune_interval_seconds: u64,
     pub metrics_bearer_token: Option<String>,
     pub metrics_allowed_cidrs: Vec<IpNet>,
     pub trust_x_forwarded_for: bool,
@@ -38,6 +43,13 @@ pub struct AppConfig {
     pub login_abuse_strikes_prefix: String,
     pub login_abuse_redis_fail_mode: LoginAbuseRedisFailMode,
     pub login_abuse_bucket_mode: LoginAbuseBucketMode,
+    pub login_risk_mode: LoginRiskMode,
+    pub login_risk_blocked_cidrs: Vec<IpNet>,
+    pub login_risk_blocked_user_agent_substrings: Vec<String>,
+    pub login_risk_blocked_email_domains: Vec<String>,
+    pub login_risk_challenge_cidrs: Vec<IpNet>,
+    pub login_risk_challenge_user_agent_substrings: Vec<String>,
+    pub login_risk_challenge_email_domains: Vec<String>,
     pub email_metrics_latency_enabled: bool,
     pub email_provider: EmailProviderConfig,
     pub email_delivery_mode: EmailDeliveryMode,
@@ -67,6 +79,12 @@ pub enum LoginAbuseRedisFailMode {
 pub enum LoginAbuseBucketMode {
     IpOnly,
     EmailAndIp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginRiskMode {
+    AllowAll,
+    Baseline,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,6 +160,27 @@ impl AppConfig {
             .unwrap_or_else(|_| "false".to_string())
             .parse::<bool>()
             .context("TRUST_X_FORWARDED_FOR must be true or false")?;
+        let enforce_secure_transport = std::env::var("ENFORCE_SECURE_TRANSPORT")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse::<bool>()
+            .context("ENFORCE_SECURE_TRANSPORT must be true or false")?;
+        let passkey_enabled = std::env::var("PASSKEY_ENABLED")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse::<bool>()
+            .context("PASSKEY_ENABLED must be true or false")?;
+        let passkey_rp_id = std::env::var("PASSKEY_RP_ID")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let passkey_rp_origin = std::env::var("PASSKEY_RP_ORIGIN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let passkey_challenge_prune_interval_seconds = parse_positive_u64_with_default(
+            std::env::var("PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS").ok(),
+            60,
+            "PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS",
+        )?;
         let trusted_proxy_ips =
             parse_trusted_proxy_ips(std::env::var("TRUSTED_PROXY_IPS").unwrap_or_default())?;
         let trusted_proxy_cidrs =
@@ -271,6 +310,27 @@ impl AppConfig {
         let login_abuse_bucket_mode = parse_login_abuse_bucket_mode(
             std::env::var("LOGIN_ABUSE_BUCKET_MODE").unwrap_or_else(|_| "email_and_ip".to_string()),
         )?;
+        let login_risk_mode = parse_login_risk_mode(
+            std::env::var("LOGIN_RISK_MODE").unwrap_or_else(|_| "allow_all".to_string()),
+        )?;
+        let login_risk_blocked_cidrs = parse_login_risk_blocked_cidrs(
+            std::env::var("LOGIN_RISK_BLOCKED_CIDRS").unwrap_or_default(),
+        )?;
+        let login_risk_blocked_user_agent_substrings = parse_csv_non_empty_values(
+            std::env::var("LOGIN_RISK_BLOCKED_USER_AGENT_SUBSTRINGS").unwrap_or_default(),
+        );
+        let login_risk_blocked_email_domains = parse_csv_non_empty_values(
+            std::env::var("LOGIN_RISK_BLOCKED_EMAIL_DOMAINS").unwrap_or_default(),
+        );
+        let login_risk_challenge_cidrs = parse_login_risk_challenge_cidrs(
+            std::env::var("LOGIN_RISK_CHALLENGE_CIDRS").unwrap_or_default(),
+        )?;
+        let login_risk_challenge_user_agent_substrings = parse_csv_non_empty_values(
+            std::env::var("LOGIN_RISK_CHALLENGE_USER_AGENT_SUBSTRINGS").unwrap_or_default(),
+        );
+        let login_risk_challenge_email_domains = parse_csv_non_empty_values(
+            std::env::var("LOGIN_RISK_CHALLENGE_EMAIL_DOMAINS").unwrap_or_default(),
+        );
         let email_metrics_latency_enabled = std::env::var("EMAIL_METRICS_LATENCY_ENABLED")
             .unwrap_or_else(|_| "false".to_string())
             .parse::<bool>()
@@ -383,6 +443,21 @@ impl AppConfig {
             );
         }
 
+        if enforce_secure_transport && !trust_x_forwarded_for {
+            anyhow::bail!(
+                "ENFORCE_SECURE_TRANSPORT=true requires TRUST_X_FORWARDED_FOR=true with trusted proxies"
+            );
+        }
+
+        if passkey_enabled {
+            if passkey_rp_id.is_none() {
+                anyhow::bail!("PASSKEY_ENABLED=true requires PASSKEY_RP_ID");
+            }
+            if passkey_rp_origin.is_none() {
+                anyhow::bail!("PASSKEY_ENABLED=true requires PASSKEY_RP_ORIGIN");
+            }
+        }
+
         if login_lockout_seconds <= 0 {
             anyhow::bail!("LOGIN_LOCKOUT_SECONDS must be greater than 0");
         }
@@ -395,6 +470,11 @@ impl AppConfig {
         Ok(Self {
             bind_addr,
             auth_runtime,
+            enforce_secure_transport,
+            passkey_enabled,
+            passkey_rp_id,
+            passkey_rp_origin,
+            passkey_challenge_prune_interval_seconds,
             metrics_bearer_token,
             metrics_allowed_cidrs,
             trust_x_forwarded_for,
@@ -427,6 +507,13 @@ impl AppConfig {
             login_abuse_strikes_prefix,
             login_abuse_redis_fail_mode,
             login_abuse_bucket_mode,
+            login_risk_mode,
+            login_risk_blocked_cidrs,
+            login_risk_blocked_user_agent_substrings,
+            login_risk_blocked_email_domains,
+            login_risk_challenge_cidrs,
+            login_risk_challenge_user_agent_substrings,
+            login_risk_challenge_email_domains,
             email_metrics_latency_enabled,
             email_provider,
             email_delivery_mode,
@@ -620,6 +707,44 @@ fn parse_login_abuse_bucket_mode(value: String) -> Result<LoginAbuseBucketMode> 
         "email_and_ip" => Ok(LoginAbuseBucketMode::EmailAndIp),
         _ => anyhow::bail!("LOGIN_ABUSE_BUCKET_MODE must be one of: ip_only, email_and_ip"),
     }
+}
+
+fn parse_login_risk_mode(value: String) -> Result<LoginRiskMode> {
+    match value.to_ascii_lowercase().as_str() {
+        "allow_all" => Ok(LoginRiskMode::AllowAll),
+        "baseline" => Ok(LoginRiskMode::Baseline),
+        _ => anyhow::bail!("LOGIN_RISK_MODE must be one of: allow_all, baseline"),
+    }
+}
+
+fn parse_login_risk_blocked_cidrs(value: String) -> Result<Vec<IpNet>> {
+    parse_ipnet_csv(value, "LOGIN_RISK_BLOCKED_CIDRS")
+}
+
+fn parse_login_risk_challenge_cidrs(value: String) -> Result<Vec<IpNet>> {
+    parse_ipnet_csv(value, "LOGIN_RISK_CHALLENGE_CIDRS")
+}
+
+fn parse_ipnet_csv(value: String, field_name: &str) -> Result<Vec<IpNet>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            entry
+                .parse::<IpNet>()
+                .with_context(|| format!("invalid {field_name} entry: {entry}"))
+        })
+        .collect()
+}
+
+fn parse_csv_non_empty_values(value: String) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn parse_email_provider_config(
@@ -979,10 +1104,11 @@ mod tests {
 
     use super::{
         database_url_uses_secure_transport, parse_email_delivery_mode, parse_email_provider_config,
+        parse_login_risk_blocked_cidrs, parse_login_risk_challenge_cidrs, parse_login_risk_mode,
         parse_metrics_allowed_cidrs, parse_positive_u64_with_default,
         redis_url_uses_secure_transport, resolve_jwt_key_configuration,
         resolve_optional_secret_from_env, validate_backend_transport_security, AuthRuntime,
-        EmailDeliveryMode, EmailProviderConfig,
+        EmailDeliveryMode, EmailProviderConfig, LoginRiskMode,
     };
 
     #[test]
@@ -1003,6 +1129,58 @@ mod tests {
         assert!(error
             .to_string()
             .contains("invalid METRICS_ALLOWED_CIDRS entry: not-a-cidr"));
+    }
+
+    #[test]
+    fn parse_login_risk_mode_accepts_known_values() {
+        assert_eq!(
+            parse_login_risk_mode("allow_all".to_string()).expect("allow_all should parse"),
+            LoginRiskMode::AllowAll
+        );
+        assert_eq!(
+            parse_login_risk_mode("baseline".to_string()).expect("baseline should parse"),
+            LoginRiskMode::Baseline
+        );
+    }
+
+    #[test]
+    fn parse_login_risk_mode_rejects_unknown_value() {
+        let error = parse_login_risk_mode("strict".to_string())
+            .expect_err("unknown login risk mode should fail");
+
+        assert!(error
+            .to_string()
+            .contains("LOGIN_RISK_MODE must be one of: allow_all, baseline"));
+    }
+
+    #[test]
+    fn parse_login_risk_blocked_cidrs_parses_csv() {
+        let cidrs = parse_login_risk_blocked_cidrs("203.0.113.0/24,2001:db8::/32".to_string())
+            .expect("risk blocked cidrs should parse");
+
+        assert_eq!(cidrs.len(), 2);
+        assert_eq!(cidrs[0].to_string(), "203.0.113.0/24");
+        assert_eq!(cidrs[1].to_string(), "2001:db8::/32");
+    }
+
+    #[test]
+    fn parse_login_risk_blocked_cidrs_rejects_invalid_entry() {
+        let error = parse_login_risk_blocked_cidrs("203.0.113.0/24,nope".to_string())
+            .expect_err("invalid risk cidr should fail");
+
+        assert!(error
+            .to_string()
+            .contains("invalid LOGIN_RISK_BLOCKED_CIDRS entry: nope"));
+    }
+
+    #[test]
+    fn parse_login_risk_challenge_cidrs_rejects_invalid_entry() {
+        let error = parse_login_risk_challenge_cidrs("203.0.113.0/24,nope".to_string())
+            .expect_err("invalid challenge cidr should fail");
+
+        assert!(error
+            .to_string()
+            .contains("invalid LOGIN_RISK_CHALLENGE_CIDRS entry: nope"));
     }
 
     #[test]
