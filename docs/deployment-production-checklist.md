@@ -139,6 +139,9 @@ STRICT_DEPLOY_VALIDATION=true ./scripts/validate-deploy-readiness.sh
 
 ```bash
 # GitHub Actions -> production-promotion-manual
+# Runner target:
+# - ubuntu-latest (default, hosted)
+# - self-hosted-auth-local (labels: self-hosted,linux,x64,auth-local)
 # Required inputs:
 # - image_digest (sha256:...)
 # - ingress_host
@@ -170,6 +173,9 @@ JWT_PRIMARY_KID='auth-ed25519-v2' \
 
 ```bash
 # GitHub Actions -> production-deploy-manual
+# Runner target:
+# - ubuntu-latest (default, hosted)
+# - self-hosted-auth-local (labels: self-hosted,linux,x64,auth-local)
 # Required inputs:
 # - image_digest (sha256:...)
 # - ingress_host
@@ -242,11 +248,13 @@ kubectl exec -it auth-api-pod-xxx -n auth -- sh -c 'nc -vz <redis-ip> 6379'
 - Local preflight (non-strict): `./scripts/validate-k8s-manifests.sh`
 - Local preflight (strict; fails if optional tools are missing): `STRICT_K8S_VALIDATION=true ./scripts/validate-k8s-manifests.sh`
 - Manual GitHub gate with artifacts/logs: `Actions -> k8s-manifest-validation-manual -> Run workflow`
+- `runner_target` soportado en workflow manual: `ubuntu-latest` o `self-hosted-auth-local`.
 - Workflow artifact path: `artifacts/k8s-manifest-validation/` (placeholder report, YAML/kustomize/kubeconform logs)
 - Generate production overlay: `IMAGE_DIGEST=... INGRESS_HOST=... TLS_SECRET_NAME=... POSTGRES_CIDR=... REDIS_CIDR=... ./scripts/generate-production-overlay.sh`
 - Deploy readiness gate (generated production overlay + digest policy): `./scripts/validate-deploy-readiness.sh`
 - Deploy readiness strict mode: `STRICT_DEPLOY_VALIDATION=true ./scripts/validate-deploy-readiness.sh`
 - Manual GitHub gate with artifacts/logs: `Actions -> deploy-readiness-validation-manual -> Run workflow`
+- `runner_target` soportado en workflow manual: `ubuntu-latest` o `self-hosted-auth-local`.
 - Workflow artifact path: `artifacts/deploy-readiness/` (placeholder report, render log, digest policy report)
 - Production promotion workflow (no apply): `Actions -> production-promotion-manual -> Run workflow`
 - Promotion artifacts: `production-manifest-<run_id>` and `production-promotion-evidence-<run_id>`

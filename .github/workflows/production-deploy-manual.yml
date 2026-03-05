@@ -3,6 +3,14 @@ name: production-deploy-manual
 on:
   workflow_dispatch:
     inputs:
+      runner_target:
+        description: "Runner target"
+        required: true
+        default: ubuntu-latest
+        type: choice
+        options:
+          - ubuntu-latest
+          - self-hosted-auth-local
       image_digest:
         description: "Production image digest (sha256:...)"
         required: true
@@ -44,7 +52,7 @@ permissions:
 
 jobs:
   production-deploy:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.inputs.runner_target == 'self-hosted-auth-local' && fromJson('["self-hosted","linux","x64","auth-local"]') || 'ubuntu-latest' }}
     env:
       KUSTOMIZE_VERSION: "5.4.3"
       KUBECONFORM_VERSION: "0.6.7"
@@ -57,16 +65,29 @@ jobs:
         run: |
           set -euo pipefail
 
+          mkdir -p "${HOME}/.local/bin"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+          install_bin() {
+            local src="$1"
+            local name="$2"
+            if command -v sudo >/dev/null 2>&1; then
+              sudo install -m 0755 "${src}" "/usr/local/bin/${name}"
+            else
+              install -m 0755 "${src}" "${HOME}/.local/bin/${name}"
+            fi
+          }
+
           curl -sSL -o /tmp/kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
           tar -xzf /tmp/kustomize.tar.gz -C /tmp
-          sudo install -m 0755 /tmp/kustomize /usr/local/bin/kustomize
+          install_bin /tmp/kustomize kustomize
 
           curl -sSL -o /tmp/kubeconform.tar.gz "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
           tar -xzf /tmp/kubeconform.tar.gz -C /tmp
-          sudo install -m 0755 /tmp/kubeconform /usr/local/bin/kubeconform
+          install_bin /tmp/kubeconform kubeconform
 
           curl -sSL -o /tmp/kubectl "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+          install_bin /tmp/kubectl kubectl
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3

@@ -336,7 +336,7 @@ EMAIL_OUTBOX_BACKOFF_MAX_MS=60000
 - Workflow manual para validacion de deploy readiness: `.github/workflows/deploy-readiness-validation-manual.yml`.
 - Workflow manual de promocion productiva (firma + readiness + render + schema): `.github/workflows/production-promotion-manual.yml`.
 - Workflow manual de deploy controlado a produccion (dry-run por defecto + apply opcional): `.github/workflows/production-deploy-manual.yml`.
-- Los workflows manuales `k8s-manifest-validation-manual` y `deploy-readiness-validation-manual` instalan versiones pineadas de `kustomize` y `kubeconform`, por lo que `strict_validation=true` queda soportado end-to-end en runners de GitHub Actions.
+- Los workflows manuales `k8s-manifest-validation-manual` y `deploy-readiness-validation-manual` instalan versiones pineadas de `kustomize` y `kubeconform`, por lo que `strict_validation=true` queda soportado end-to-end tanto en runners hospedados como self-hosted.
 - Snippets SQL parametrizados para el rollout de compliance: `scripts/sql/outbox-replay-audit-compliance-queries.sql`.
 - Snippets SQL DBA para verificar guardas append-only y smoke tests de rechazo: `scripts/sql/outbox-replay-audit-append-only-queries.sql`.
 - El comando `requeue` registra auditoria persistente en `outbox_replay_audit` tanto en dry-run como en apply (incluye actor, ticket, filtros, scope y conteos).
@@ -393,6 +393,9 @@ Pasos recomendados:
 ### Workflow manual: promotion artifact para produccion (sin apply)
 
 - Ejecutar: `Actions -> production-promotion-manual -> Run workflow`.
+- Input `runner_target`:
+  - `ubuntu-latest` (default): runner hospedado de GitHub.
+  - `self-hosted-auth-local`: runner self-hosted con labels `self-hosted,linux,x64,auth-local`.
 - Inputs obligatorios: `image_digest`, `ingress_host`, `tls_secret_name`, `postgres_cidr`, `redis_cidr`.
 - Gate de firma: valida keyless Cosign para `ghcr.io/lu149e/system@<digest>` con issuer `https://token.actions.githubusercontent.com` e identidad del workflow `release-image.yml` en `refs/heads/main` o `refs/tags/*`.
 - Gate de readiness: ejecuta `scripts/generate-production-overlay.sh` y luego `scripts/validate-deploy-readiness.sh` en modo estricto (`STRICT_DEPLOY_VALIDATION=true`).
@@ -405,6 +408,9 @@ Pasos recomendados:
 ### Workflow manual: controlled deploy a produccion (dry-run default, apply opcional)
 
 - Ejecutar: `Actions -> production-deploy-manual -> Run workflow`.
+- Input `runner_target`:
+  - `ubuntu-latest` (default): runner hospedado de GitHub.
+  - `self-hosted-auth-local`: runner self-hosted con labels `self-hosted,linux,x64,auth-local`.
 - Inputs obligatorios: `image_digest`, `ingress_host`, `tls_secret_name`, `postgres_cidr`, `redis_cidr`.
 - Inputs operativos:
   - `apply_changes` (boolean, default `false`): en `false` ejecuta solo dry-run server-side; en `true` aplica manifiestos al cluster.
