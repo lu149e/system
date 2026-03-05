@@ -13,6 +13,9 @@ on:
           - soak
           - both
 
+permissions:
+  contents: read
+
 jobs:
   perf-evidence:
     runs-on: ubuntu-latest

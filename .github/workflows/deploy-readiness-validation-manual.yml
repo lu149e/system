@@ -47,6 +47,9 @@ on:
         default: true
         type: boolean
 
+permissions:
+  contents: read
+
 jobs:
   deploy-readiness-validation:
     runs-on: ${{ github.event.inputs.runner_target == 'self-hosted-auth-local' && fromJson('["self-hosted","linux","x64","auth-local"]') || 'ubuntu-latest' }}
