@@ -57,6 +57,9 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
+      - name: Prepare SBOM artifact directory
+        run: mkdir -p artifacts/image-sbom
+
       - name: Generate SBOM (SPDX JSON) for pushed digest
         id: sbom
         uses: anchore/sbom-action@v0
