@@ -14,7 +14,7 @@ RUN cargo build --release --locked && rm -rf src
 
 COPY src ./src
 COPY migrations ./migrations
-RUN cargo build --release --locked
+RUN find src -type f -exec touch {} + && cargo build --release --locked
 
 FROM debian:bookworm-slim AS runtime
 
