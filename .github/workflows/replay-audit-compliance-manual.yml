@@ -111,7 +111,7 @@ jobs:
 
       - name: Upload replay-audit compliance artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: replay-audit-compliance-${{ github.run_id }}
           path: artifacts/replay-audit-compliance
