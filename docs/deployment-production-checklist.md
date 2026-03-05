@@ -178,10 +178,12 @@ JWT_PRIMARY_KID='auth-ed25519-v2' \
 # - redis_cidr
 # Optional inputs:
 # - apply_changes=false (default; non-destructive dry-run mode)
+# - allow_client_dry_run_fallback=false (default; only for simulation when API server is unreachable)
 # - namespace=auth
 ```
 
    - Always performs: signature verify, overlay generation, strict deploy readiness, render + `kubeconform -strict`, kube auth setup, and `kubectl apply --dry-run=server`.
+   - Optional simulation fallback (only with `apply_changes=false`): if `allow_client_dry_run_fallback=true` and server dry-run fails due cluster connectivity, workflow runs `kubectl apply --dry-run=client` and marks it in summary/artifacts.
    - Apply gate: only mutates cluster when `apply_changes=true`.
    - Safety guard: fails fast if `apply_changes=true` and `KUBE_CONFIG_B64` is missing.
    - Post-apply smoke checks (only in apply mode): rollout status, endpoint readiness, `/healthz` and `/readyz` via service port-forward.

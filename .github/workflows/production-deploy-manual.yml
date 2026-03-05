@@ -28,6 +28,11 @@ on:
         required: true
         default: false
         type: boolean
+      allow_client_dry_run_fallback:
+        description: "Only for simulation: fallback to --dry-run=client when API server is unreachable (requires apply_changes=false)"
+        required: true
+        default: false
+        type: boolean
       namespace:
         description: "Kubernetes namespace target"
         required: true
@@ -178,12 +183,34 @@ jobs:
           kubectl config current-context > artifacts/production-deploy/kube-context.log
 
       - name: Server-side dry-run apply (always)
+        id: dryrun
         env:
           NAMESPACE: ${{ github.event.inputs.namespace }}
+          APPLY_CHANGES: ${{ github.event.inputs.apply_changes }}
+          ALLOW_CLIENT_FALLBACK: ${{ github.event.inputs.allow_client_dry_run_fallback }}
         run: |
           set -euo pipefail
+          fallback_used="false"
+
+          set +e
           kubectl apply --dry-run=server -n "${NAMESPACE}" -f artifacts/production-deploy/production-manifests.yaml \
-            2>&1 | tee artifacts/production-deploy/kubectl-dry-run.log
+            2>&1 | tee artifacts/production-deploy/kubectl-dry-run-server.log
+          server_rc=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${server_rc}" -ne 0 ]; then
+            if [ "${ALLOW_CLIENT_FALLBACK}" = "true" ] && [ "${APPLY_CHANGES}" != "true" ]; then
+              echo "Server-side dry-run failed; running client-side fallback because allow_client_dry_run_fallback=true." \
+                | tee artifacts/production-deploy/kubectl-dry-run-fallback.log
+              kubectl apply --dry-run=client -n "${NAMESPACE}" -f artifacts/production-deploy/production-manifests.yaml \
+                2>&1 | tee artifacts/production-deploy/kubectl-dry-run-client.log
+              fallback_used="true"
+            else
+              exit "${server_rc}"
+            fi
+          fi
+
+          echo "fallback_used=${fallback_used}" >> "${GITHUB_OUTPUT}"
 
       - name: Apply manifests to production cluster
         if: ${{ github.event.inputs.apply_changes == 'true' }}
@@ -238,6 +265,8 @@ jobs:
           MODE: ${{ steps.mode.outputs.mode }}
           NAMESPACE: ${{ steps.mode.outputs.namespace }}
           APPLY_CHANGES: ${{ github.event.inputs.apply_changes }}
+          CLIENT_FALLBACK: ${{ github.event.inputs.allow_client_dry_run_fallback }}
+          FALLBACK_USED: ${{ steps.dryrun.outputs.fallback_used }}
           JOB_STATUS: ${{ job.status }}
         run: |
           set -euo pipefail
@@ -247,6 +276,8 @@ jobs:
             echo "- Mode: ${MODE}"
             echo "- Namespace: ${NAMESPACE}"
             echo "- apply_changes input: ${APPLY_CHANGES}"
+            echo "- allow_client_dry_run_fallback input: ${CLIENT_FALLBACK}"
+            echo "- client fallback used: ${FALLBACK_USED:-false}"
             echo "- Job status: ${JOB_STATUS}"
             if [ "${MODE}" = "dry-run" ]; then
               echo "- Cluster mutation: no (dry-run only)"
