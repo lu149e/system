@@ -90,6 +90,7 @@ jobs:
       - name: Install promtool
         run: |
           set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
           curl -sSL -o /tmp/prometheus.tar.gz "https://github.com/prometheus/prometheus/releases/download/v${PROMTOOL_VERSION}/prometheus-${PROMTOOL_VERSION}.linux-amd64.tar.gz"
           tar -xzf /tmp/prometheus.tar.gz -C /tmp
           install -m 0755 "/tmp/prometheus-${PROMTOOL_VERSION}.linux-amd64/promtool" "$HOME/.local/bin/promtool"
