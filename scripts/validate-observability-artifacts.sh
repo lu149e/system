@@ -27,8 +27,8 @@ validate_rules_with_promtool() {
   fi
 
   if command -v docker >/dev/null 2>&1; then
-    docker run --rm -v "${ROOT_DIR}:/work" -w /work prom/prometheus:v2.53.0 \
-      promtool check rules "$rules_file"
+    docker run --rm --entrypoint=promtool -v "${ROOT_DIR}:/work" -w /work prom/prometheus:v2.53.0 \
+      check rules "$rules_file"
     return 0
   fi
 

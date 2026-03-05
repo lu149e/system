@@ -50,7 +50,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Rust tests (with Postgres adapter coverage)
-        run: cargo test --all-features
+        run: cargo test --all-features -- --test-threads=1
 
   supply-chain:
     runs-on: ubuntu-latest
@@ -82,9 +82,21 @@ jobs:
     runs-on: ubuntu-latest
     env:
       STRICT_PROMTOOL: "true"
+      PROMTOOL_VERSION: "3.10.0"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install promtool
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/prometheus.tar.gz "https://github.com/prometheus/prometheus/releases/download/v${PROMTOOL_VERSION}/prometheus-${PROMTOOL_VERSION}.linux-amd64.tar.gz"
+          tar -xzf /tmp/prometheus.tar.gz -C /tmp
+          install -m 0755 "/tmp/prometheus-${PROMTOOL_VERSION}.linux-amd64/promtool" "$HOME/.local/bin/promtool"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify promtool
+        run: promtool --version
 
       - name: Validate observability artifacts
         run: ./scripts/validate-observability-artifacts.sh
