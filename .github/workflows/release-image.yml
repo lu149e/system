@@ -38,7 +38,7 @@ jobs:
 
       - name: Derive image metadata and tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/lu149e/system
           tags: |
