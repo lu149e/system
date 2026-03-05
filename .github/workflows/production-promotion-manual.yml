@@ -229,7 +229,7 @@ jobs:
 
       - name: Upload production manifest artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: production-manifest-${{ github.run_id }}
           path: artifacts/production-promotion/production-manifests.yaml
@@ -237,7 +237,7 @@ jobs:
 
       - name: Upload promotion evidence and logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: production-promotion-evidence-${{ github.run_id }}
           path: |
