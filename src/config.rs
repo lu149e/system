@@ -275,7 +275,7 @@ impl AppConfig {
             .unwrap_or_else(|_| "false".to_string())
             .parse::<bool>()
             .context("EMAIL_METRICS_LATENCY_ENABLED must be true or false")?;
-        let sendgrid_env_value = resolve_optional_secret_from_env(
+        let sendgrid_api_key = resolve_optional_secret_from_env(
             "SENDGRID_API_KEY",
             std::env::var("SENDGRID_API_KEY").ok(),
             "SENDGRID_API_KEY_FILE",
@@ -283,7 +283,7 @@ impl AppConfig {
         )?;
         let email_provider = parse_email_provider_config(
             std::env::var("EMAIL_PROVIDER").unwrap_or_else(|_| "noop".to_string()),
-            sendgrid_env_value,
+            sendgrid_api_key,
             SendGridEnvConfig {
                 api_base_url: std::env::var("SENDGRID_API_BASE_URL").ok(),
                 from_email: std::env::var("SENDGRID_FROM_EMAIL").ok(),
@@ -624,13 +624,13 @@ fn parse_login_abuse_bucket_mode(value: String) -> Result<LoginAbuseBucketMode> 
 
 fn parse_email_provider_config(
     value: String,
-    sendgrid_env_value: Option<String>,
+    sendgrid_api_key: Option<String>,
     sendgrid: SendGridEnvConfig,
 ) -> Result<EmailProviderConfig> {
     match value.trim().to_ascii_lowercase().as_str() {
         "noop" => Ok(EmailProviderConfig::Noop),
         "sendgrid" => {
-            let api_key = sendgrid_env_value
+            let api_key = sendgrid_api_key
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
                 .context("SENDGRID_API_KEY or SENDGRID_API_KEY_FILE is required when EMAIL_PROVIDER=sendgrid")?;

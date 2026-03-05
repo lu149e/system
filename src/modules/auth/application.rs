@@ -2129,8 +2129,8 @@ mod tests {
     #[tokio::test]
     async fn password_change_revokes_sessions_and_replaces_credentials() {
         let harness = build_harness();
-        let wrong_current_password = generated_test_password("wrong-current");
-        let next_password = generated_test_password("next-credential");
+        let wrong_current_password = generated_test_password();
+        let next_password = generated_test_password();
 
         let login_initial = harness
             .service
@@ -2268,7 +2268,7 @@ mod tests {
         assert_eq!(active_after[0].id, principal1.session_id);
 
         let other_email = "other@example.com";
-        let other_password = generated_test_password("other-user");
+        let other_password = generated_test_password();
         let other_hash = super::hash_password(&other_password).expect("hashing should work");
         let other_user = harness
             .users
@@ -3337,7 +3337,7 @@ mod tests {
             mfa_totp_issuer: "auth-tests".to_string(),
             mfa_encryption_key: generated_test_mfa_encryption_key_base64(),
             bootstrap_user_email: Some("bootstrap@example.com".to_string()),
-            bootstrap_user_password: Some(generated_test_password("bootstrap-user")),
+            bootstrap_user_password: Some(generated_test_password()),
             login_max_attempts: 5,
             login_attempt_window_seconds: 300,
             login_lockout_seconds: 900,
@@ -3382,8 +3382,8 @@ mod tests {
         super::totp_code_for_step(&secret_bytes, step).expect("totp generation should succeed")
     }
 
-    fn generated_test_password(label: &str) -> String {
-        format!("A{label}!9z{}", Uuid::new_v4().simple())
+    fn generated_test_password() -> String {
+        format!("Aa!9z{}", Uuid::new_v4().simple())
     }
 
     fn generated_test_mfa_encryption_key_base64() -> String {

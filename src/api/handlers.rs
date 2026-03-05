@@ -2190,7 +2190,7 @@ mod tests {
         cfg.database_url = database_url;
         cfg.bootstrap_user_email =
             Some(format!("bootstrap-pg-{}@example.com", uuid::Uuid::new_v4()));
-        cfg.bootstrap_user_password = Some(generated_test_password("bootstrap-pg"));
+        cfg.bootstrap_user_password = Some(generated_test_password());
         cfg.login_abuse_attempts_prefix =
             format!("handler:pg:test:attempts:{}", uuid::Uuid::new_v4());
         cfg.login_abuse_lock_prefix = format!("handler:pg:test:lock:{}", uuid::Uuid::new_v4());
@@ -2364,7 +2364,7 @@ mod tests {
             mfa_totp_issuer: "handler-tests".to_string(),
             mfa_encryption_key: generated_test_mfa_encryption_key_base64(),
             bootstrap_user_email: Some("bootstrap@example.com".to_string()),
-            bootstrap_user_password: Some(generated_test_password("bootstrap-user")),
+            bootstrap_user_password: Some(generated_test_password()),
             login_max_attempts: 5,
             login_attempt_window_seconds: 300,
             login_lockout_seconds: 900,
@@ -2395,8 +2395,8 @@ mod tests {
         totp_code_for_step(&secret_bytes, step).expect("totp generation should succeed")
     }
 
-    fn generated_test_password(label: &str) -> String {
-        format!("A{label}!9z{}", Uuid::new_v4().simple())
+    fn generated_test_password() -> String {
+        format!("Aa!9z{}", Uuid::new_v4().simple())
     }
 
     fn generated_test_mfa_encryption_key_base64() -> String {
