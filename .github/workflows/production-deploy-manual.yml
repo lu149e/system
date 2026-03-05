@@ -81,7 +81,7 @@ jobs:
           install_bin() {
             local src="$1"
             local name="$2"
-            if command -v sudo >/dev/null 2>&1; then
+            if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
               sudo install -m 0755 "${src}" "/usr/local/bin/${name}"
             else
               install -m 0755 "${src}" "${HOME}/.local/bin/${name}"
