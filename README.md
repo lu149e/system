@@ -408,7 +408,7 @@ Pasos recomendados:
 - Inputs obligatorios: `image_digest`, `ingress_host`, `tls_secret_name`, `postgres_cidr`, `redis_cidr`.
 - Inputs operativos:
   - `apply_changes` (boolean, default `false`): en `false` ejecuta solo dry-run server-side; en `true` aplica manifiestos al cluster.
-  - `allow_client_dry_run_fallback` (boolean, default `false`): solo para simulacion; si el server-side dry-run no puede contactar el API server y `apply_changes=false`, permite fallback a `kubectl --dry-run=client`.
+  - `allow_client_dry_run_fallback` (boolean, default `false`): solo para simulacion; si el server-side dry-run no puede contactar el API server y `apply_changes=false`, permite continuar sin el gate de `kubectl --dry-run=server`.
   - `namespace` (default `auth`): namespace destino para dry-run/apply/smoke.
 - Secret requerido: `KUBE_CONFIG_B64` (kubeconfig en base64 para autenticar `kubectl` en el cluster objetivo).
 - Secuencia del workflow:

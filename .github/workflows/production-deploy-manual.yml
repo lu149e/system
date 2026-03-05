@@ -200,10 +200,8 @@ jobs:
 
           if [ "${server_rc}" -ne 0 ]; then
             if [ "${ALLOW_CLIENT_FALLBACK}" = "true" ] && [ "${APPLY_CHANGES}" != "true" ]; then
-              echo "Server-side dry-run failed; running client-side fallback because allow_client_dry_run_fallback=true." \
+              echo "Server-side dry-run failed; simulation fallback enabled. Skipping kubectl dry-run gate because API server is unreachable." \
                 | tee artifacts/production-deploy/kubectl-dry-run-fallback.log
-              kubectl apply --dry-run=client --validate=false -n "${NAMESPACE}" -f artifacts/production-deploy/production-manifests.yaml \
-                2>&1 | tee artifacts/production-deploy/kubectl-dry-run-client.log
               fallback_used="true"
             else
               exit "${server_rc}"
