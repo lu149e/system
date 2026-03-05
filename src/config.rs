@@ -275,7 +275,7 @@ impl AppConfig {
             .unwrap_or_else(|_| "false".to_string())
             .parse::<bool>()
             .context("EMAIL_METRICS_LATENCY_ENABLED must be true or false")?;
-        let sendgrid_api_key = resolve_optional_secret_from_env(
+        let sendgrid_provider_credential = resolve_optional_secret_from_env(
             "SENDGRID_API_KEY",
             std::env::var("SENDGRID_API_KEY").ok(),
             "SENDGRID_API_KEY_FILE",
@@ -283,7 +283,7 @@ impl AppConfig {
         )?;
         let email_provider = parse_email_provider_config(
             std::env::var("EMAIL_PROVIDER").unwrap_or_else(|_| "noop".to_string()),
-            sendgrid_api_key,
+            sendgrid_provider_credential,
             SendGridEnvConfig {
                 api_base_url: std::env::var("SENDGRID_API_BASE_URL").ok(),
                 from_email: std::env::var("SENDGRID_FROM_EMAIL").ok(),
@@ -624,16 +624,23 @@ fn parse_login_abuse_bucket_mode(value: String) -> Result<LoginAbuseBucketMode> 
 
 fn parse_email_provider_config(
     value: String,
-    sendgrid_api_key: Option<String>,
+    sendgrid_provider_credential: Option<String>,
     sendgrid: SendGridEnvConfig,
 ) -> Result<EmailProviderConfig> {
     match value.trim().to_ascii_lowercase().as_str() {
         "noop" => Ok(EmailProviderConfig::Noop),
         "sendgrid" => {
-            let api_key = sendgrid_api_key
+            let provider_credential = sendgrid_provider_credential
                 .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .context("SENDGRID_API_KEY or SENDGRID_API_KEY_FILE is required when EMAIL_PROVIDER=sendgrid")?;
+                .filter(|v| !v.is_empty());
+            let api_key = match provider_credential {
+                Some(value) => value,
+                None => {
+                    anyhow::bail!(
+                        "SENDGRID_API_KEY or SENDGRID_API_KEY_FILE is required when EMAIL_PROVIDER=sendgrid"
+                    )
+                }
+            };
             let api_base_url = sendgrid
                 .api_base_url
                 .map(|v| v.trim().to_string())
