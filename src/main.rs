@@ -1,6 +1,7 @@
 mod adapters;
 mod api;
 mod config;
+mod health;
 mod jwks;
 mod modules;
 mod observability;
@@ -25,6 +26,7 @@ use axum::{
 use config::{AppConfig, AuthRuntime, EmailDeliveryMode, EmailProviderConfig};
 use ipnet::IpNet;
 use modules::auth::application::AuthService;
+use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tower_http::{request_id::MakeRequestUuid, trace::TraceLayer};
 use tracing::info;
@@ -33,11 +35,79 @@ use tracing::info;
 pub struct AppState {
     pub auth_service: Arc<AuthService>,
     pub jwks: jwks::JwksDocument,
+    pub readiness_checker: Arc<dyn health::ReadinessChecker>,
     pub metrics_bearer_token: Option<String>,
     pub metrics_allowed_cidrs: Vec<IpNet>,
     pub trust_x_forwarded_for: bool,
     pub trusted_proxy_ips: Vec<IpAddr>,
     pub trusted_proxy_cidrs: Vec<IpNet>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunMode {
+    Server,
+    Migrate,
+}
+
+fn parse_run_mode(args: Vec<String>, run_mode_env: Option<String>) -> anyhow::Result<RunMode> {
+    if let Some(command) = args.first() {
+        return match command.as_str() {
+            "migrate" => {
+                if args.len() > 1 {
+                    anyhow::bail!("`auth migrate` does not accept additional arguments");
+                }
+                Ok(RunMode::Migrate)
+            }
+            _ => anyhow::bail!("unknown command `{}`; supported command: migrate", command),
+        };
+    }
+
+    parse_run_mode_env(run_mode_env)
+}
+
+fn parse_run_mode_env(run_mode_env: Option<String>) -> anyhow::Result<RunMode> {
+    match run_mode_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("server") => Ok(RunMode::Server),
+        Some("migrate") => Ok(RunMode::Migrate),
+        Some(_) => anyhow::bail!("AUTH_RUN_MODE must be one of: server, migrate"),
+    }
+}
+
+fn ensure_migrations_supported(auth_runtime: AuthRuntime) -> anyhow::Result<()> {
+    if auth_runtime == AuthRuntime::InMemory {
+        anyhow::bail!(
+            "migrations are not applicable for AUTH_RUNTIME=inmemory; switch to AUTH_RUNTIME=postgres_redis for migration mode"
+        );
+    }
+
+    Ok(())
+}
+
+async fn run_migration_mode() -> anyhow::Result<()> {
+    let auth_runtime = config::auth_runtime_from_env()?;
+    ensure_migrations_supported(auth_runtime)?;
+
+    let database_url = std::env::var("DATABASE_URL")
+        .context("DATABASE_URL is required when AUTH_RUNTIME=postgres_redis")?;
+    let database_max_connections = std::env::var("DATABASE_MAX_CONNECTIONS")
+        .unwrap_or_else(|_| "10".to_string())
+        .parse::<u32>()
+        .context("DATABASE_MAX_CONNECTIONS must be numeric")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(database_max_connections)
+        .connect(&database_url)
+        .await?;
+
+    adapters::postgres::run_migrations(&pool).await?;
+    info!("database migrations completed successfully");
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -47,6 +117,14 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    let run_mode = parse_run_mode(
+        std::env::args().skip(1).collect(),
+        std::env::var("AUTH_RUN_MODE").ok(),
+    )?;
+    if run_mode == RunMode::Migrate {
+        return run_migration_mode().await;
+    }
 
     let cfg = AppConfig::from_env()?;
     observability::configure_email_metrics(cfg.email_metrics_latency_enabled);
@@ -92,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
         audit,
         outbox_repository,
         dispatcher,
+        readiness_checker,
     ) = match cfg.auth_runtime {
         AuthRuntime::PostgresRedis => {
             let pg = PostgresAdapters::bootstrap(&cfg).await?;
@@ -107,6 +186,11 @@ async fn main() -> anyhow::Result<()> {
                 cfg.login_abuse_redis_fail_mode,
                 cfg.login_abuse_bucket_mode,
             )?;
+            let readiness_checker = health::RuntimeReadinessChecker::postgres_redis(
+                pg.pool.clone(),
+                Some(redis.health_client()),
+                std::time::Duration::from_secs(2),
+            );
             let outbox_repository = Arc::new(pg.email_outbox.clone())
                 as Arc<dyn modules::auth::ports::EmailOutboxRepository>;
             let dispatcher = if cfg.email_delivery_mode == EmailDeliveryMode::Outbox {
@@ -149,10 +233,12 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(pg.audit) as Arc<dyn modules::audit::ports::AuditRepository>,
                 Some(outbox_repository),
                 dispatcher,
+                readiness_checker,
             )
         }
         AuthRuntime::InMemory => {
             let adapters = InMemoryAdapters::bootstrap(&cfg)?;
+            let readiness_checker = health::RuntimeReadinessChecker::inmemory();
             (
                 Arc::new(adapters.users) as Arc<dyn modules::auth::ports::UserRepository>,
                 Arc::new(adapters.login_abuse)
@@ -173,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::new(adapters.audit) as Arc<dyn modules::audit::ports::AuditRepository>,
                 None,
                 None,
+                readiness_checker,
             )
         }
     };
@@ -218,6 +305,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         auth_service,
         jwks,
+        readiness_checker,
         metrics_bearer_token: cfg.metrics_bearer_token,
         metrics_allowed_cidrs: cfg.metrics_allowed_cidrs,
         trust_x_forwarded_for: cfg.trust_x_forwarded_for,
@@ -233,6 +321,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let app = Router::new()
+        .route("/healthz", get(api::handlers::healthz))
+        .route("/readyz", get(api::handlers::readyz))
         .route("/.well-known/jwks.json", get(api::handlers::jwks))
         .route("/v1/auth/register", post(api::handlers::register))
         .route("/v1/auth/verify-email", post(api::handlers::verify_email))
@@ -279,4 +369,67 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_migrations_supported, parse_run_mode, RunMode};
+    use crate::config::AuthRuntime;
+
+    #[test]
+    fn run_mode_defaults_to_server() {
+        let mode = parse_run_mode(vec![], None).expect("default run mode should parse");
+
+        assert_eq!(mode, RunMode::Server);
+    }
+
+    #[test]
+    fn run_mode_accepts_migrate_subcommand() {
+        let mode = parse_run_mode(vec!["migrate".to_string()], None)
+            .expect("migrate command should parse");
+
+        assert_eq!(mode, RunMode::Migrate);
+    }
+
+    #[test]
+    fn run_mode_accepts_auth_run_mode_env() {
+        let mode = parse_run_mode(vec![], Some("migrate".to_string()))
+            .expect("migrate env mode should parse");
+
+        assert_eq!(mode, RunMode::Migrate);
+    }
+
+    #[test]
+    fn run_mode_rejects_unknown_subcommand() {
+        let error = parse_run_mode(vec!["serve".to_string()], None)
+            .expect_err("unknown command should fail");
+
+        assert!(error.to_string().contains("unknown command `serve`"));
+    }
+
+    #[test]
+    fn run_mode_rejects_unknown_env_mode() {
+        let error = parse_run_mode(vec![], Some("worker".to_string()))
+            .expect_err("unknown env mode should fail");
+
+        assert!(error
+            .to_string()
+            .contains("AUTH_RUN_MODE must be one of: server, migrate"));
+    }
+
+    #[test]
+    fn migrations_are_rejected_for_inmemory_runtime() {
+        let error = ensure_migrations_supported(AuthRuntime::InMemory)
+            .expect_err("inmemory runtime should reject migrations");
+
+        assert!(error
+            .to_string()
+            .contains("migrations are not applicable for AUTH_RUNTIME=inmemory"));
+    }
+
+    #[test]
+    fn migrations_are_supported_for_postgres_runtime() {
+        ensure_migrations_supported(AuthRuntime::PostgresRedis)
+            .expect("postgres runtime should support migrations");
+    }
 }

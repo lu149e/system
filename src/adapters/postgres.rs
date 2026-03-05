@@ -34,6 +34,7 @@ use crate::{
 
 #[derive(Clone)]
 pub struct PostgresAdapters {
+    pub pool: PgPool,
     pub users: PostgresUserRepository,
     pub verification_tokens: PostgresVerificationTokenRepository,
     pub password_reset_tokens: PostgresPasswordResetTokenRepository,
@@ -59,6 +60,7 @@ impl PostgresAdapters {
         users.ensure_bootstrap_user(cfg).await?;
 
         Ok(Self {
+            pool: pool.clone(),
             users,
             verification_tokens: PostgresVerificationTokenRepository { pool: pool.clone() },
             password_reset_tokens: PostgresPasswordResetTokenRepository { pool: pool.clone() },

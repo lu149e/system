@@ -1,0 +1,123 @@
+name: release-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional release tag (example: v1.2.3)"
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image metadata and tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/lu149e/system
+          tags: |
+            type=raw,value=main
+            type=sha,prefix=sha-
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
+            type=ref,event=tag
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Generate SBOM (SPDX JSON) for pushed digest
+        id: sbom
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/lu149e/system@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: artifacts/image-sbom/sbom.spdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-sbom-${{ github.run_id }}
+          path: artifacts/image-sbom
+          if-no-files-found: error
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Verify Cosign availability
+        run: |
+          if ! command -v cosign >/dev/null 2>&1; then
+            echo "ERROR: cosign binary not found after installation step." >&2
+            exit 1
+          fi
+
+      - name: Sign image digest with Cosign keyless (GitHub OIDC)
+        id: sign
+        run: |
+          cosign sign --yes ghcr.io/lu149e/system@${{ steps.build.outputs.digest }}
+
+      - name: Persist release metadata
+        run: |
+          mkdir -p artifacts/image-release
+          printf '%s\n' 'ghcr.io/lu149e/system' > artifacts/image-release/image.txt
+          printf '%s\n' '${{ steps.build.outputs.digest }}' > artifacts/image-release/digest.txt
+          printf '%s\n' '${{ steps.meta.outputs.tags }}' > artifacts/image-release/tags.txt
+          printf '%s\n' 'ghcr.io/lu149e/system@${{ steps.build.outputs.digest }}' > artifacts/image-release/reference.txt
+
+      - name: Upload release metadata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-release-${{ github.run_id }}
+          path: artifacts/image-release
+          if-no-files-found: error
+
+      - name: Log digest, tags, SBOM and signing status
+        if: always()
+        run: |
+          echo "Image digest: ${{ steps.build.outputs.digest }}"
+          echo "Published tags:"
+          echo "${{ steps.meta.outputs.tags }}"
+          {
+            echo "## OCI image published"
+            echo
+            echo "- Image: ghcr.io/lu149e/system"
+            echo "- Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "- Tags:"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo "- Deploy reference: \`ghcr.io/lu149e/system@${{ steps.build.outputs.digest }}\`"
+            echo "- SBOM artifact: \`image-sbom-${{ github.run_id }}\`"
+            echo "- Cosign signing step: \`${{ steps.sign.outcome }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

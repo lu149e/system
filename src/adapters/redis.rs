@@ -141,6 +141,10 @@ impl RedisLoginAbuseProtector {
 
         seconds.min(self.lockout_max_seconds)
     }
+
+    pub fn health_client(&self) -> redis::Client {
+        self.client.clone()
+    }
 }
 
 #[async_trait]

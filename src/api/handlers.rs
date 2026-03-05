@@ -13,6 +13,7 @@ use std::{
 
 use crate::{
     api::problem::{from_auth_error, ApiProblem, ProblemDetails},
+    health::ComponentState,
     modules::auth::application::{
         AuthError, LoginCommand, LoginResult, LogoutCommand, MfaActivateCommand, MfaDisableCommand,
         MfaVerifyCommand, PasswordChangeCommand, PasswordForgotCommand, PasswordResetCommand,
@@ -145,6 +146,45 @@ pub struct SessionResponse {
     pub created_at: String,
     pub last_seen_at: String,
     pub is_current: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LivenessComponents {
+    pub app: ComponentState,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LivenessResponse {
+    pub status: String,
+    pub components: LivenessComponents,
+}
+
+pub async fn healthz() -> (StatusCode, Json<LivenessResponse>) {
+    (
+        StatusCode::OK,
+        Json(LivenessResponse {
+            status: "ok".to_string(),
+            components: LivenessComponents {
+                app: ComponentState {
+                    status: "ok".to_string(),
+                    detail: None,
+                },
+            },
+        }),
+    )
+}
+
+pub async fn readyz(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<crate::health::ReadinessPayload>) {
+    let report = state.readiness_checker.check().await;
+    let status = if report.is_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (status, Json(report.payload))
 }
 
 pub async fn register(
@@ -883,6 +923,7 @@ fn is_trusted_proxy(
 mod tests {
     use std::sync::Arc;
 
+    use async_trait::async_trait;
     use axum::{
         body::to_bytes,
         extract::{ConnectInfo, State},
@@ -923,6 +964,70 @@ mod tests {
         state: AppState,
         bootstrap_email: String,
         bootstrap_password: String,
+    }
+
+    struct FailingReadinessChecker;
+
+    #[async_trait]
+    impl crate::health::ReadinessChecker for FailingReadinessChecker {
+        async fn check(&self) -> crate::health::ReadinessReport {
+            crate::health::ReadinessReport {
+                is_ready: false,
+                payload: crate::health::ReadinessPayload {
+                    status: "error".to_string(),
+                    runtime: "postgres_redis".to_string(),
+                    components: crate::health::ReadinessComponents {
+                        app: crate::health::ComponentState {
+                            status: "ok".to_string(),
+                            detail: None,
+                        },
+                        database: crate::health::ComponentState {
+                            status: "error".to_string(),
+                            detail: Some("db ping failed: connection refused".to_string()),
+                        },
+                        redis: crate::health::ComponentState {
+                            status: "ok".to_string(),
+                            detail: None,
+                        },
+                    },
+                },
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn healthz_handler_always_returns_ok() {
+        let (status, body) = super::healthz().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0.status, "ok");
+        assert_eq!(body.0.components.app.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn readyz_handler_returns_ok_for_inmemory_runtime() {
+        let harness = build_harness();
+        let (status, body) = super::readyz(State(harness.state.clone())).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0.status, "ok");
+        assert_eq!(body.0.runtime, "inmemory");
+        assert_eq!(body.0.components.app.status, "ok");
+        assert_eq!(body.0.components.database.status, "not_configured");
+        assert_eq!(body.0.components.redis.status, "not_configured");
+    }
+
+    #[tokio::test]
+    async fn readyz_handler_returns_service_unavailable_on_dependency_failure() {
+        let mut harness = build_harness();
+        harness.state.readiness_checker = Arc::new(FailingReadinessChecker);
+
+        let (status, body) = super::readyz(State(harness.state.clone())).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0.status, "error");
+        assert_eq!(body.0.components.database.status, "error");
+        assert!(body.0.components.database.detail.is_some());
     }
 
     #[tokio::test]
@@ -2041,6 +2146,7 @@ mod tests {
                         .collect::<Vec<_>>(),
                 )
                 .expect("jwks document should be built"),
+                readiness_checker: crate::health::RuntimeReadinessChecker::inmemory(),
                 metrics_bearer_token: metrics_bearer_token.map(str::to_string),
                 metrics_allowed_cidrs: metrics_allowed_cidrs
                     .into_iter()
@@ -2137,6 +2243,11 @@ mod tests {
             Ok(service) => Arc::new(service),
             Err(_) => return None,
         };
+        let readiness_checker = crate::health::RuntimeReadinessChecker::postgres_redis(
+            adapters.pool.clone(),
+            None,
+            std::time::Duration::from_millis(500),
+        );
 
         Some(HandlerHarness {
             state: AppState {
@@ -2151,6 +2262,7 @@ mod tests {
                         .collect::<Vec<_>>(),
                 )
                 .expect("jwks document should be built"),
+                readiness_checker,
                 metrics_bearer_token: metrics_bearer_token.map(str::to_string),
                 metrics_allowed_cidrs: metrics_allowed_cidrs
                     .into_iter()

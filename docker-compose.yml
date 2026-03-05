@@ -1,0 +1,69 @@
+services:
+  auth-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: auth-api:local
+    restart: unless-stopped
+    env_file:
+      - compose.env.example
+    environment:
+      AUTH_RUNTIME: postgres_redis
+      DATABASE_URL: postgres://auth:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-noop}
+      EMAIL_DELIVERY_MODE: ${EMAIL_DELIVERY_MODE:-outbox}
+      ENFORCE_DATABASE_TLS: ${ENFORCE_DATABASE_TLS:-false}
+      ENFORCE_REDIS_TLS: ${ENFORCE_REDIS_TLS:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q ':1F90' /proc/net/tcp /proc/net/tcp6"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file:
+      - compose.env.example
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    env_file:
+      - compose.env.example
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD} ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:

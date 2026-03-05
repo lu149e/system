@@ -435,6 +435,12 @@ impl AppConfig {
     }
 }
 
+pub fn auth_runtime_from_env() -> Result<AuthRuntime> {
+    parse_auth_runtime(
+        std::env::var("AUTH_RUNTIME").unwrap_or_else(|_| "postgres_redis".to_string()),
+    )
+}
+
 fn parse_email_delivery_mode(value: String) -> Result<EmailDeliveryMode> {
     match value.trim().to_ascii_lowercase().as_str() {
         "inline" => Ok(EmailDeliveryMode::Inline),

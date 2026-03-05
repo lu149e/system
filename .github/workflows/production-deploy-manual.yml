@@ -1,0 +1,268 @@
+name: production-deploy-manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: "Production image digest (sha256:...)"
+        required: true
+        type: string
+      ingress_host:
+        description: "Production ingress host"
+        required: true
+        type: string
+      tls_secret_name:
+        description: "TLS secret name for production ingress"
+        required: true
+        type: string
+      postgres_cidr:
+        description: "PostgreSQL egress CIDR"
+        required: true
+        type: string
+      redis_cidr:
+        description: "Redis egress CIDR"
+        required: true
+        type: string
+      apply_changes:
+        description: "Apply rendered manifests to the cluster after dry-run"
+        required: true
+        default: false
+        type: boolean
+      namespace:
+        description: "Kubernetes namespace target"
+        required: true
+        default: auth
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  production-deploy:
+    runs-on: ubuntu-latest
+    env:
+      KUSTOMIZE_VERSION: "5.4.3"
+      KUBECONFORM_VERSION: "0.6.7"
+      KUBECTL_VERSION: "1.30.6"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned deployment tooling
+        run: |
+          set -euo pipefail
+
+          curl -sSL -o /tmp/kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          tar -xzf /tmp/kustomize.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/kustomize /usr/local/bin/kustomize
+
+          curl -sSL -o /tmp/kubeconform.tar.gz "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/kubeconform /usr/local/bin/kubeconform
+
+          curl -sSL -o /tmp/kubectl "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Verify installed deployment tooling
+        run: |
+          set -euo pipefail
+          kustomize version
+          kubeconform -v
+          kubectl version --client=true
+          cosign version
+
+      - name: Ensure deploy scripts are executable
+        run: chmod +x scripts/generate-production-overlay.sh scripts/generate-k8s-secret-manifest.sh scripts/validate-deploy-readiness.sh
+
+      - name: Generate production secret manifest
+        env:
+          DATABASE_URL: ${{ secrets.PROD_AUTH_DATABASE_URL }}
+          REDIS_URL: ${{ secrets.PROD_AUTH_REDIS_URL }}
+          REFRESH_TOKEN_PEPPER: ${{ secrets.PROD_AUTH_REFRESH_TOKEN_PEPPER }}
+          MFA_ENCRYPTION_KEY_BASE64: ${{ secrets.PROD_AUTH_MFA_ENCRYPTION_KEY_BASE64 }}
+          JWT_KEYSET: ${{ secrets.PROD_AUTH_JWT_KEYSET }}
+          JWT_PRIMARY_KID: ${{ secrets.PROD_AUTH_JWT_PRIMARY_KID }}
+          METRICS_BEARER_TOKEN: ${{ secrets.PROD_AUTH_METRICS_BEARER_TOKEN }}
+          SENDGRID_API_KEY: ${{ secrets.PROD_AUTH_SENDGRID_API_KEY }}
+          SENDGRID_FROM_EMAIL: ${{ secrets.PROD_AUTH_SENDGRID_FROM_EMAIL }}
+          VERIFY_EMAIL_URL_BASE: ${{ secrets.PROD_AUTH_VERIFY_EMAIL_URL_BASE }}
+          PASSWORD_RESET_URL_BASE: ${{ secrets.PROD_AUTH_PASSWORD_RESET_URL_BASE }}
+        run: ./scripts/generate-k8s-secret-manifest.sh
+
+      - name: Verify release signature (Cosign keyless)
+        env:
+          IMAGE_DIGEST: ${{ github.event.inputs.image_digest }}
+          CERT_IDENTITY_REGEXP: "^https://github.com/${{ github.repository }}/.github/workflows/release-image.yml@refs/(heads/main|tags/.+)$"
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/production-deploy
+          cosign verify "ghcr.io/lu149e/system@${IMAGE_DIGEST}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp "${CERT_IDENTITY_REGEXP}" \
+            >"artifacts/production-deploy/cosign-verify.log"
+
+      - name: Generate production overlay
+        env:
+          IMAGE_DIGEST: ${{ github.event.inputs.image_digest }}
+          INGRESS_HOST: ${{ github.event.inputs.ingress_host }}
+          TLS_SECRET_NAME: ${{ github.event.inputs.tls_secret_name }}
+          POSTGRES_CIDR: ${{ github.event.inputs.postgres_cidr }}
+          REDIS_CIDR: ${{ github.event.inputs.redis_cidr }}
+        run: ./scripts/generate-production-overlay.sh
+
+      - name: Run deploy readiness validation (strict)
+        env:
+          STRICT_DEPLOY_VALIDATION: "true"
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/deploy-readiness
+          ./scripts/validate-deploy-readiness.sh 2>&1 | tee artifacts/deploy-readiness/validation.log
+
+      - name: Render production manifests
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/production-deploy
+          kustomize build artifacts/production-overlay/generated \
+            > artifacts/production-deploy/production-manifests.yaml
+          printf '\n---\n' >> artifacts/production-deploy/production-manifests.yaml
+          cat artifacts/production-secrets/auth-api-secrets.yaml >> artifacts/production-deploy/production-manifests.yaml
+
+      - name: Validate rendered manifests with kubeconform (strict)
+        run: |
+          set -euo pipefail
+          kubeconform -strict -summary artifacts/production-deploy/production-manifests.yaml \
+            > artifacts/production-deploy/kubeconform.log
+
+      - name: Resolve deployment mode
+        id: mode
+        env:
+          APPLY_CHANGES: ${{ github.event.inputs.apply_changes }}
+          NAMESPACE: ${{ github.event.inputs.namespace }}
+        run: |
+          set -euo pipefail
+          mode="dry-run"
+          if [ "${APPLY_CHANGES}" = "true" ]; then
+            mode="apply"
+          fi
+          echo "mode=${mode}" >> "${GITHUB_OUTPUT}"
+          echo "namespace=${NAMESPACE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate kube credential policy
+        env:
+          APPLY_CHANGES: ${{ github.event.inputs.apply_changes }}
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          set -euo pipefail
+
+          if [ "${APPLY_CHANGES}" = "true" ] && [ -z "${KUBE_CONFIG_B64}" ]; then
+            echo "apply_changes=true requires KUBE_CONFIG_B64 secret. Refusing to continue." >&2
+            exit 1
+          fi
+
+          if [ -z "${KUBE_CONFIG_B64}" ]; then
+            echo "KUBE_CONFIG_B64 secret is required for kubectl --dry-run=server validation." >&2
+            exit 1
+          fi
+
+      - name: Configure kube auth from KUBE_CONFIG_B64
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/.kube" artifacts/production-deploy
+          printf '%s' "${KUBE_CONFIG_B64}" | base64 --decode > "${HOME}/.kube/config"
+          chmod 600 "${HOME}/.kube/config"
+          kubectl config current-context > artifacts/production-deploy/kube-context.log
+
+      - name: Server-side dry-run apply (always)
+        env:
+          NAMESPACE: ${{ github.event.inputs.namespace }}
+        run: |
+          set -euo pipefail
+          kubectl apply --dry-run=server -n "${NAMESPACE}" -f artifacts/production-deploy/production-manifests.yaml \
+            2>&1 | tee artifacts/production-deploy/kubectl-dry-run.log
+
+      - name: Apply manifests to production cluster
+        if: ${{ github.event.inputs.apply_changes == 'true' }}
+        env:
+          NAMESPACE: ${{ github.event.inputs.namespace }}
+        run: |
+          set -euo pipefail
+          kubectl apply -n "${NAMESPACE}" -f artifacts/production-deploy/production-manifests.yaml \
+            2>&1 | tee artifacts/production-deploy/kubectl-apply.log
+
+      - name: Smoke checks after apply
+        if: ${{ github.event.inputs.apply_changes == 'true' }}
+        env:
+          NAMESPACE: ${{ github.event.inputs.namespace }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/production-deploy
+
+          kubectl rollout status deployment/auth-api -n "${NAMESPACE}" --timeout=5m \
+            2>&1 | tee artifacts/production-deploy/smoke-rollout.log
+
+          kubectl get endpoints auth-api -n "${NAMESPACE}" -o wide \
+            2>&1 | tee artifacts/production-deploy/smoke-endpoints.log
+
+          endpoint_ips="$(kubectl get endpoints auth-api -n "${NAMESPACE}" -o jsonpath='{range .subsets[*].addresses[*]}{.ip}{" "}{end}')"
+          if [ -z "${endpoint_ips}" ]; then
+            echo "Service auth-api has no ready endpoint addresses." >&2
+            exit 1
+          fi
+
+          kubectl port-forward -n "${NAMESPACE}" svc/auth-api 18080:80 \
+            > artifacts/production-deploy/smoke-port-forward.log 2>&1 &
+          pf_pid=$!
+
+          cleanup() {
+            kill "${pf_pid}" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:18080/healthz" > artifacts/production-deploy/smoke-healthz.log; then
+              break
+            fi
+            sleep 1
+          done
+
+          curl -fsS "http://127.0.0.1:18080/readyz" > artifacts/production-deploy/smoke-readyz.log
+
+      - name: Publish deployment mode summary
+        if: always()
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+          NAMESPACE: ${{ steps.mode.outputs.namespace }}
+          APPLY_CHANGES: ${{ github.event.inputs.apply_changes }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Production deploy manual result"
+            echo ""
+            echo "- Mode: ${MODE}"
+            echo "- Namespace: ${NAMESPACE}"
+            echo "- apply_changes input: ${APPLY_CHANGES}"
+            echo "- Job status: ${JOB_STATUS}"
+            if [ "${MODE}" = "dry-run" ]; then
+              echo "- Cluster mutation: no (dry-run only)"
+            else
+              echo "- Cluster mutation: attempted (see kubectl-apply.log)"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload deployment artifacts and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-deploy-manual-${{ github.run_id }}
+          path: |
+            artifacts/production-deploy
+            artifacts/deploy-readiness
+            artifacts/production-overlay/generated
+            artifacts/production-secrets
+          if-no-files-found: warn

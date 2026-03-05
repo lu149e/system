@@ -49,6 +49,8 @@ Base tecnica para API de autenticacion en Rust con Axum/Tokio, arquitectura hexa
 - `GET /v1/auth/me`
 - `GET /.well-known/jwks.json` (publicacion de clave publica para validacion JWT)
 - `GET /metrics` (operativo, formato Prometheus)
+- `GET /healthz` (liveness)
+- `GET /readyz` (readiness; valida dependencias segun runtime)
 
 Notas de contrato:
 
@@ -57,6 +59,7 @@ Notas de contrato:
 ## Variables de entorno
 
 - `APP_ADDR` (opcional, default `0.0.0.0:8080`)
+- `AUTH_RUN_MODE` (opcional, default `server`; valores: `server`, `migrate`)
 - `AUTH_RUNTIME` (opcional, default `postgres_redis`; valores: `postgres_redis`, `inmemory`)
 - `ALLOW_INSECURE_INMEMORY` (opcional, default `false`; requerido en `true` para habilitar runtime in-memory)
 - `METRICS_BEARER_TOKEN` (opcional; si se define, `GET /metrics` exige `Authorization: Bearer <token>`)
@@ -268,6 +271,14 @@ EMAIL_OUTBOX_BACKOFF_MAX_MS=60000
 - Cuando `AUTH_RUNTIME=postgres_redis`, el servicio ejecuta migraciones SQL al arrancar (`sqlx::migrate!`) y falla en startup si hay incompatibilidades.
 - `0003_guard_credentials_coverage.sql` bloquea el arranque si detecta usuarios sin fila en `credentials` para evitar huecos silenciosos de autenticacion.
 
+## Modo de ejecucion para migraciones
+
+- Comando canonico en contenedor: `/app/auth migrate`.
+- Alternativa equivalente: `AUTH_RUN_MODE=migrate /app/auth`.
+- Contrato por runtime:
+  - `AUTH_RUNTIME=postgres_redis`: ejecuta migraciones SQL y termina con exit code `0` en exito.
+  - `AUTH_RUNTIME=inmemory`: falla rapido con error explicito porque no hay migraciones aplicables.
+
 ## Pruebas locales con Postgres
 
 - Helper local: `scripts/test-postgres-local.sh`.
@@ -313,6 +324,7 @@ EMAIL_OUTBOX_BACKOFF_MAX_MS=60000
 - Ejemplo de enrutamiento Alertmanager: `docs/alertmanager/auth-routing-example.yaml`.
 - Ejemplo de configuracion Prometheus (scrape + rules): `docs/prometheus/prometheus-auth-example.yaml`.
 - Validacion local de artefactos de observabilidad: `scripts/validate-observability-artifacts.sh`.
+- Validacion local de manifiestos Kubernetes (placeholders, sintaxis YAML, render Kustomize y schema): `scripts/validate-k8s-manifests.sh`.
 - Tooling operativo para dead-letter de outbox (inspect/requeue/report): `scripts/outbox-dead-letter-tool.sh`.
 - Atajo para reporte de dead-letter por provider/template/edad: `scripts/outbox-dead-letter-report.sh`.
 - Smoke test reproducible de tooling operativo (DB temporal + migraciones + checkpoints): `scripts/test-ops-tooling-smoke.sh`.
@@ -320,6 +332,11 @@ EMAIL_OUTBOX_BACKOFF_MAX_MS=60000
 - Tooling de rollout para compliance de `outbox_replay_audit` (inspect/remediate/validate/status): `scripts/outbox-replay-audit-compliance-tool.sh`.
 - Workflow manual para gate/auditoria de compliance: `.github/workflows/replay-audit-compliance-manual.yml`.
 - Workflow manual para smoke test de tooling operativo: `.github/workflows/ops-tooling-smoke-manual.yml`.
+- Workflow manual para validacion de manifiestos K8s: `.github/workflows/k8s-manifest-validation-manual.yml`.
+- Workflow manual para validacion de deploy readiness: `.github/workflows/deploy-readiness-validation-manual.yml`.
+- Workflow manual de promocion productiva (firma + readiness + render + schema): `.github/workflows/production-promotion-manual.yml`.
+- Workflow manual de deploy controlado a produccion (dry-run por defecto + apply opcional): `.github/workflows/production-deploy-manual.yml`.
+- Los workflows manuales `k8s-manifest-validation-manual` y `deploy-readiness-validation-manual` instalan versiones pineadas de `kustomize` y `kubeconform`, por lo que `strict_validation=true` queda soportado end-to-end en runners de GitHub Actions.
 - Snippets SQL parametrizados para el rollout de compliance: `scripts/sql/outbox-replay-audit-compliance-queries.sql`.
 - Snippets SQL DBA para verificar guardas append-only y smoke tests de rechazo: `scripts/sql/outbox-replay-audit-append-only-queries.sql`.
 - El comando `requeue` registra auditoria persistente en `outbox_replay_audit` tanto en dry-run como en apply (incluye actor, ticket, filtros, scope y conteos).
@@ -331,6 +348,80 @@ EMAIL_OUTBOX_BACKOFF_MAX_MS=60000
 - Break-glass explicito: solo se permite mutar en una transaccion de mantenimiento si se setean `SET LOCAL auth.outbox_replay_audit_maintenance_override=on`, `SET LOCAL auth.outbox_replay_audit_maintenance_actor=...` y `SET LOCAL auth.outbox_replay_audit_maintenance_ticket=...`.
 - El comando `audit` permite revisar ejecuciones recientes de replay (filtrable por `--provider`/`--template`/`--ticket`).
 - Soporte de indices para queries de observabilidad: `migrations/0008_add_audit_observability_indexes.sql`.
+
+## Deployment artifacts
+
+- Imagen multi-stage para runtime productivo: `Dockerfile`.
+- Exclusion de contexto para build reproducible: `.dockerignore`.
+- Integracion local app + postgres + redis: `docker-compose.yml` + `compose.env.example`.
+- Baseline Kubernetes canonico (namespace/config/deploy/service/ingress/migration-job/HPA): `deploy/k8s/`.
+- Default baseline image for deployability: `ghcr.io/lu149e/system:main` in `deploy/k8s/deployment.yaml` and `deploy/k8s/migration-job.yaml` (override with release tag, ideally immutable digest).
+- Baseline ingress is hostless (`deploy/k8s/ingress.yaml`); set host/TLS in your environment overlay.
+- Baseline network policy uses selector-based egress for in-cluster `postgres`/`redis` plus DNS; for external endpoints, add overlay egress rules instead of loosening baseline.
+- Gate de validacion de manifiestos K8s para pre-deploy/manual CI: `scripts/validate-k8s-manifests.sh`.
+- Checklist de despliegue productivo (pre, migrate, smoke, rollback, observabilidad): `docs/deployment-production-checklist.md`.
+
+### Publicar imagen OCI en GHCR (manual o por tag)
+
+- Workflow: `.github/workflows/release-image.yml`.
+- Triggers soportados:
+  - Manual (`workflow_dispatch`) con input opcional `tag` (ejemplo `v1.4.0`).
+  - Push de tags Git que cumplan `v*`.
+- Autenticacion: usa `GITHUB_TOKEN` nativo de GitHub Actions (`packages:write`), sin PAT hardcodeado.
+- Tags publicados por ejecucion: `main`, `sha-<commit>`, `refs/tags/<tag>` (si corre por tag push) y `tag` manual si se informa en dispatch.
+- Evidencia generada:
+  - Artifact `image-release-<run_id>` con `image.txt`, `digest.txt`, `tags.txt`, `reference.txt`.
+  - Artifact `image-sbom-<run_id>` con SBOM SPDX JSON del digest publicado.
+  - Firma keyless Cosign del digest usando OIDC de GitHub Actions (certificado emitido por Fulcio).
+
+Pasos recomendados:
+
+1. Ejecutar release manual desde UI (`Actions -> release-image -> Run workflow`) o por CLI:
+   - `gh workflow run release-image.yml -f tag=v1.4.0`
+2. Descargar artifact `image-release-<run_id>` y tomar el digest (`digest.txt`).
+3. Verificar firma Cosign del digest (recomendado antes de promover):
+   - `export OWNER="<org-or-user>"`
+   - `export REPO="<repo>"`
+   - `export DIGEST="sha256:<digest>"`
+   - `cosign verify ghcr.io/lu149e/system@${DIGEST} --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity "https://github.com/${OWNER}/${REPO}/.github/workflows/release-image.yml@refs/heads/main"`
+   - Para releases por tag, usar la identidad del ref de tag (`...@refs/tags/<tag>`).
+4. Descargar artifact `image-sbom-<run_id>` para evidencia de composicion (archivo `sbom.spdx.json`).
+5. Parchear manifiestos de baseline a digest inmutable:
+   - `sed -i 's|ghcr.io/lu149e/system:[^[:space:]]*|ghcr.io/lu149e/system@sha256:TU_DIGEST|g' deploy/k8s/deployment.yaml deploy/k8s/migration-job.yaml`
+6. Validar render y aplicar con tu pipeline de despliegue.
+
+### Workflow manual: promotion artifact para produccion (sin apply)
+
+- Ejecutar: `Actions -> production-promotion-manual -> Run workflow`.
+- Inputs obligatorios: `image_digest`, `ingress_host`, `tls_secret_name`, `postgres_cidr`, `redis_cidr`.
+- Gate de firma: valida keyless Cosign para `ghcr.io/lu149e/system@<digest>` con issuer `https://token.actions.githubusercontent.com` e identidad del workflow `release-image.yml` en `refs/heads/main` o `refs/tags/*`.
+- Gate de readiness: ejecuta `scripts/generate-production-overlay.sh` y luego `scripts/validate-deploy-readiness.sh` en modo estricto (`STRICT_DEPLOY_VALIDATION=true`).
+- Gate de manifiestos: renderiza `kustomize build artifacts/production-overlay/generated` y corre `kubeconform -strict` sobre el YAML renderizado.
+- Artifacts publicados siempre:
+  - `production-manifest-<run_id>` con `artifacts/production-promotion/production-manifests.yaml`.
+  - `production-promotion-evidence-<run_id>` con logs/evidencia (`artifacts/production-promotion/`, `artifacts/deploy-readiness/` y overlay generado).
+- Alcance intencional: este workflow NO aplica al cluster ni requiere credenciales de Kubernetes.
+
+### Workflow manual: controlled deploy a produccion (dry-run default, apply opcional)
+
+- Ejecutar: `Actions -> production-deploy-manual -> Run workflow`.
+- Inputs obligatorios: `image_digest`, `ingress_host`, `tls_secret_name`, `postgres_cidr`, `redis_cidr`.
+- Inputs operativos:
+  - `apply_changes` (boolean, default `false`): en `false` ejecuta solo dry-run server-side; en `true` aplica manifiestos al cluster.
+  - `namespace` (default `auth`): namespace destino para dry-run/apply/smoke.
+- Secret requerido: `KUBE_CONFIG_B64` (kubeconfig en base64 para autenticar `kubectl` en el cluster objetivo).
+- Secuencia del workflow:
+  - Instala tooling pineado (`kustomize`, `kubeconform`, `kubectl`, `cosign`).
+  - Verifica firma keyless Cosign del digest.
+  - Genera overlay productivo + ejecuta `validate-deploy-readiness` en modo estricto.
+  - Renderiza manifiestos y valida schema con `kubeconform -strict`.
+  - Configura kube auth desde `KUBE_CONFIG_B64`.
+  - Ejecuta siempre `kubectl apply --dry-run=server` sobre el manifiesto renderizado.
+  - Solo si `apply_changes=true`, ejecuta `kubectl apply` real y smoke checks (`rollout status`, endpoints, `GET /healthz`, `GET /readyz` via port-forward).
+- Controles de seguridad:
+  - Si `apply_changes=true` y falta `KUBE_CONFIG_B64`, falla rapido antes de cualquier intento de apply.
+  - Summary final explicita modo (`dry-run` vs `apply`) y estado del job.
+  - Publica artifacts/logs siempre: `production-deploy-manual-<run_id>`.
 
 ### Smoke test rapido: tooling replay-audit/dead-letter
 

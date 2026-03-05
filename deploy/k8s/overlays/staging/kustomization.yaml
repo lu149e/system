@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../
+patches:
+  - path: ingress-staging.patch.yaml
+images:
+  - name: ghcr.io/lu149e/system
+    newName: ghcr.io/lu149e/system
+    newTag: main

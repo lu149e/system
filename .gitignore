@@ -1,3 +1,5 @@
 target/
 .cargo/
-*.lock
+__pycache__/
+artifacts/
+.env

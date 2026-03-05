@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auth-api
+  namespace: auth
+spec:
+  rules:
+    - host: __PRODUCTION_INGRESS_HOST__
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-api
+                port:
+                  name: http
+  tls:
+    - hosts:
+        - __PRODUCTION_INGRESS_HOST__
+      secretName: __PRODUCTION_TLS_SECRET_NAME__

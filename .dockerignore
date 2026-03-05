@@ -1,0 +1,31 @@
+# VCS and local config
+.git
+.gitignore
+.github
+
+# Build outputs
+target
+
+# Local runtime/env files
+.env
+.env.*
+*.local
+
+# Editors and OS artifacts
+.idea
+.vscode
+*.swp
+*.swo
+.DS_Store
+
+# Docs and ops artifacts not required for image build
+docs
+k8s
+deploy
+scripts
+artifacts
+
+# CI and misc
+Makefile
+PRD.md
+README.md

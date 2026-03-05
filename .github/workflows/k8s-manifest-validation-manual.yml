@@ -1,0 +1,71 @@
+name: k8s-manifest-validation-manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      strict_validation:
+        description: "Fail when optional tooling is unavailable"
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  k8s-manifest-validation:
+    runs-on: ubuntu-latest
+    env:
+      KUSTOMIZE_VERSION: "5.4.3"
+      KUBECONFORM_VERSION: "0.6.7"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned validation tooling
+        run: |
+          set -euo pipefail
+
+          curl -sSL -o /tmp/kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          tar -xzf /tmp/kustomize.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/kustomize /usr/local/bin/kustomize
+
+          curl -sSL -o /tmp/kubeconform.tar.gz "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/kubeconform /usr/local/bin/kubeconform
+
+      - name: Verify installed validation tooling
+        run: |
+          set -euo pipefail
+          kustomize version
+          kubeconform -v
+
+      - name: Ensure validation script is executable
+        run: chmod +x scripts/validate-k8s-manifests.sh
+
+      - name: Run Kubernetes manifest validation
+        id: validate
+        env:
+          STRICT_K8S_VALIDATION: ${{ github.event.inputs.strict_validation }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifacts/k8s-manifest-validation
+          log_file="artifacts/k8s-manifest-validation/validation.log"
+
+          set +e
+          ./scripts/validate-k8s-manifests.sh 2>&1 | tee "${log_file}"
+          exit_code=${PIPESTATUS[0]}
+          set -e
+
+          echo "validation_exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload Kubernetes manifest validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-manifest-validation-${{ github.run_id }}
+          path: artifacts/k8s-manifest-validation
+
+      - name: Enforce validation result
+        if: ${{ steps.validate.outputs.validation_exit_code != '0' }}
+        run: |
+          echo "Kubernetes manifest validation failed. Check uploaded artifact logs." >&2
+          exit 1
