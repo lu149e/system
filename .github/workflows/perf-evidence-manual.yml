@@ -1,0 +1,39 @@
+name: perf-evidence-manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Execution mode"
+        required: true
+        default: "load"
+        type: choice
+        options:
+          - load
+          - soak
+          - both
+
+jobs:
+  perf-evidence:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup k6
+        uses: grafana/setup-k6-action@v1
+
+      - name: Run auth load/soak evidence
+        env:
+          AUTH_BASE_URL: ${{ secrets.AUTH_PERF_BASE_URL }}
+          AUTH_PERF_EMAIL: ${{ secrets.AUTH_PERF_EMAIL }}
+          AUTH_PERF_PASSWORD: ${{ secrets.AUTH_PERF_PASSWORD }}
+          AUTH_PERF_OUT_DIR: artifacts/perf
+        run: scripts/perf/run-auth-load-soak.sh "${{ github.event.inputs.mode }}"
+
+      - name: Upload perf evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-perf-evidence-${{ github.run_id }}
+          path: artifacts/perf

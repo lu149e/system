@@ -1,0 +1,774 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(auth_refresh_requests_total[5m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Refresh Request Rate by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(auth_refresh_rejected_total[5m]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Refresh Rejected Rate by Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 4,
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(auth_refresh_requests_total{outcome=\"error\"}[10m])) / clamp_min(sum(rate(auth_refresh_requests_total[10m])), 0.0001)",
+          "legendFormat": "error_ratio_10m",
+          "refId": "A"
+        }
+      ],
+      "title": "Refresh Error Ratio (10m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, outcome) (rate(auth_refresh_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 {{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Refresh Latency P95 by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(auth_problem_responses_total{status=\"429\",type=\"https://example.com/problems/login-locked\"}[5m]))",
+          "legendFormat": "login_locked_429_rate",
+          "refId": "A"
+        }
+      ],
+      "title": "Login Locked (429) Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 6,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(auth_refresh_rejected_total{reason=\"refresh_reuse_detected\"}[15m]))",
+          "legendFormat": "reuse_detected_last_15m",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(auth_refresh_rejected_total{reason=\"internal\"}[15m]))",
+          "legendFormat": "internal_rejected_last_15m",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(increase(auth_problem_responses_total{status=\"429\",type=\"https://example.com/problems/login-locked\"}[15m]))",
+          "legendFormat": "login_locked_429_last_15m",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(increase(auth_problem_responses_total{status=\"403\",type=\"https://example.com/problems/metrics-access-denied\"}[15m]))",
+          "legendFormat": "metrics_access_denied_last_15m",
+          "refId": "D"
+        },
+        {
+          "expr": "sum(increase(auth_problem_responses_total{status=\"401\",type=\"https://example.com/problems/metrics-auth-required\"}[15m]))",
+          "legendFormat": "metrics_auth_required_last_15m",
+          "refId": "E"
+        },
+        {
+          "expr": "sum(increase(auth_email_delivery_total{provider!=\"noop\",outcome=\"failure\"}[15m]))",
+          "legendFormat": "email_failures_last_15m",
+          "refId": "F"
+        },
+        {
+          "expr": "sum(increase(auth_email_retry_attempts_total{provider!=\"noop\"}[15m]))",
+          "legendFormat": "email_retries_last_15m",
+          "refId": "G"
+        },
+        {
+          "expr": "sum(increase(auth_email_outbox_claim_failures_total[15m]))",
+          "legendFormat": "outbox_claim_failures_last_15m",
+          "refId": "H"
+        }
+      ],
+      "title": "Current 15m Snapshot",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(auth_problem_responses_total{status=\"403\",type=\"https://example.com/problems/metrics-access-denied\"}[5m]))",
+          "legendFormat": "metrics_access_denied_403_rate",
+          "refId": "A"
+        }
+      ],
+      "title": "Metrics Access Denied (403) Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(auth_problem_responses_total{status=\"401\",type=\"https://example.com/problems/metrics-auth-required\"}[5m]))",
+          "legendFormat": "metrics_auth_required_401_rate",
+          "refId": "A"
+        }
+      ],
+      "title": "Metrics Auth Required (401) Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (provider, outcome) (rate(auth_email_delivery_total{provider!=\"noop\"}[5m]))",
+          "legendFormat": "{{provider}} {{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Email Delivery Rate by Provider/Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (le) (rate(auth_email_retry_attempts_bucket{provider!=\"noop\"}[10m]))",
+          "legendFormat": "<= {{le}} retries",
+          "refId": "A"
+        }
+      ],
+      "title": "Email Retry Distribution (10m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, provider, outcome) (rate(auth_email_retry_attempts_bucket{provider!=\"noop\"}[10m])))",
+          "legendFormat": "retry_p95 {{provider}} {{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Email Retry Intensity P95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, provider, outcome) (rate(auth_email_delivery_duration_seconds_bucket{provider!=\"noop\"}[10m])))",
+          "legendFormat": "latency_p95 {{provider}} {{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Email Delivery Latency P95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "id": 13,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "max(auth_email_outbox_queue_depth)",
+          "legendFormat": "outbox_queue_depth",
+          "refId": "A"
+        }
+      ],
+      "title": "Email Outbox Queue Depth",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "id": 14,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(auth_email_outbox_dispatch_total{outcome=\"sent\"}[5m]))",
+          "legendFormat": "sent_rate",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(auth_email_outbox_dispatch_total{outcome=\"failed_retryable\"}[5m]))",
+          "legendFormat": "failed_retryable_rate",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(auth_email_outbox_dispatch_total{outcome=\"failed_exhausted\"}[5m]))",
+          "legendFormat": "failed_exhausted_rate",
+          "refId": "C"
+        }
+      ],
+      "title": "Email Outbox Dispatch Rates",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 4,
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 56
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(auth_email_outbox_dispatch_total{outcome=~\"failed_retryable|failed_exhausted\"}[10m])) / clamp_min(sum(rate(auth_email_outbox_dispatch_total[10m])), 0.0001)",
+          "legendFormat": "outbox_failure_ratio_10m",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(auth_email_retry_attempts_total{provider!=\"noop\"}[10m])) / clamp_min(sum(rate(auth_email_delivery_total{provider!=\"noop\"}[10m])), 0.0001)",
+          "legendFormat": "email_retry_pressure_10m",
+          "refId": "B"
+        }
+      ],
+      "title": "Outbox Failure Ratio and Retry Pressure",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 64
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "max(auth_email_outbox_oldest_due_age_seconds)",
+          "legendFormat": "oldest_due_age_seconds",
+          "refId": "A"
+        },
+        {
+          "expr": "max(auth_email_outbox_oldest_pending_age_seconds)",
+          "legendFormat": "oldest_pending_age_seconds",
+          "refId": "B"
+        }
+      ],
+      "title": "Email Outbox Oldest Due vs Pending Age",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 64
+      },
+      "id": 17,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(auth_email_outbox_claimed_per_poll_sum[5m]) / clamp_min(rate(auth_email_outbox_claimed_per_poll_count[5m]), 0.0001)",
+          "legendFormat": "avg_claimed_per_poll_5m",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(auth_email_outbox_reclaimed_after_expiry_total[15m]))",
+          "legendFormat": "reclaimed_after_expiry_last_15m",
+          "refId": "B"
+        }
+      ],
+      "title": "Email Outbox Claim and Lease Churn",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 72
+      },
+      "id": 18,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(auth_email_outbox_claim_failures_total[10m]))",
+          "legendFormat": "claim_failures_last_10m",
+          "refId": "A"
+        }
+      ],
+      "title": "Email Outbox Claim Failures (10m)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [
+    "auth",
+    "refresh",
+    "security",
+    "prometheus"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Auth Refresh Runtime Metrics",
+  "uid": "auth-refresh-runtime-metrics",
+  "version": 6,
+  "weekStart": ""
+}

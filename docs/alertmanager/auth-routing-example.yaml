@@ -1,0 +1,53 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: default-notifications
+  group_by: [alertname, area, severity]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - area="auth"
+        - severity="critical"
+      receiver: auth-critical-pager
+      continue: false
+    - matchers:
+        - area="auth"
+        - severity="warning"
+      receiver: auth-warning-slack
+      continue: false
+
+receivers:
+  - name: default-notifications
+    # Placeholder: define your org-wide notification policy
+    webhook_configs:
+      - url: http://alert-relay.default.svc.cluster.local/default
+
+  - name: auth-critical-pager
+    # Placeholder integrations for critical auth incidents
+    pagerduty_configs:
+      - routing_key: "REPLACE_WITH_PAGERDUTY_ROUTING_KEY"
+        severity: "critical"
+        description: "[AUTH][CRITICAL] {{ .CommonAnnotations.summary }}"
+
+  - name: auth-warning-slack
+    # Placeholder integrations for warning-level auth events
+    slack_configs:
+      - api_url: "REPLACE_WITH_SLACK_WEBHOOK"
+        channel: "#auth-alerts"
+        title: "[AUTH][WARNING] {{ .CommonAnnotations.summary }}"
+        text: |
+          {{ .CommonAnnotations.description }}
+          Runbook: {{ .CommonAnnotations.runbook }}
+          Dashboard: {{ .CommonAnnotations.dashboard }}
+
+inhibit_rules:
+  - source_matchers:
+      - area="auth"
+      - severity="critical"
+    target_matchers:
+      - area="auth"
+      - severity="warning"
+    equal: [alertname]

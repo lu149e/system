@@ -1,0 +1,120 @@
+name: replay-audit-compliance-manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      database_url:
+        description: "Optional PostgreSQL URL override (prefer secret)"
+        required: false
+        type: string
+      strict_gate:
+        description: "Fail run when release_ready=false"
+        required: true
+        default: true
+        type: boolean
+      recent_window_days:
+        description: "Window in days for recent apply count"
+        required: false
+        default: "7"
+        type: string
+      maintenance_role:
+        description: "Optional maintenance role override for drift checks"
+        required: false
+        type: string
+      app_role:
+        description: "Optional app runtime role that must NOT be maintenance member"
+        required: false
+        type: string
+      operator_roles:
+        description: "Optional CSV of operator roles that MUST be maintenance members"
+        required: false
+        type: string
+
+jobs:
+  replay-audit-compliance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Run replay-audit compliance status
+        id: compliance
+        env:
+          DATABASE_URL_FROM_INPUT: ${{ github.event.inputs.database_url }}
+          DATABASE_URL_FROM_SECRET: ${{ secrets.OUTBOX_REPLAY_AUDIT_DATABASE_URL }}
+          STRICT_GATE: ${{ github.event.inputs.strict_gate }}
+          RECENT_WINDOW_DAYS: ${{ github.event.inputs.recent_window_days }}
+          MAINTENANCE_ROLE: ${{ github.event.inputs.maintenance_role }}
+          APP_ROLE: ${{ github.event.inputs.app_role }}
+          OPERATOR_ROLES: ${{ github.event.inputs.operator_roles }}
+        run: |
+          set -euo pipefail
+
+          db_url="${DATABASE_URL_FROM_INPUT:-}"
+          if [[ -z "$db_url" ]]; then
+            db_url="${DATABASE_URL_FROM_SECRET:-}"
+          fi
+
+          if [[ -z "$db_url" ]]; then
+            echo "ERROR: Provide workflow_dispatch input 'database_url' or secret 'OUTBOX_REPLAY_AUDIT_DATABASE_URL'." >&2
+            exit 1
+          fi
+
+          status_args=(status --format json --recent-window-days "${RECENT_WINDOW_DAYS}")
+          if [[ "${STRICT_GATE}" == "true" ]]; then
+            status_args+=(--require-release-ready)
+          fi
+
+          if [[ -n "${APP_ROLE}" ]]; then
+            status_args+=(--app-role "${APP_ROLE}")
+          fi
+
+          if [[ -n "${OPERATOR_ROLES}" ]]; then
+            status_args+=(--operator-role "${OPERATOR_ROLES}")
+          fi
+
+          pgoptions_value="${PGOPTIONS:-}"
+          if [[ -n "${MAINTENANCE_ROLE}" ]]; then
+            if [[ -n "${pgoptions_value}" ]]; then
+              pgoptions_value+=" "
+            fi
+            pgoptions_value+="-c auth.outbox_replay_audit_maintenance_role=${MAINTENANCE_ROLE}"
+          fi
+
+          mkdir -p artifacts/replay-audit-compliance
+          json_out="artifacts/replay-audit-compliance/status.json"
+          log_out="artifacts/replay-audit-compliance/status.log"
+
+          set +e
+          if [[ -n "${pgoptions_value}" ]]; then
+            PGOPTIONS="${pgoptions_value}" DATABASE_URL="$db_url" scripts/outbox-replay-audit-compliance-tool.sh "${status_args[@]}" >"${json_out}" 2>"${log_out}"
+          else
+            DATABASE_URL="$db_url" scripts/outbox-replay-audit-compliance-tool.sh "${status_args[@]}" >"${json_out}" 2>"${log_out}"
+          fi
+          exit_code=$?
+          set -e
+
+          cat "${json_out}"
+          if [[ -s "${log_out}" ]]; then
+            cat "${log_out}"
+          fi
+
+          echo "status_exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
+          echo "status_json_path=${json_out}" >> "${GITHUB_OUTPUT}"
+          echo "status_log_path=${log_out}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload replay-audit compliance artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-audit-compliance-${{ github.run_id }}
+          path: artifacts/replay-audit-compliance
+
+      - name: Enforce strict gate result
+        if: ${{ github.event.inputs.strict_gate == 'true' && steps.compliance.outputs.status_exit_code != '0' }}
+        run: |
+          echo "Replay-audit compliance strict gate failed (release_ready=false or status error)." >&2
+          exit 1

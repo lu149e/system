@@ -1,0 +1,1554 @@
+use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use uuid::Uuid;
+
+use crate::{
+    adapters::outbox::PostgresEmailOutboxRepository,
+    config::AppConfig,
+    modules::{
+        audit::{domain::AuditEvent, ports::AuditRepository},
+        auth::{
+            domain::{
+                MfaChallengeRecord, MfaFactorRecord, PasswordResetTokenRecord, User, UserStatus,
+                VerificationTokenRecord,
+            },
+            ports::{
+                MfaBackupCodeConsumeState, MfaBackupCodeRepository, MfaChallengeFailureState,
+                MfaChallengeLookupState, MfaChallengeRepository, MfaFactorRepository,
+                PasswordResetTokenConsumeState, PasswordResetTokenRepository, UserRepository,
+                VerificationTokenConsumeState, VerificationTokenRepository,
+            },
+        },
+        sessions::{
+            domain::{Session, SessionStatus},
+            ports::SessionRepository,
+        },
+        tokens::{
+            domain::RefreshTokenRecord,
+            ports::{RefreshRotationState, RefreshTokenRepository},
+        },
+    },
+};
+
+#[derive(Clone)]
+pub struct PostgresAdapters {
+    pub users: PostgresUserRepository,
+    pub verification_tokens: PostgresVerificationTokenRepository,
+    pub password_reset_tokens: PostgresPasswordResetTokenRepository,
+    pub mfa_factors: PostgresMfaFactorRepository,
+    pub mfa_challenges: PostgresMfaChallengeRepository,
+    pub mfa_backup_codes: PostgresMfaBackupCodeRepository,
+    pub sessions: PostgresSessionRepository,
+    pub refresh_tokens: PostgresRefreshTokenRepository,
+    pub audit: PostgresAuditRepository,
+    pub email_outbox: PostgresEmailOutboxRepository,
+}
+
+impl PostgresAdapters {
+    pub async fn bootstrap(cfg: &AppConfig) -> anyhow::Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(cfg.database_max_connections)
+            .connect(&cfg.database_url)
+            .await?;
+
+        run_migrations(&pool).await?;
+
+        let users = PostgresUserRepository { pool: pool.clone() };
+        users.ensure_bootstrap_user(cfg).await?;
+
+        Ok(Self {
+            users,
+            verification_tokens: PostgresVerificationTokenRepository { pool: pool.clone() },
+            password_reset_tokens: PostgresPasswordResetTokenRepository { pool: pool.clone() },
+            mfa_factors: PostgresMfaFactorRepository { pool: pool.clone() },
+            mfa_challenges: PostgresMfaChallengeRepository { pool: pool.clone() },
+            mfa_backup_codes: PostgresMfaBackupCodeRepository { pool: pool.clone() },
+            sessions: PostgresSessionRepository { pool: pool.clone() },
+            refresh_tokens: PostgresRefreshTokenRepository { pool: pool.clone() },
+            audit: PostgresAuditRepository { pool: pool.clone() },
+            email_outbox: PostgresEmailOutboxRepository { pool },
+        })
+    }
+}
+
+pub(crate) async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
+    let migrations_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let migrator = sqlx::migrate::Migrator::new(migrations_path.as_path()).await?;
+    migrator.run(pool).await
+}
+
+#[derive(Clone)]
+pub struct PostgresUserRepository {
+    pool: PgPool,
+}
+
+impl PostgresUserRepository {
+    async fn ensure_bootstrap_user(&self, cfg: &AppConfig) -> anyhow::Result<()> {
+        match (&cfg.bootstrap_user_email, &cfg.bootstrap_user_password) {
+            (Some(email), Some(password)) => {
+                let mut tx = self.pool.begin().await?;
+                let email = email.to_ascii_lowercase();
+
+                let exists = sqlx::query("SELECT id FROM users WHERE email = $1")
+                    .bind(&email)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .is_some();
+                if exists {
+                    tx.commit().await?;
+                    return Ok(());
+                }
+
+                let user_id = Uuid::new_v4().to_string();
+                let password_hash = {
+                    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+                    Argon2::default()
+                        .hash_password(password.as_bytes(), &salt)
+                        .map_err(|_| anyhow::anyhow!("failed to hash BOOTSTRAP_USER_PASSWORD"))?
+                        .to_string()
+                };
+
+                sqlx::query(
+                    "INSERT INTO users (id, email, status, created_at, updated_at) VALUES ($1::uuid, $2, $3, NOW(), NOW())",
+                )
+                .bind(&user_id)
+                .bind(&email)
+                .bind("active")
+                .execute(&mut *tx)
+                .await?;
+
+                sqlx::query(
+                    "INSERT INTO credentials (user_id, password_hash, password_changed_at) VALUES ($1::uuid, $2, NOW())",
+                )
+                .bind(&user_id)
+                .bind(&password_hash)
+                .execute(&mut *tx)
+                .await?;
+
+                tx.commit().await?;
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            _ => {
+                tracing::warn!(
+                    "bootstrap user disabled: set both BOOTSTRAP_USER_EMAIL and BOOTSTRAP_USER_PASSWORD"
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl UserRepository for PostgresUserRepository {
+    async fn find_by_email(&self, email: &str) -> Option<User> {
+        let row = sqlx::query(
+            "SELECT u.id::text AS id, u.email, c.password_hash, u.status
+             FROM users u
+             INNER JOIN credentials c ON c.user_id = u.id
+             WHERE u.email = $1",
+        )
+        .bind(email.to_ascii_lowercase())
+        .fetch_optional(&self.pool)
+        .await
+        .ok()??;
+
+        Some(User {
+            id: row.try_get("id").ok()?,
+            email: row.try_get("email").ok()?,
+            password_hash: row.try_get("password_hash").ok()?,
+            status: parse_user_status(row.try_get::<String, _>("status").ok()?),
+        })
+    }
+
+    async fn find_by_id(&self, user_id: &str) -> Option<User> {
+        let row = sqlx::query(
+            "SELECT u.id::text AS id, u.email, c.password_hash, u.status
+             FROM users u
+             INNER JOIN credentials c ON c.user_id = u.id
+             WHERE u.id = $1::uuid",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()??;
+
+        Some(User {
+            id: row.try_get("id").ok()?,
+            email: row.try_get("email").ok()?,
+            password_hash: row.try_get("password_hash").ok()?,
+            status: parse_user_status(row.try_get::<String, _>("status").ok()?),
+        })
+    }
+
+    async fn create_pending_user(
+        &self,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<Option<User>, String> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| "user transaction begin failed".to_string())?;
+
+        let user_id = Uuid::new_v4().to_string();
+        let inserted = sqlx::query(
+            "INSERT INTO users (id, email, status, created_at, updated_at)
+             VALUES ($1::uuid, $2, 'pending_verification', NOW(), NOW())
+             ON CONFLICT (email) DO NOTHING
+             RETURNING id::text AS id",
+        )
+        .bind(&user_id)
+        .bind(email.to_ascii_lowercase())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| "user insert failed".to_string())?;
+
+        let Some(_row) = inserted else {
+            tx.rollback().await.ok();
+            return Ok(None);
+        };
+
+        sqlx::query(
+            "INSERT INTO credentials (user_id, password_hash, password_changed_at)
+             VALUES ($1::uuid, $2, NOW())",
+        )
+        .bind(&user_id)
+        .bind(password_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "credential insert failed".to_string())?;
+
+        tx.commit()
+            .await
+            .map_err(|_| "user transaction commit failed".to_string())?;
+
+        Ok(Some(User {
+            id: user_id,
+            email: email.to_ascii_lowercase(),
+            password_hash: password_hash.to_string(),
+            status: UserStatus::PendingVerification,
+        }))
+    }
+
+    async fn activate_user(&self, user_id: &str, now: DateTime<Utc>) -> Result<(), String> {
+        let updated = sqlx::query(
+            "UPDATE users
+             SET status = 'active', email_verified_at = $2, updated_at = $2
+             WHERE id = $1::uuid",
+        )
+        .bind(user_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "user activation failed".to_string())?;
+
+        if updated.rows_affected() == 0 {
+            return Err("user not found".to_string());
+        }
+
+        Ok(())
+    }
+
+    async fn update_password(
+        &self,
+        user_id: &str,
+        password_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let updated = sqlx::query(
+            "UPDATE credentials
+             SET password_hash = $2, password_changed_at = $3
+             WHERE user_id = $1::uuid",
+        )
+        .bind(user_id)
+        .bind(password_hash)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "password update failed".to_string())?;
+
+        if updated.rows_affected() == 0 {
+            return Err("user credentials not found".to_string());
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresVerificationTokenRepository {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl VerificationTokenRepository for PostgresVerificationTokenRepository {
+    async fn issue(&self, token: VerificationTokenRecord) -> Result<(), String> {
+        sqlx::query(
+            "UPDATE verification_tokens
+             SET used_at = $2
+             WHERE user_id = $1::uuid AND used_at IS NULL",
+        )
+        .bind(token.user_id.clone())
+        .bind(token.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "verification token cleanup failed".to_string())?;
+
+        sqlx::query(
+            "INSERT INTO verification_tokens (id, user_id, token_hash, expires_at, used_at, created_at)
+             VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)",
+        )
+        .bind(token.id)
+        .bind(token.user_id)
+        .bind(token.token_hash)
+        .bind(token.expires_at)
+        .bind(token.used_at)
+        .bind(token.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "verification token insert failed".to_string())?;
+
+        Ok(())
+    }
+
+    async fn consume(
+        &self,
+        token_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<VerificationTokenConsumeState, String> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| "verification token transaction begin failed".to_string())?;
+
+        let row = sqlx::query(
+            "SELECT id::text AS id, user_id::text AS user_id, expires_at, used_at
+             FROM verification_tokens
+             WHERE token_hash = $1
+             FOR UPDATE",
+        )
+        .bind(token_hash)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| "verification token fetch failed".to_string())?;
+
+        let Some(row) = row else {
+            tx.rollback().await.ok();
+            return Ok(VerificationTokenConsumeState::NotFound);
+        };
+
+        let token_id: String = row
+            .try_get("id")
+            .map_err(|_| "invalid verification token id".to_string())?;
+        let user_id: String = row
+            .try_get("user_id")
+            .map_err(|_| "invalid verification token user".to_string())?;
+        let expires_at: DateTime<Utc> = row
+            .try_get("expires_at")
+            .map_err(|_| "invalid verification token expiration".to_string())?;
+        let used_at: Option<DateTime<Utc>> = row
+            .try_get("used_at")
+            .map_err(|_| "invalid verification token used marker".to_string())?;
+
+        if used_at.is_some() {
+            tx.rollback().await.ok();
+            return Ok(VerificationTokenConsumeState::AlreadyUsed);
+        }
+
+        if expires_at <= now {
+            tx.rollback().await.ok();
+            return Ok(VerificationTokenConsumeState::Expired);
+        }
+
+        sqlx::query(
+            "UPDATE verification_tokens
+             SET used_at = $2
+             WHERE id = $1::uuid AND used_at IS NULL",
+        )
+        .bind(token_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "verification token consume failed".to_string())?;
+
+        tx.commit()
+            .await
+            .map_err(|_| "verification token transaction commit failed".to_string())?;
+
+        Ok(VerificationTokenConsumeState::Consumed { user_id })
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresPasswordResetTokenRepository {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl PasswordResetTokenRepository for PostgresPasswordResetTokenRepository {
+    async fn issue(&self, token: PasswordResetTokenRecord) -> Result<(), String> {
+        sqlx::query(
+            "UPDATE password_reset_tokens
+             SET used_at = $2
+             WHERE user_id = $1::uuid AND used_at IS NULL",
+        )
+        .bind(token.user_id.clone())
+        .bind(token.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "password reset token cleanup failed".to_string())?;
+
+        sqlx::query(
+            "INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at, used_at, created_at)
+             VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)",
+        )
+        .bind(token.id)
+        .bind(token.user_id)
+        .bind(token.token_hash)
+        .bind(token.expires_at)
+        .bind(token.used_at)
+        .bind(token.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "password reset token insert failed".to_string())?;
+
+        Ok(())
+    }
+
+    async fn consume(
+        &self,
+        token_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<PasswordResetTokenConsumeState, String> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| "password reset token transaction begin failed".to_string())?;
+
+        let row = sqlx::query(
+            "SELECT id::text AS id, user_id::text AS user_id, expires_at, used_at
+             FROM password_reset_tokens
+             WHERE token_hash = $1
+             FOR UPDATE",
+        )
+        .bind(token_hash)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| "password reset token fetch failed".to_string())?;
+
+        let Some(row) = row else {
+            tx.rollback().await.ok();
+            return Ok(PasswordResetTokenConsumeState::NotFound);
+        };
+
+        let token_id: String = row
+            .try_get("id")
+            .map_err(|_| "invalid password reset token id".to_string())?;
+        let user_id: String = row
+            .try_get("user_id")
+            .map_err(|_| "invalid password reset token user".to_string())?;
+        let expires_at: DateTime<Utc> = row
+            .try_get("expires_at")
+            .map_err(|_| "invalid password reset token expiration".to_string())?;
+        let used_at: Option<DateTime<Utc>> = row
+            .try_get("used_at")
+            .map_err(|_| "invalid password reset token used marker".to_string())?;
+
+        if used_at.is_some() {
+            tx.rollback().await.ok();
+            return Ok(PasswordResetTokenConsumeState::AlreadyUsed);
+        }
+
+        if expires_at <= now {
+            tx.rollback().await.ok();
+            return Ok(PasswordResetTokenConsumeState::Expired);
+        }
+
+        sqlx::query(
+            "UPDATE password_reset_tokens
+             SET used_at = $2
+             WHERE id = $1::uuid AND used_at IS NULL",
+        )
+        .bind(token_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "password reset token consume failed".to_string())?;
+
+        tx.commit()
+            .await
+            .map_err(|_| "password reset token transaction commit failed".to_string())?;
+
+        Ok(PasswordResetTokenConsumeState::Consumed { user_id })
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresMfaFactorRepository {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl MfaFactorRepository for PostgresMfaFactorRepository {
+    async fn find_by_user_id(&self, user_id: &str) -> Option<MfaFactorRecord> {
+        let row = sqlx::query(
+            "SELECT user_id::text AS user_id, secret_ciphertext, secret_nonce, enabled_at, created_at, updated_at
+             FROM mfa_factors
+             WHERE user_id = $1::uuid",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()??;
+
+        Some(MfaFactorRecord {
+            user_id: row.try_get("user_id").ok()?,
+            secret_ciphertext: row.try_get("secret_ciphertext").ok()?,
+            secret_nonce: row.try_get("secret_nonce").ok()?,
+            enabled_at: row.try_get("enabled_at").ok()?,
+            created_at: row.try_get("created_at").ok()?,
+            updated_at: row.try_get("updated_at").ok()?,
+        })
+    }
+
+    async fn upsert(&self, factor: MfaFactorRecord) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO mfa_factors (user_id, secret_ciphertext, secret_nonce, enabled_at, created_at, updated_at)
+             VALUES ($1::uuid, $2, $3, $4, $5, $6)
+             ON CONFLICT (user_id)
+             DO UPDATE SET
+               secret_ciphertext = EXCLUDED.secret_ciphertext,
+               secret_nonce = EXCLUDED.secret_nonce,
+               enabled_at = EXCLUDED.enabled_at,
+               updated_at = EXCLUDED.updated_at",
+        )
+        .bind(factor.user_id)
+        .bind(factor.secret_ciphertext)
+        .bind(factor.secret_nonce)
+        .bind(factor.enabled_at)
+        .bind(factor.created_at)
+        .bind(factor.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "mfa factor upsert failed".to_string())?;
+
+        Ok(())
+    }
+
+    async fn set_enabled_at(&self, user_id: &str, enabled_at: DateTime<Utc>) -> Result<(), String> {
+        let updated = sqlx::query(
+            "UPDATE mfa_factors
+             SET enabled_at = $2, updated_at = $2
+             WHERE user_id = $1::uuid",
+        )
+        .bind(user_id)
+        .bind(enabled_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "mfa factor enable failed".to_string())?;
+
+        if updated.rows_affected() == 0 {
+            return Err("mfa factor not found".to_string());
+        }
+
+        Ok(())
+    }
+
+    async fn delete_for_user(&self, user_id: &str) -> Result<(), String> {
+        sqlx::query("DELETE FROM mfa_factors WHERE user_id = $1::uuid")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|_| "mfa factor delete failed".to_string())?;
+
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresMfaChallengeRepository {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl MfaChallengeRepository for PostgresMfaChallengeRepository {
+    async fn issue(&self, challenge: MfaChallengeRecord) -> Result<(), String> {
+        sqlx::query(
+            "UPDATE mfa_challenges
+             SET used_at = $2
+             WHERE user_id = $1::uuid AND used_at IS NULL",
+        )
+        .bind(challenge.user_id.clone())
+        .bind(challenge.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "mfa challenge cleanup failed".to_string())?;
+
+        sqlx::query(
+            "INSERT INTO mfa_challenges (id, user_id, challenge_hash, device_info, failed_attempts, expires_at, used_at, created_at)
+             VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(challenge.id)
+        .bind(challenge.user_id)
+        .bind(challenge.challenge_hash)
+        .bind(challenge.device_info)
+        .bind(challenge.failed_attempts as i32)
+        .bind(challenge.expires_at)
+        .bind(challenge.used_at)
+        .bind(challenge.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "mfa challenge insert failed".to_string())?;
+
+        Ok(())
+    }
+
+    async fn find_active(
+        &self,
+        challenge_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<MfaChallengeLookupState, String> {
+        let row = sqlx::query(
+            "SELECT user_id::text AS user_id, device_info, expires_at, used_at
+             FROM mfa_challenges
+             WHERE challenge_hash = $1",
+        )
+        .bind(challenge_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| "mfa challenge fetch failed".to_string())?;
+
+        let Some(row) = row else {
+            return Ok(MfaChallengeLookupState::NotFound);
+        };
+
+        let user_id: String = row
+            .try_get("user_id")
+            .map_err(|_| "invalid mfa challenge user".to_string())?;
+        let device_info: Option<String> = row
+            .try_get("device_info")
+            .map_err(|_| "invalid mfa challenge device info".to_string())?;
+        let expires_at: DateTime<Utc> = row
+            .try_get("expires_at")
+            .map_err(|_| "invalid mfa challenge expiration".to_string())?;
+        let used_at: Option<DateTime<Utc>> = row
+            .try_get("used_at")
+            .map_err(|_| "invalid mfa challenge used marker".to_string())?;
+
+        if used_at.is_some() {
+            return Ok(MfaChallengeLookupState::AlreadyUsed);
+        }
+
+        if expires_at <= now {
+            return Ok(MfaChallengeLookupState::Expired);
+        }
+
+        Ok(MfaChallengeLookupState::Active {
+            user_id,
+            device_info,
+        })
+    }
+
+    async fn mark_used(&self, challenge_hash: &str, now: DateTime<Utc>) -> Result<(), String> {
+        let updated = sqlx::query(
+            "UPDATE mfa_challenges
+             SET used_at = $2
+             WHERE challenge_hash = $1 AND used_at IS NULL",
+        )
+        .bind(challenge_hash)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "mfa challenge consume failed".to_string())?;
+
+        if updated.rows_affected() == 0 {
+            return Err("mfa challenge already consumed or missing".to_string());
+        }
+
+        Ok(())
+    }
+
+    async fn register_failure(
+        &self,
+        challenge_hash: &str,
+        now: DateTime<Utc>,
+        max_attempts: u32,
+    ) -> Result<MfaChallengeFailureState, String> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| "mfa challenge transaction begin failed".to_string())?;
+
+        let row = sqlx::query(
+            "SELECT id::text AS id, failed_attempts, expires_at, used_at
+             FROM mfa_challenges
+             WHERE challenge_hash = $1
+             FOR UPDATE",
+        )
+        .bind(challenge_hash)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| "mfa challenge fetch failed".to_string())?;
+
+        let Some(row) = row else {
+            tx.rollback().await.ok();
+            return Ok(MfaChallengeFailureState::NotFound);
+        };
+
+        let challenge_id: String = row
+            .try_get("id")
+            .map_err(|_| "invalid mfa challenge id".to_string())?;
+        let failed_attempts: i32 = row
+            .try_get("failed_attempts")
+            .map_err(|_| "invalid mfa challenge attempts".to_string())?;
+        let expires_at: DateTime<Utc> = row
+            .try_get("expires_at")
+            .map_err(|_| "invalid mfa challenge expiration".to_string())?;
+        let used_at: Option<DateTime<Utc>> = row
+            .try_get("used_at")
+            .map_err(|_| "invalid mfa challenge used marker".to_string())?;
+
+        if used_at.is_some() {
+            tx.rollback().await.ok();
+            return Ok(MfaChallengeFailureState::AlreadyUsed);
+        }
+
+        if expires_at <= now {
+            tx.rollback().await.ok();
+            return Ok(MfaChallengeFailureState::Expired);
+        }
+
+        let failed_attempts = failed_attempts.max(0);
+        let updated_attempts = failed_attempts.saturating_add(1);
+        if updated_attempts as u32 >= max_attempts {
+            sqlx::query(
+                "UPDATE mfa_challenges
+                 SET failed_attempts = $2, used_at = $3
+                 WHERE id = $1::uuid",
+            )
+            .bind(challenge_id)
+            .bind(updated_attempts)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| "mfa challenge exhaustion update failed".to_string())?;
+
+            tx.commit()
+                .await
+                .map_err(|_| "mfa challenge transaction commit failed".to_string())?;
+
+            return Ok(MfaChallengeFailureState::Exhausted);
+        }
+
+        sqlx::query(
+            "UPDATE mfa_challenges
+             SET failed_attempts = $2
+             WHERE id = $1::uuid",
+        )
+        .bind(challenge_id)
+        .bind(updated_attempts)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "mfa challenge failure update failed".to_string())?;
+
+        tx.commit()
+            .await
+            .map_err(|_| "mfa challenge transaction commit failed".to_string())?;
+
+        Ok(MfaChallengeFailureState::RetryAllowed {
+            remaining_attempts: max_attempts - updated_attempts as u32,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresMfaBackupCodeRepository {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl MfaBackupCodeRepository for PostgresMfaBackupCodeRepository {
+    async fn replace_for_user(
+        &self,
+        user_id: &str,
+        code_hashes: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| "mfa backup code transaction begin failed".to_string())?;
+
+        sqlx::query("DELETE FROM mfa_backup_codes WHERE user_id = $1::uuid")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| "mfa backup code cleanup failed".to_string())?;
+
+        for code_hash in code_hashes {
+            sqlx::query(
+                "INSERT INTO mfa_backup_codes (id, user_id, code_hash, used_at, created_at)
+                 VALUES ($1::uuid, $2::uuid, $3, NULL, $4)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(user_id)
+            .bind(code_hash)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| "mfa backup code insert failed".to_string())?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|_| "mfa backup code transaction commit failed".to_string())?;
+
+        Ok(())
+    }
+
+    async fn consume(
+        &self,
+        user_id: &str,
+        code_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<MfaBackupCodeConsumeState, String> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| "mfa backup code transaction begin failed".to_string())?;
+
+        let row = sqlx::query(
+            "SELECT id::text AS id, used_at
+             FROM mfa_backup_codes
+             WHERE user_id = $1::uuid AND code_hash = $2
+             FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(code_hash)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| "mfa backup code fetch failed".to_string())?;
+
+        let Some(row) = row else {
+            tx.rollback().await.ok();
+            return Ok(MfaBackupCodeConsumeState::NotFound);
+        };
+
+        let backup_code_id: String = row
+            .try_get("id")
+            .map_err(|_| "invalid mfa backup code id".to_string())?;
+        let used_at: Option<DateTime<Utc>> = row
+            .try_get("used_at")
+            .map_err(|_| "invalid mfa backup code used marker".to_string())?;
+
+        if used_at.is_some() {
+            tx.rollback().await.ok();
+            return Ok(MfaBackupCodeConsumeState::AlreadyUsed);
+        }
+
+        sqlx::query(
+            "UPDATE mfa_backup_codes
+             SET used_at = $2
+             WHERE id = $1::uuid AND used_at IS NULL",
+        )
+        .bind(backup_code_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "mfa backup code consume failed".to_string())?;
+
+        tx.commit()
+            .await
+            .map_err(|_| "mfa backup code transaction commit failed".to_string())?;
+
+        Ok(MfaBackupCodeConsumeState::Consumed)
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresSessionRepository {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl SessionRepository for PostgresSessionRepository {
+    async fn create(&self, session: Session) {
+        if let Err(error) = sqlx::query(
+            "INSERT INTO sessions (id, user_id, device_info, ip, status, created_at, last_seen_at)
+             VALUES ($1::uuid, $2::uuid, $3, $4::inet, $5, $6, $7)",
+        )
+        .bind(session.id)
+        .bind(session.user_id)
+        .bind(session.device_info)
+        .bind(session.ip)
+        .bind(session_status_to_db(&session.status))
+        .bind(session.created_at)
+        .bind(session.last_seen_at)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::error!(?error, "failed to create session");
+        }
+    }
+
+    async fn find_by_id(&self, session_id: &str) -> Option<Session> {
+        let row = sqlx::query(
+            "SELECT id::text AS id, user_id::text AS user_id, device_info, ip::text AS ip, status, created_at, last_seen_at
+             FROM sessions
+             WHERE id = $1::uuid",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()??;
+
+        Some(Session {
+            id: row.try_get("id").ok()?,
+            user_id: row.try_get("user_id").ok()?,
+            device_info: row.try_get("device_info").ok()?,
+            ip: row.try_get("ip").ok()?,
+            status: parse_session_status(row.try_get::<String, _>("status").ok()?),
+            created_at: row.try_get("created_at").ok()?,
+            last_seen_at: row.try_get("last_seen_at").ok()?,
+        })
+    }
+
+    async fn list_active_for_user(&self, user_id: &str) -> Vec<Session> {
+        let rows = match sqlx::query(
+            "SELECT id::text AS id, user_id::text AS user_id, device_info, ip::text AS ip, status, created_at, last_seen_at
+             FROM sessions
+             WHERE user_id = $1::uuid AND status = 'active'
+             ORDER BY created_at DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(?error, "failed to list active sessions for user");
+                return Vec::new();
+            }
+        };
+
+        rows.into_iter()
+            .filter_map(|row| {
+                Some(Session {
+                    id: row.try_get("id").ok()?,
+                    user_id: row.try_get("user_id").ok()?,
+                    device_info: row.try_get("device_info").ok()?,
+                    ip: row.try_get("ip").ok()?,
+                    status: parse_session_status(row.try_get::<String, _>("status").ok()?),
+                    created_at: row.try_get("created_at").ok()?,
+                    last_seen_at: row.try_get("last_seen_at").ok()?,
+                })
+            })
+            .collect()
+    }
+
+    async fn update(&self, session: Session) {
+        if let Err(error) = sqlx::query(
+            "UPDATE sessions
+             SET device_info = $2, ip = $3::inet, status = $4, last_seen_at = $5
+             WHERE id = $1::uuid",
+        )
+        .bind(session.id)
+        .bind(session.device_info)
+        .bind(session.ip)
+        .bind(session_status_to_db(&session.status))
+        .bind(session.last_seen_at)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::error!(?error, "failed to update session");
+        }
+    }
+
+    async fn revoke_session(&self, session_id: &str) {
+        if let Err(error) = sqlx::query(
+            "UPDATE sessions
+             SET status = 'revoked', revoked_at = NOW(), last_seen_at = NOW()
+             WHERE id = $1::uuid AND status = 'active'",
+        )
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::error!(?error, "failed to revoke session");
+        }
+    }
+
+    async fn revoke_all_for_user(&self, user_id: &str) -> Vec<String> {
+        let rows = match sqlx::query(
+            "UPDATE sessions
+             SET status = 'revoked', revoked_at = NOW(), last_seen_at = NOW()
+             WHERE user_id = $1::uuid AND status = 'active'
+             RETURNING id::text AS id",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(?error, "failed to revoke all sessions for user");
+                return Vec::new();
+            }
+        };
+
+        rows.into_iter()
+            .filter_map(|row| row.try_get::<String, _>("id").ok())
+            .collect()
+    }
+
+    async fn mark_compromised_and_revoke_all_for_user(&self, user_id: &str) -> Vec<String> {
+        let rows = match sqlx::query(
+            "UPDATE sessions
+             SET status = 'compromised', compromised_at = NOW(), last_seen_at = NOW()
+             WHERE user_id = $1::uuid
+             RETURNING id::text AS id",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(?error, "failed to compromise sessions for user");
+                return Vec::new();
+            }
+        };
+
+        rows.into_iter()
+            .filter_map(|row| row.try_get::<String, _>("id").ok())
+            .collect()
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresRefreshTokenRepository {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl RefreshTokenRepository for PostgresRefreshTokenRepository {
+    async fn insert(&self, token: RefreshTokenRecord) {
+        if let Err(error) = sqlx::query(
+            "INSERT INTO refresh_tokens (id, session_id, token_hash, expires_at, revoked_at, replaced_by, created_at)
+             VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7)",
+        )
+        .bind(token.id)
+        .bind(token.session_id)
+        .bind(token.token_hash)
+        .bind(token.expires_at)
+        .bind(token.revoked_at)
+        .bind(token.replaced_by)
+        .bind(token.created_at)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::error!(?error, "failed to insert refresh token");
+        }
+    }
+
+    async fn find_by_hash(&self, token_hash: &str) -> Option<RefreshTokenRecord> {
+        let row = sqlx::query(
+            "SELECT id::text AS id, session_id::text AS session_id, token_hash, expires_at, revoked_at, replaced_by, created_at
+             FROM refresh_tokens
+             WHERE token_hash = $1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()??;
+
+        Some(RefreshTokenRecord {
+            id: row.try_get("id").ok()?,
+            session_id: row.try_get("session_id").ok()?,
+            token_hash: row.try_get("token_hash").ok()?,
+            expires_at: row.try_get("expires_at").ok()?,
+            revoked_at: row.try_get("revoked_at").ok()?,
+            replaced_by: row.try_get("replaced_by").ok()?,
+            created_at: row.try_get("created_at").ok()?,
+        })
+    }
+
+    async fn rotate_strong(
+        &self,
+        current_hash: &str,
+        next_token: RefreshTokenRecord,
+        now: DateTime<Utc>,
+    ) -> Result<RefreshRotationState, String> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| "refresh transaction begin failed".to_string())?;
+
+        let row = sqlx::query(
+            "SELECT expires_at, revoked_at
+             FROM refresh_tokens
+             WHERE token_hash = $1
+             FOR UPDATE",
+        )
+        .bind(current_hash)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| "refresh token fetch failed".to_string())?;
+
+        let Some(row) = row else {
+            tx.rollback().await.ok();
+            return Ok(RefreshRotationState::NotFound);
+        };
+
+        let expires_at: DateTime<Utc> = row
+            .try_get("expires_at")
+            .map_err(|_| "invalid refresh token expiration".to_string())?;
+        let revoked_at: Option<DateTime<Utc>> = row
+            .try_get("revoked_at")
+            .map_err(|_| "invalid refresh token revocation".to_string())?;
+
+        if revoked_at.is_some() {
+            tx.rollback().await.ok();
+            return Ok(RefreshRotationState::AlreadyRevoked);
+        }
+
+        if expires_at <= now {
+            sqlx::query(
+                "UPDATE refresh_tokens
+                 SET revoked_at = COALESCE(revoked_at, $2)
+                 WHERE token_hash = $1",
+            )
+            .bind(current_hash)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| "refresh token expiration update failed".to_string())?;
+
+            tx.commit()
+                .await
+                .map_err(|_| "refresh transaction commit failed".to_string())?;
+            return Ok(RefreshRotationState::Expired);
+        }
+
+        sqlx::query(
+            "UPDATE refresh_tokens
+             SET revoked_at = $2, replaced_by = $3
+             WHERE token_hash = $1 AND revoked_at IS NULL",
+        )
+        .bind(current_hash)
+        .bind(now)
+        .bind(next_token.token_hash.clone())
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "refresh token revoke failed".to_string())?;
+
+        sqlx::query(
+            "INSERT INTO refresh_tokens (id, session_id, token_hash, expires_at, revoked_at, replaced_by, created_at)
+             VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7)",
+        )
+        .bind(next_token.id)
+        .bind(next_token.session_id)
+        .bind(next_token.token_hash)
+        .bind(next_token.expires_at)
+        .bind(next_token.revoked_at)
+        .bind(next_token.replaced_by)
+        .bind(next_token.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "next refresh token insert failed".to_string())?;
+
+        tx.commit()
+            .await
+            .map_err(|_| "refresh transaction commit failed".to_string())?;
+
+        Ok(RefreshRotationState::Rotated)
+    }
+
+    async fn rotate(
+        &self,
+        current_hash: &str,
+        next_token: RefreshTokenRecord,
+        revoked_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        match self
+            .rotate_strong(current_hash, next_token, revoked_at)
+            .await?
+        {
+            RefreshRotationState::Rotated => Ok(()),
+            RefreshRotationState::NotFound => Err("current refresh token not found".to_string()),
+            RefreshRotationState::AlreadyRevoked => {
+                Err("refresh token already revoked".to_string())
+            }
+            RefreshRotationState::Expired => Err("refresh token expired".to_string()),
+        }
+    }
+
+    async fn revoke_by_session_ids(&self, session_ids: &[String], revoked_at: DateTime<Utc>) {
+        let ids = parse_uuids(session_ids);
+        if ids.is_empty() {
+            return;
+        }
+
+        if let Err(error) = sqlx::query(
+            "UPDATE refresh_tokens
+             SET revoked_at = $2
+             WHERE session_id = ANY($1::uuid[]) AND revoked_at IS NULL",
+        )
+        .bind(ids)
+        .bind(revoked_at)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::error!(?error, "failed to revoke refresh tokens by session ids");
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresAuditRepository {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl AuditRepository for PostgresAuditRepository {
+    async fn append(&self, event: AuditEvent) {
+        if let Err(error) = sqlx::query(
+            "INSERT INTO audit_events (actor_user_id, event_type, trace_id, metadata, created_at)
+             VALUES ($1::uuid, $2, $3, $4::jsonb, $5)",
+        )
+        .bind(event.actor_user_id)
+        .bind(event.event_type)
+        .bind(event.trace_id)
+        .bind(event.metadata)
+        .bind(event.created_at)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::error!(?error, "failed to append audit event");
+        }
+    }
+}
+
+fn parse_uuids(values: &[String]) -> Vec<Uuid> {
+    values
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect()
+}
+
+fn parse_user_status(value: String) -> UserStatus {
+    match value.as_str() {
+        "active" => UserStatus::Active,
+        "pending_verification" => UserStatus::PendingVerification,
+        "locked" => UserStatus::Locked,
+        _ => UserStatus::Locked,
+    }
+}
+
+fn parse_session_status(value: String) -> SessionStatus {
+    match value.as_str() {
+        "active" => SessionStatus::Active,
+        "revoked" => SessionStatus::Revoked,
+        "compromised" => SessionStatus::Compromised,
+        _ => SessionStatus::Revoked,
+    }
+}
+
+fn session_status_to_db(status: &SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Active => "active",
+        SessionStatus::Revoked => "revoked",
+        SessionStatus::Compromised => "compromised",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{DateTime, Duration, Utc};
+    use sqlx::{postgres::PgPoolOptions, PgPool};
+
+    use crate::modules::tokens::{
+        domain::RefreshTokenRecord,
+        ports::{RefreshRotationState, RefreshTokenRepository},
+    };
+
+    use super::PostgresRefreshTokenRepository;
+
+    #[tokio::test]
+    async fn postgres_refresh_rotate_strong_returns_not_found_when_current_missing() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresRefreshTokenRepository { pool: pool.clone() };
+
+        let now = Utc::now();
+        let session_id = create_user_and_session(&pool).await;
+        let state = repo
+            .rotate_strong(
+                "missing-refresh-hash",
+                refresh_record(
+                    &session_id,
+                    &format!("next-{}", uuid::Uuid::new_v4()),
+                    now,
+                    now + Duration::seconds(300),
+                    None,
+                ),
+                now,
+            )
+            .await
+            .expect("rotation state should be returned");
+
+        assert_eq!(state, RefreshRotationState::NotFound);
+    }
+
+    #[tokio::test]
+    async fn postgres_refresh_rotate_strong_returns_expired_and_marks_current_revoked() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresRefreshTokenRepository { pool: pool.clone() };
+
+        let now = Utc::now();
+        let session_id = create_user_and_session(&pool).await;
+        let current_hash = format!("expired-{}", uuid::Uuid::new_v4());
+        let next_hash = format!("next-expired-{}", uuid::Uuid::new_v4());
+
+        repo.insert(refresh_record(
+            &session_id,
+            &current_hash,
+            now,
+            now - Duration::seconds(1),
+            None,
+        ))
+        .await;
+
+        let state = repo
+            .rotate_strong(
+                &current_hash,
+                refresh_record(
+                    &session_id,
+                    &next_hash,
+                    now,
+                    now + Duration::seconds(300),
+                    None,
+                ),
+                now,
+            )
+            .await
+            .expect("rotation state should be returned");
+        assert_eq!(state, RefreshRotationState::Expired);
+
+        let current = repo
+            .find_by_hash(&current_hash)
+            .await
+            .expect("current token should exist");
+        let revoked_at = current
+            .revoked_at
+            .expect("expired token should be marked revoked");
+        assert_eq!(revoked_at.timestamp_micros(), now.timestamp_micros());
+        assert!(repo.find_by_hash(&next_hash).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn postgres_refresh_rotate_strong_returns_already_revoked_for_replayed_token() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresRefreshTokenRepository { pool: pool.clone() };
+
+        let now = Utc::now();
+        let session_id = create_user_and_session(&pool).await;
+        let current_hash = format!("revoked-{}", uuid::Uuid::new_v4());
+        let next_hash = format!("next-revoked-{}", uuid::Uuid::new_v4());
+
+        repo.insert(refresh_record(
+            &session_id,
+            &current_hash,
+            now,
+            now + Duration::seconds(300),
+            Some(now - Duration::seconds(1)),
+        ))
+        .await;
+
+        let state = repo
+            .rotate_strong(
+                &current_hash,
+                refresh_record(
+                    &session_id,
+                    &next_hash,
+                    now,
+                    now + Duration::seconds(300),
+                    None,
+                ),
+                now,
+            )
+            .await
+            .expect("rotation state should be returned");
+        assert_eq!(state, RefreshRotationState::AlreadyRevoked);
+        assert!(repo.find_by_hash(&next_hash).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn postgres_refresh_rotate_strong_rotates_and_links_replacement() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresRefreshTokenRepository { pool: pool.clone() };
+
+        let now = Utc::now();
+        let session_id = create_user_and_session(&pool).await;
+        let current_hash = format!("current-{}", uuid::Uuid::new_v4());
+        let next_hash = format!("next-{}", uuid::Uuid::new_v4());
+
+        repo.insert(refresh_record(
+            &session_id,
+            &current_hash,
+            now,
+            now + Duration::seconds(300),
+            None,
+        ))
+        .await;
+
+        let state = repo
+            .rotate_strong(
+                &current_hash,
+                refresh_record(
+                    &session_id,
+                    &next_hash,
+                    now,
+                    now + Duration::seconds(600),
+                    None,
+                ),
+                now,
+            )
+            .await
+            .expect("rotation state should be returned");
+        assert_eq!(state, RefreshRotationState::Rotated);
+
+        let current = repo
+            .find_by_hash(&current_hash)
+            .await
+            .expect("current token should exist");
+        let revoked_at = current
+            .revoked_at
+            .expect("rotated token should be marked revoked");
+        assert_eq!(revoked_at.timestamp_micros(), now.timestamp_micros());
+        assert_eq!(current.replaced_by.as_deref(), Some(next_hash.as_str()));
+
+        let next = repo
+            .find_by_hash(&next_hash)
+            .await
+            .expect("next token should be persisted");
+        assert_eq!(next.session_id, session_id);
+        assert!(next.revoked_at.is_none());
+    }
+
+    async fn test_pool() -> Option<PgPool> {
+        if let Some(database_url) = non_empty_env("AUTH_TEST_DATABASE_URL") {
+            return Some(
+                connect_and_prepare_pool(&database_url)
+                    .await
+                    .expect("AUTH_TEST_DATABASE_URL is set but connection/migration failed"),
+            );
+        }
+
+        for database_url in local_postgres_test_urls() {
+            if let Ok(pool) = connect_and_prepare_pool(database_url).await {
+                return Some(pool);
+            }
+        }
+
+        None
+    }
+
+    async fn connect_and_prepare_pool(database_url: &str) -> Result<PgPool, String> {
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(database_url)
+            .await
+            .map_err(|_| "postgres test connection failed".to_string())?;
+
+        super::run_migrations(&pool)
+            .await
+            .map_err(|_| "postgres test migrations failed".to_string())?;
+
+        Ok(pool)
+    }
+
+    fn non_empty_env(name: &str) -> Option<String> {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn local_postgres_test_urls() -> [&'static str; 4] {
+        [
+            "postgres://auth_user:change_me@127.0.0.1:5432/auth",
+            "postgres://postgres:postgres@127.0.0.1:5432/postgres",
+            "postgres://postgres@127.0.0.1:5432/postgres",
+            "postgresql:///postgres?host=/var/run/postgresql",
+        ]
+    }
+
+    async fn create_user_and_session(pool: &PgPool) -> String {
+        let now = Utc::now();
+        let user_id = uuid::Uuid::new_v4();
+        let session_id = uuid::Uuid::new_v4();
+
+        sqlx::query(
+            "INSERT INTO users (id, email, status, created_at, updated_at)
+             VALUES ($1, $2, 'active', $3, $4)",
+        )
+        .bind(user_id)
+        .bind(format!("postgres-refresh-test-{}@example.com", user_id))
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("test user should be inserted");
+
+        sqlx::query(
+            "INSERT INTO sessions (id, user_id, device_info, ip, status, created_at, last_seen_at)
+             VALUES ($1, $2, $3, NULL, 'active', $4, $5)",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind("postgres-refresh-test-device")
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("test session should be inserted");
+
+        session_id.to_string()
+    }
+
+    fn refresh_record(
+        session_id: &str,
+        token_hash: &str,
+        now: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        revoked_at: Option<DateTime<Utc>>,
+    ) -> RefreshTokenRecord {
+        RefreshTokenRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            token_hash: token_hash.to_string(),
+            expires_at,
+            revoked_at,
+            replaced_by: None,
+            created_at: now,
+        }
+    }
+}

@@ -1,0 +1,230 @@
+groups:
+  - name: auth-refresh-security
+    interval: 30s
+    rules:
+      - record: auth:refresh_error_ratio_10m
+        expr: |
+          sum(rate(auth_refresh_requests_total{outcome="error"}[10m]))
+          /
+          clamp_min(sum(rate(auth_refresh_requests_total[10m])), 0.0001)
+
+      - record: auth:refresh_reuse_ratio_10m
+        expr: |
+          sum(rate(auth_refresh_rejected_total{reason="refresh_reuse_detected"}[10m]))
+          /
+          clamp_min(sum(rate(auth_refresh_requests_total[10m])), 0.0001)
+
+      - record: auth:refresh_internal_ratio_10m
+        expr: |
+          sum(rate(auth_refresh_rejected_total{reason="internal"}[10m]))
+          /
+          clamp_min(sum(rate(auth_refresh_requests_total[10m])), 0.0001)
+
+      - record: auth:email_failure_ratio_10m
+        expr: |
+          sum(rate(auth_email_delivery_total{provider!="noop",outcome="failure"}[10m]))
+          /
+          clamp_min(sum(rate(auth_email_delivery_total{provider!="noop"}[10m])), 0.0001)
+
+      - record: auth:email_retry_pressure_10m
+        expr: |
+          sum(rate(auth_email_retry_attempts_total{provider!="noop"}[10m]))
+          /
+          clamp_min(sum(rate(auth_email_delivery_total{provider!="noop"}[10m])), 0.0001)
+
+      - record: auth:email_outbox_dispatch_failure_ratio_10m
+        expr: |
+          sum(rate(auth_email_outbox_dispatch_total{outcome=~"failed_retryable|failed_exhausted"}[10m]))
+          /
+          clamp_min(sum(rate(auth_email_outbox_dispatch_total[10m])), 0.0001)
+
+      - record: auth:email_outbox_oldest_pending_age_seconds_max_15m
+        expr: |
+          max_over_time(auth_email_outbox_oldest_pending_age_seconds[15m])
+
+      - record: auth:email_outbox_oldest_due_age_seconds_max_15m
+        expr: |
+          max_over_time(auth_email_outbox_oldest_due_age_seconds[15m])
+
+      - record: auth:email_outbox_claim_failures_10m
+        expr: |
+          sum(increase(auth_email_outbox_claim_failures_total[10m]))
+
+      - alert: AuthRefreshReuseDetectedSpike
+        expr: sum(increase(auth_refresh_rejected_total{reason="refresh_reuse_detected"}[5m])) >= 10
+        for: 2m
+        labels:
+          severity: critical
+          area: auth
+        annotations:
+          summary: "Refresh reuse detected spike"
+          description: "Se detecto un pico de reuse de refresh tokens en los ultimos 5m. Ejecutar contencion de seguridad."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthRefreshReuseDetectedRatioHigh
+        expr: auth:refresh_reuse_ratio_10m >= 0.005
+        for: 10m
+        labels:
+          severity: critical
+          area: auth
+        annotations:
+          summary: "Refresh reuse ratio high"
+          description: "El ratio de refresh reuse supera 0.5% durante 10m. Evaluar replay activo y compromisos de sesion."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthRefreshInternalErrorBurst
+        expr: sum(increase(auth_refresh_rejected_total{reason="internal"}[5m])) >= 5
+        for: 2m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Refresh internal rejection burst"
+          description: "Pico de errores internos de refresh en 5m. Revisar salud de DB/transacciones/pool."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthRefreshInternalErrorRatioHigh
+        expr: auth:refresh_internal_ratio_10m >= 0.02
+        for: 10m
+        labels:
+          severity: critical
+          area: auth
+        annotations:
+          summary: "Refresh internal rejection ratio high"
+          description: "El ratio de errores internos de refresh supera 2% por 10m. Posible degradacion de infraestructura."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthLoginLocked429Spike
+        expr: |
+          sum(increase(auth_problem_responses_total{status="429",type="https://example.com/problems/login-locked"}[15m]))
+          >= 100
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Login locked (429) spike"
+          description: "Spike de respuestas 429 por login lock en 15m. Revisar calibracion de anti-abuso y posible ataque."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthMetricsAccessDeniedSpike
+        expr: |
+          sum(increase(auth_problem_responses_total{status="403",type="https://example.com/problems/metrics-access-denied"}[15m]))
+          >= 20
+        for: 5m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Metrics endpoint access denied spike"
+          description: "Spike de 403 en /metrics por politica de acceso. Verificar scrapers legitimos y posibles intentos de sondeo."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthMetricsAuthRequiredSpike
+        expr: |
+          sum(increase(auth_problem_responses_total{status="401",type="https://example.com/problems/metrics-auth-required"}[15m]))
+          >= 20
+        for: 5m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Metrics endpoint auth-required spike"
+          description: "Spike de 401 en /metrics por bearer faltante/invalido. Validar scrapers y posibles intentos de acceso no autorizado."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthEmailFailureRatioSustained
+        expr: |
+          auth:email_failure_ratio_10m >= 0.05
+          and
+          sum(increase(auth_email_delivery_total{provider!="noop"}[10m])) >= 50
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Transactional email failure ratio sustained"
+          description: "El ratio de fallos de envio email supera 5% durante 10m con volumen relevante. Revisar proveedor, credenciales y cuotas."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthEmailRetryPressureHigh
+        expr: |
+          auth:email_retry_pressure_10m >= 0.8
+          and
+          sum(increase(auth_email_delivery_total{provider!="noop"}[10m])) >= 50
+        for: 15m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Transactional email retry pressure high"
+          description: "La presion de reintentos de email (retries por envio) es alta y sostenida. Posible degradacion upstream o throttling del proveedor."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthEmailOutboxQueueBacklogHigh
+        expr: |
+          auth:email_outbox_oldest_due_age_seconds_max_15m >= 600
+          and
+          max_over_time(auth_email_outbox_queue_depth[15m]) >= 20
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Email outbox backlog sustained high"
+          description: "La edad del mensaje due mas antiguo en outbox supera 10m y existe backlog sostenido. Riesgo de retraso real en emails transaccionales."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthEmailOutboxDispatchFailureRatioHigh
+        expr: |
+          auth:email_outbox_dispatch_failure_ratio_10m >= 0.2
+          and
+          sum(increase(auth_email_outbox_dispatch_total[10m])) >= 25
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Email outbox dispatch failure ratio elevated"
+          description: "El ratio de fallos del dispatcher de outbox supera 20% por 10m con volumen relevante. Revisar proveedor, conectividad y capacidad del worker."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthEmailOutboxProcessingStalled
+        expr: |
+          auth:email_outbox_oldest_due_age_seconds_max_15m >= 900
+          and
+          sum(increase(auth_email_outbox_dispatch_total[15m])) == 0
+          and
+          sum(increase(auth_email_outbox_claimed_per_poll_count[15m])) == 0
+        for: 15m
+        labels:
+          severity: critical
+          area: auth
+        annotations:
+          summary: "Email outbox processing appears stalled"
+          description: "La edad del mensaje due mas antiguo supera 15m sin claims ni dispatches en 15m. Posible worker caido, lock/lease atascado o interrupcion de polling."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthEmailOutboxClaimFailuresSustained
+        expr: auth:email_outbox_claim_failures_10m >= 10
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Email outbox claim failures sustained"
+          description: "El worker de outbox acumula fallos de claim/fetch por >=10m. Revisar salud de DB/pool, locks y errores de query antes de que escale a backlog."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"

@@ -1,0 +1,74 @@
+name: ops-tooling-smoke-manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      postgres_url:
+        description: "Optional PostgreSQL admin URL override (prefer secret)"
+        required: false
+        type: string
+      keep_db:
+        description: "Keep temporary smoke-test database for manual inspection"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  ops-tooling-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Ensure scripts are executable
+        run: chmod +x scripts/*.sh
+
+      - name: Run ops tooling smoke script
+        id: smoke
+        env:
+          POSTGRES_URL_FROM_INPUT: ${{ github.event.inputs.postgres_url }}
+          POSTGRES_URL_FROM_SECRET: ${{ secrets.OUTBOX_REPLAY_AUDIT_DATABASE_URL }}
+          KEEP_DB: ${{ github.event.inputs.keep_db }}
+        run: |
+          set -euo pipefail
+
+          db_url="${POSTGRES_URL_FROM_INPUT:-}"
+          if [[ -z "${db_url}" ]]; then
+            db_url="${POSTGRES_URL_FROM_SECRET:-}"
+          fi
+
+          mkdir -p artifacts/ops-tooling-smoke
+          smoke_log="artifacts/ops-tooling-smoke/smoke.log"
+
+          smoke_args=()
+          if [[ -n "${db_url}" ]]; then
+            smoke_args+=(--postgres-url "${db_url}")
+          fi
+
+          if [[ "${KEEP_DB}" == "true" ]]; then
+            smoke_args+=(--keep-db)
+          fi
+
+          set +e
+          bash scripts/test-ops-tooling-smoke.sh "${smoke_args[@]}" 2>&1 | tee "${smoke_log}"
+          exit_code=${PIPESTATUS[0]}
+          set -e
+
+          echo "smoke_exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
+          echo "smoke_log_path=${smoke_log}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload ops-tooling smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ops-tooling-smoke-${{ github.run_id }}
+          path: artifacts/ops-tooling-smoke
+
+      - name: Enforce smoke success
+        if: ${{ steps.smoke.outputs.smoke_exit_code != '0' }}
+        run: |
+          echo "Ops tooling smoke failed. Check artifact log for details." >&2
+          exit 1
