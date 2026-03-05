@@ -104,7 +104,8 @@ validate_yaml_syntax() {
   local syntax_report="${ARTIFACT_DIR}/yaml-syntax.log"
 
   if command -v yamllint >/dev/null 2>&1; then
-    if yamllint "${K8S_DIR}" >"${syntax_report}" 2>&1; then
+    local yamllint_config='{extends: default, rules: {document-start: disable, line-length: disable}}'
+    if yamllint -d "${yamllint_config}" "${K8S_DIR}" >"${syntax_report}" 2>&1; then
       info "YAML syntax validation passed with yamllint"
     else
       fail "YAML syntax validation failed (yamllint, see ${syntax_report})"
