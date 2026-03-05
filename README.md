@@ -359,6 +359,7 @@ EMAIL_OUTBOX_BACKOFF_MAX_MS=60000
 - Baseline ingress is hostless (`deploy/k8s/ingress.yaml`); set host/TLS in your environment overlay.
 - Baseline network policy uses selector-based egress for in-cluster `postgres`/`redis` plus DNS; for external endpoints, add overlay egress rules instead of loosening baseline.
 - Gate de validacion de manifiestos K8s para pre-deploy/manual CI: `scripts/validate-k8s-manifests.sh`.
+- Generador de secret JWT (PEM -> `auth-jwt-keys`): `scripts/generate-k8s-jwt-key-secret.sh`.
 - Checklist de despliegue productivo (pre, migrate, smoke, rollback, observabilidad): `docs/deployment-production-checklist.md`.
 
 ### Publicar imagen OCI en GHCR (manual o por tag)
@@ -397,6 +398,10 @@ Pasos recomendados:
   - `ubuntu-latest` (default): runner hospedado de GitHub.
   - `self-hosted-auth-local`: runner self-hosted con labels `self-hosted,linux,x64,auth-local`.
 - Inputs obligatorios: `image_digest`, `ingress_host`, `tls_secret_name`, `postgres_cidr`, `redis_cidr`.
+- Secrets requeridos para generar manifiestos de runtime:
+  - `PROD_AUTH_DATABASE_URL`, `PROD_AUTH_REDIS_URL`, `PROD_AUTH_REFRESH_TOKEN_PEPPER`, `PROD_AUTH_MFA_ENCRYPTION_KEY_BASE64`, `PROD_AUTH_JWT_KEYSET`, `PROD_AUTH_JWT_PRIMARY_KID`.
+  - `PROD_AUTH_JWT_PRIVATE_KEY_PEM`, `PROD_AUTH_JWT_PUBLIC_KEY_PEM` (para generar `auth-jwt-keys`).
+  - Opcionales: `PROD_AUTH_METRICS_BEARER_TOKEN`, `PROD_AUTH_SENDGRID_API_KEY`, `PROD_AUTH_SENDGRID_FROM_EMAIL`, `PROD_AUTH_VERIFY_EMAIL_URL_BASE`, `PROD_AUTH_PASSWORD_RESET_URL_BASE`.
 - Gate de firma: valida keyless Cosign para `ghcr.io/lu149e/system@<digest>` con issuer `https://token.actions.githubusercontent.com` e identidad del workflow `release-image.yml` en `refs/heads/main` o `refs/tags/*`.
 - Gate de readiness: ejecuta `scripts/generate-production-overlay.sh` y luego `scripts/validate-deploy-readiness.sh` en modo estricto (`STRICT_DEPLOY_VALIDATION=true`).
 - Gate de manifiestos: renderiza `kustomize build artifacts/production-overlay/generated` y corre `kubeconform -strict` sobre el YAML renderizado.
@@ -417,6 +422,7 @@ Pasos recomendados:
   - `allow_client_dry_run_fallback` (boolean, default `false`): solo para simulacion; si el server-side dry-run no puede contactar el API server y `apply_changes=false`, permite continuar sin el gate de `kubectl --dry-run=server`.
   - `namespace` (default `auth`): namespace destino para dry-run/apply/smoke.
 - Secret requerido: `KUBE_CONFIG_B64` (kubeconfig en base64 para autenticar `kubectl` en el cluster objetivo).
+- Secrets de runtime para generar manifiestos antes de deploy: mismos `PROD_AUTH_*` del workflow de promotion, incluyendo `PROD_AUTH_JWT_PRIVATE_KEY_PEM` y `PROD_AUTH_JWT_PUBLIC_KEY_PEM`.
 - Secuencia del workflow:
   - Instala tooling pineado (`kustomize`, `kubeconform`, `kubectl`, `cosign`).
   - Verifica firma keyless Cosign del digest.

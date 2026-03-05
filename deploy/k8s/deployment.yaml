@@ -96,8 +96,14 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 3
           volumeMounts:
+            - name: jwt-keys
+              mountPath: /var/run/secrets/auth/jwt
+              readOnly: true
             - name: tmp
               mountPath: /tmp
       volumes:
+        - name: jwt-keys
+          secret:
+            secretName: auth-jwt-keys
         - name: tmp
           emptyDir: {}

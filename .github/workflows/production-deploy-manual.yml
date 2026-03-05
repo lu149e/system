@@ -101,7 +101,7 @@ jobs:
           cosign version
 
       - name: Ensure deploy scripts are executable
-        run: chmod +x scripts/generate-production-overlay.sh scripts/generate-k8s-secret-manifest.sh scripts/validate-deploy-readiness.sh
+        run: chmod +x scripts/generate-production-overlay.sh scripts/generate-k8s-secret-manifest.sh scripts/generate-k8s-jwt-key-secret.sh scripts/validate-deploy-readiness.sh
 
       - name: Generate production secret manifest
         env:
@@ -116,7 +116,11 @@ jobs:
           SENDGRID_FROM_EMAIL: ${{ secrets.PROD_AUTH_SENDGRID_FROM_EMAIL }}
           VERIFY_EMAIL_URL_BASE: ${{ secrets.PROD_AUTH_VERIFY_EMAIL_URL_BASE }}
           PASSWORD_RESET_URL_BASE: ${{ secrets.PROD_AUTH_PASSWORD_RESET_URL_BASE }}
-        run: ./scripts/generate-k8s-secret-manifest.sh
+          JWT_PRIVATE_KEY_PEM: ${{ secrets.PROD_AUTH_JWT_PRIVATE_KEY_PEM }}
+          JWT_PUBLIC_KEY_PEM: ${{ secrets.PROD_AUTH_JWT_PUBLIC_KEY_PEM }}
+        run: |
+          ./scripts/generate-k8s-secret-manifest.sh
+          ./scripts/generate-k8s-jwt-key-secret.sh
 
       - name: Verify release signature (Cosign keyless)
         env:
@@ -153,6 +157,8 @@ jobs:
           mkdir -p artifacts/production-deploy
           kustomize build artifacts/production-overlay/generated \
             > artifacts/production-deploy/production-manifests.yaml
+          printf '\n---\n' >> artifacts/production-deploy/production-manifests.yaml
+          cat artifacts/production-secrets/auth-jwt-keys.yaml >> artifacts/production-deploy/production-manifests.yaml
           printf '\n---\n' >> artifacts/production-deploy/production-manifests.yaml
           cat artifacts/production-secrets/auth-api-secrets.yaml >> artifacts/production-deploy/production-manifests.yaml
 

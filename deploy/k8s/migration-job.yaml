@@ -26,6 +26,10 @@ spec:
                 name: auth-api-config
             - secretRef:
                 name: auth-api-secrets
+          volumeMounts:
+            - name: jwt-keys
+              mountPath: /var/run/secrets/auth/jwt
+              readOnly: true
           resources:
             requests:
               cpu: 100m
@@ -33,3 +37,7 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+      volumes:
+        - name: jwt-keys
+          secret:
+            secretName: auth-jwt-keys

@@ -11,14 +11,14 @@
 - Production overlay inputs finalized (ingress host/TLS, external DB/Redis CIDRs, digest-pinned image) and generated into `artifacts/production-overlay/generated/`.
 - GitHub Actions secret `KUBE_CONFIG_B64` configured with base64-encoded kubeconfig for the target cluster/namespace.
 - For manual production workflows, configure secret inputs as repository/environ secrets:
-  - required: `PROD_AUTH_DATABASE_URL`, `PROD_AUTH_REDIS_URL`, `PROD_AUTH_REFRESH_TOKEN_PEPPER`, `PROD_AUTH_MFA_ENCRYPTION_KEY_BASE64`, `PROD_AUTH_JWT_KEYSET`, `PROD_AUTH_JWT_PRIMARY_KID`
+  - required: `PROD_AUTH_DATABASE_URL`, `PROD_AUTH_REDIS_URL`, `PROD_AUTH_REFRESH_TOKEN_PEPPER`, `PROD_AUTH_MFA_ENCRYPTION_KEY_BASE64`, `PROD_AUTH_JWT_KEYSET`, `PROD_AUTH_JWT_PRIMARY_KID`, `PROD_AUTH_JWT_PRIVATE_KEY_PEM`, `PROD_AUTH_JWT_PUBLIC_KEY_PEM`
   - optional: `PROD_AUTH_METRICS_BEARER_TOKEN`, `PROD_AUTH_SENDGRID_API_KEY`, `PROD_AUTH_SENDGRID_FROM_EMAIL`, `PROD_AUTH_VERIFY_EMAIL_URL_BASE`, `PROD_AUTH_PASSWORD_RESET_URL_BASE`
 
 ## Required Environment Variables and Secrets
 
 Use `deploy/k8s/configmap.yaml` for non-secret runtime config.
 
-Do not apply `deploy/k8s/secret.template.yaml`; it is reference-only. Generate a concrete manifest with `scripts/generate-k8s-secret-manifest.sh`.
+Do not apply `deploy/k8s/secret.template.yaml`; it is reference-only. Generate concrete manifests with `scripts/generate-k8s-secret-manifest.sh` and `scripts/generate-k8s-jwt-key-secret.sh`.
 
 Required secret environment variables for `scripts/generate-k8s-secret-manifest.sh`:
 
@@ -27,6 +27,11 @@ Required secret environment variables for `scripts/generate-k8s-secret-manifest.
 - `REFRESH_TOKEN_PEPPER`
 - `MFA_ENCRYPTION_KEY_BASE64`
 - `JWT_KEYSET` and `JWT_PRIMARY_KID` (or legacy single-key variables)
+
+Required variables for `scripts/generate-k8s-jwt-key-secret.sh`:
+
+- `JWT_PRIVATE_KEY_PEM`
+- `JWT_PUBLIC_KEY_PEM`
 
 Optional variables (included only when set):
 
@@ -72,7 +77,11 @@ REFRESH_TOKEN_PEPPER='...' \
 MFA_ENCRYPTION_KEY_BASE64='...' \
 JWT_KEYSET='auth-ed25519-v2|/var/run/secrets/auth/jwt/v2-private.pem|/var/run/secrets/auth/jwt/v2-public.pem' \
 JWT_PRIMARY_KID='auth-ed25519-v2' \
+JWT_PRIVATE_KEY_PEM="$(cat /path/to/v2-private.pem)" \
+JWT_PUBLIC_KEY_PEM="$(cat /path/to/v2-public.pem)" \
 ./scripts/generate-k8s-secret-manifest.sh
+./scripts/generate-k8s-jwt-key-secret.sh
+kubectl apply -f artifacts/production-secrets/auth-jwt-keys.yaml
 kubectl apply -f artifacts/production-secrets/auth-api-secrets.yaml
 kubectl apply -f deploy/k8s/migration-job.yaml
 kubectl wait --for=condition=complete job/auth-api-migrate -n auth --timeout=10m
@@ -166,7 +175,10 @@ REFRESH_TOKEN_PEPPER='...' \
 MFA_ENCRYPTION_KEY_BASE64='...' \
 JWT_KEYSET='auth-ed25519-v2|/var/run/secrets/auth/jwt/v2-private.pem|/var/run/secrets/auth/jwt/v2-public.pem' \
 JWT_PRIMARY_KID='auth-ed25519-v2' \
+JWT_PRIVATE_KEY_PEM="$(cat /path/to/v2-private.pem)" \
+JWT_PUBLIC_KEY_PEM="$(cat /path/to/v2-public.pem)" \
 ./scripts/generate-k8s-secret-manifest.sh
+./scripts/generate-k8s-jwt-key-secret.sh
 ```
 
 6. Execute controlled deployment workflow (dry-run by default, apply only when explicit):
