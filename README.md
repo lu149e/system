@@ -344,6 +344,8 @@ EMAIL_OUTBOX_BACKOFF_MAX_MS=60000
   - `auth_passkey_requests_total{operation=register_start|register_finish|login_start|login_finish,outcome=success|error}`
   - `auth_passkey_login_rejected_total{reason=invalid_or_expired_challenge|account_not_active|passkey_not_registered|invalid_passkey_response|other}`
   - `auth_passkey_register_rejected_total{reason=invalid_or_expired_challenge|challenge_user_mismatch|account_not_active|invalid_passkey_response|other}`
+  - `auth_password_forgot_accepted_total{outcome=existing|existing_not_active|unknown|other}`
+  - `auth_password_reset_rejected_total{reason=weak_password|token_not_found|token_already_used|token_expired|user_not_found|account_not_active|other}`
   - `auth_passkey_challenge_janitor_enabled`
   - `auth_passkey_challenge_prune_interval_seconds`
   - `auth_passkey_challenge_prune_runs_total{outcome=success|error}`
@@ -352,6 +354,7 @@ EMAIL_OUTBOX_BACKOFF_MAX_MS=60000
   - `auth_passkey_challenge_pruned_total`
   - `auth_passkey_challenge_prune_errors_total`
   - `auth_login_risk_decisions_total{decision=allow|block|challenge,reason=...}`
+  - `auth_login_risk_penalty_total{profile=standard|elevated|aggressive,reason=...}`
   - `auth_refresh_rejected_total{reason=...}`
   - `auth_refresh_duration_seconds{outcome=...}`
   - `auth_problem_responses_total{status=...,type=...}`

@@ -108,7 +108,7 @@ jobs:
       KUBECONFORM_VERSION: "0.6.7"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install pinned promotion tooling
         run: |
