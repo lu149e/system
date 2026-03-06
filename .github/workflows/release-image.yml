@@ -69,7 +69,7 @@ jobs:
           output-file: artifacts/image-sbom/sbom.spdx.json
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: image-sbom-${{ github.run_id }}
           path: artifacts/image-sbom
@@ -99,7 +99,7 @@ jobs:
           printf '%s\n' 'ghcr.io/lu149e/system@${{ steps.build.outputs.digest }}' > artifacts/image-release/reference.txt
 
       - name: Upload release metadata artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: image-release-${{ github.run_id }}
           path: artifacts/image-release
