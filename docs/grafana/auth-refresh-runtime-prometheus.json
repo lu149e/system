@@ -297,6 +297,21 @@
           "expr": "sum(increase(auth_passkey_register_rejected_total[15m]))",
           "legendFormat": "passkey_register_rejected_last_15m",
           "refId": "N"
+        },
+        {
+          "expr": "sum(increase(auth_password_reset_rejected_total[15m]))",
+          "legendFormat": "password_reset_rejected_last_15m",
+          "refId": "O"
+        },
+        {
+          "expr": "sum(increase(auth_password_forgot_accepted_total{outcome=\"unknown\"}[15m]))",
+          "legendFormat": "password_forgot_unknown_last_15m",
+          "refId": "P"
+        },
+        {
+          "expr": "sum(increase(auth_login_risk_penalty_total[15m]))",
+          "legendFormat": "login_risk_penalty_units_last_15m",
+          "refId": "Q"
         }
       ],
       "title": "Current 15m Snapshot",
@@ -1109,6 +1124,85 @@
       ],
       "title": "Passkey Register Rejected Rate by Reason",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 120
+      },
+      "id": 27,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(auth_password_reset_rejected_total[5m]))",
+          "legendFormat": "reset_rejected {{reason}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (outcome) (rate(auth_password_forgot_accepted_total[5m]))",
+          "legendFormat": "forgot {{outcome}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Password Recovery Signals",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 128
+      },
+      "id": 28,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (profile, reason) (rate(auth_login_risk_penalty_total[5m]))",
+          "legendFormat": "{{profile}} {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Login Risk Penalty Units by Profile/Reason",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",
@@ -1131,6 +1225,6 @@
   "timezone": "browser",
   "title": "Auth Refresh Runtime Metrics",
   "uid": "auth-refresh-runtime-metrics",
-  "version": 11,
+  "version": 13,
   "weekStart": ""
 }
