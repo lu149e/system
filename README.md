@@ -626,6 +626,7 @@ Pasos recomendados:
 - Alcance real de esta API: solo PostgreSQL (`sqlx` con feature `postgres` + `default-features=false`).
 - Riesgo residual: bajo para este servicio (no se usa MySQL en runtime), pero debe revisarse al actualizar `sqlx`.
 - Dependabot queda configurado en `.github/dependabot.yml` para updates diarios de `cargo`, `github-actions` y `docker` (versiones + security advisories), con PRs agrupadas por tipo de cambio para reducir ruido operativo.
+- Auto-merge se aplica solo a updates `patch/minor` del ecosistema `github-actions` via `.github/workflows/dependabot-auto-merge.yml`; updates de runtime (`cargo`/`docker`) y cambios `major` quedan manuales para control de riesgo.
 
 ## Siguientes pasos
 

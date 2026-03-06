@@ -29,19 +29,31 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Enable auto-merge for patch/minor only
+      - name: Classify update risk
+        run: |
+          echo "ecosystem=${{ steps.metadata.outputs.package-ecosystem }}"
+          echo "update_type=${{ steps.metadata.outputs.update-type }}"
+          echo "dependency_type=${{ steps.metadata.outputs.dependency-type }}"
+
+      - name: Enable auto-merge for low-risk Actions updates
         if: >-
-          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
-          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+          steps.metadata.outputs.package-ecosystem == 'github-actions' &&
+          (
+            steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+            steps.metadata.outputs.update-type == 'version-update:semver-minor'
+          )
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: gh pr merge --auto --rebase "$PR_URL"
 
-      - name: Skip auto-merge for unsupported update types
+      - name: Skip auto-merge for runtime or high-risk updates
         if: >-
-          steps.metadata.outputs.update-type != 'version-update:semver-patch' &&
-          steps.metadata.outputs.update-type != 'version-update:semver-minor'
+          steps.metadata.outputs.package-ecosystem != 'github-actions' ||
+          (
+            steps.metadata.outputs.update-type != 'version-update:semver-patch' &&
+            steps.metadata.outputs.update-type != 'version-update:semver-minor'
+          )
         run: |
-          echo "Auto-merge skipped for update type: '${{ steps.metadata.outputs.update-type }}'"
-          echo "Only semver patch/minor updates are automatically merged."
+          echo "Auto-merge skipped for ecosystem='${{ steps.metadata.outputs.package-ecosystem }}', update-type='${{ steps.metadata.outputs.update-type }}'"
+          echo "Policy: only github-actions patch/minor updates are auto-merged."
