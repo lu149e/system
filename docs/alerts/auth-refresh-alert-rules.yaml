@@ -26,6 +26,10 @@ groups:
           /
           clamp_min(sum(rate(auth_login_risk_decisions_total[10m])), 0.0001)
 
+      - record: auth:login_risk_penalty_units_10m
+        expr: |
+          sum(increase(auth_login_risk_penalty_total[10m]))
+
       - record: auth:passkey_error_ratio_10m
         expr: |
           sum(rate(auth_passkey_requests_total{outcome="error"}[10m]))
@@ -43,6 +47,16 @@ groups:
           sum(rate(auth_passkey_register_rejected_total[10m]))
           /
           clamp_min(sum(rate(auth_passkey_requests_total{operation="register_finish"}[10m])), 0.0001)
+
+      - record: auth:password_reset_rejected_10m
+        expr: |
+          sum(increase(auth_password_reset_rejected_total[10m]))
+
+      - record: auth:password_forgot_unknown_ratio_10m
+        expr: |
+          sum(rate(auth_password_forgot_accepted_total{outcome="unknown"}[10m]))
+          /
+          clamp_min(sum(rate(auth_password_forgot_accepted_total[10m])), 0.0001)
 
       - record: auth:passkey_prune_errors_10m
         expr: |
@@ -172,6 +186,18 @@ groups:
           runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
           dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
 
+      - alert: AuthLoginRiskPenaltyUnitsSpike
+        expr: auth:login_risk_penalty_units_10m >= 150
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Login risk penalty units spike"
+          description: "Pico de unidades de penalizacion adaptativa en login risk. Revisar si el perfil `aggressive` domina y ajustar reglas para evitar lockouts excesivos por falsos positivos."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
       - alert: AuthPasskeyErrorRatioHigh
         expr: |
           auth:passkey_error_ratio_10m >= 0.2
@@ -266,6 +292,33 @@ groups:
         annotations:
           summary: "Passkey register challenge-user mismatch spike"
           description: "Pico de rechazos `challenge_user_mismatch` en passkey register finish. Revisar correlacion user/flow en clientes, sesiones cruzadas o anomalías de integracion front-end."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthPasswordResetRejectedSpike
+        expr: auth:password_reset_rejected_10m >= 20
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Password reset rejected spike"
+          description: "Pico sostenido de rechazos en password reset. Revisar razones dominantes (`token_not_found|expired|already_used|account_not_active`) y posible abuso de recovery flow."
+          runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthPasswordForgotUnknownRatioHigh
+        expr: |
+          auth:password_forgot_unknown_ratio_10m >= 0.6
+          and
+          sum(increase(auth_password_forgot_accepted_total[10m])) >= 30
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Password forgot unknown ratio high"
+          description: "La proporcion de forgot-password para emails desconocidos supera 60% con volumen relevante. Posible enumeracion o stuffing sobre flujo de recovery."
           runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
           dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
 

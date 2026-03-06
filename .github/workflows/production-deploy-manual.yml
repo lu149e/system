@@ -124,7 +124,7 @@ jobs:
       KUBECTL_VERSION: "1.30.6"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install pinned deployment tooling
         run: |
