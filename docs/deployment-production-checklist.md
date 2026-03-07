@@ -153,10 +153,10 @@ LOGIN_RISK_MODE='baseline' \
 STRICT_DEPLOY_VALIDATION=true ./scripts/validate-deploy-readiness.sh
 ```
 
-4. Prefer manual governance workflow to generate a promotion-ready artifact (no cluster apply):
+4. Prefer the unified manual governance workflow in dry-run mode before any cluster mutation:
 
 ```bash
-# GitHub Actions -> production-promotion-manual
+# GitHub Actions -> production-deploy-manual
 # Runner target:
 # - ubuntu-latest (default, hosted)
 # - self-hosted-auth-local (labels: self-hosted,linux,x64,auth-local)
@@ -178,14 +178,13 @@ STRICT_DEPLOY_VALIDATION=true ./scripts/validate-deploy-readiness.sh
 # - login_risk_challenge_cidrs (optional CSV)
 # - login_risk_challenge_user_agent_substrings (optional CSV)
 # - login_risk_challenge_email_domains (optional CSV)
+# - apply_changes=false (default)
 ```
 
    - Signature gate: verifies `ghcr.io/lu149e/system@<digest>` with Cosign keyless against GitHub OIDC issuer and release workflow identity.
    - Readiness gate: runs `scripts/generate-production-overlay.sh` and strict `scripts/validate-deploy-readiness.sh`.
-   - Manifest gate: renders `kustomize build` output and runs `kubeconform -strict`.
-    - Always uploads:
-      - `production-manifest-<run_id>` (`artifacts/production-promotion/production-manifests.yaml`)
-      - `production-promotion-evidence-<run_id>` (promotion logs + deploy readiness logs + generated overlay)
+   - Manifest gate: renders `kustomize build` output, runs `kubeconform -strict`, and performs `kubectl apply --dry-run=server`.
+   - Always uploads execution evidence even in dry-run mode.
 
 5. Generate concrete secret manifest for production deployment:
 
@@ -287,17 +286,12 @@ kubectl exec -it auth-api-pod-xxx -n auth -- sh -c 'nc -vz <redis-ip> 6379'
 
 - Local preflight (non-strict): `./scripts/validate-k8s-manifests.sh`
 - Local preflight (strict; fails if optional tools are missing): `STRICT_K8S_VALIDATION=true ./scripts/validate-k8s-manifests.sh`
-- Manual GitHub gate with artifacts/logs: `Actions -> k8s-manifest-validation-manual -> Run workflow`
-- `runner_target` soportado en workflow manual: `ubuntu-latest` o `self-hosted-auth-local`.
-- Workflow artifact path: `artifacts/k8s-manifest-validation/` (placeholder report, YAML/kustomize/kubeconform logs)
 - Generate production overlay: `IMAGE_DIGEST=... INGRESS_HOST=... TLS_SECRET_NAME=... POSTGRES_CIDR=... REDIS_CIDR=... ./scripts/generate-production-overlay.sh`
 - Deploy readiness gate (generated production overlay + digest policy): `./scripts/validate-deploy-readiness.sh`
 - Deploy readiness strict mode: `STRICT_DEPLOY_VALIDATION=true ./scripts/validate-deploy-readiness.sh`
-- Manual GitHub gate with artifacts/logs: `Actions -> deploy-readiness-validation-manual -> Run workflow`
+- Manual GitHub gate with artifacts/logs: `Actions -> production-deploy-manual -> Run workflow` with `apply_changes=false`
 - `runner_target` soportado en workflow manual: `ubuntu-latest` o `self-hosted-auth-local`.
-- Workflow artifact path: `artifacts/deploy-readiness/` (placeholder report, render log, digest policy report)
-- Production promotion workflow (no apply): `Actions -> production-promotion-manual -> Run workflow`
-- Promotion artifacts: `production-manifest-<run_id>` and `production-promotion-evidence-<run_id>`
+- Workflow artifacts: `production-deploy-manual-<run_id>` (render, readiness, kube dry-run, optional apply logs)
 
 ## Smoke Checks Post Deploy
 

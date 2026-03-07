@@ -16,6 +16,91 @@ pub struct User {
     pub status: UserStatus,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AccountStatus {
+    Active,
+    PendingVerification,
+    Locked,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountRecord {
+    pub id: String,
+    pub email: String,
+    pub status: AccountStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LegacyPasswordRecord {
+    pub user_id: String,
+    pub password_hash: String,
+    pub legacy_login_allowed: bool,
+    pub migrated_to_opaque_at: Option<DateTime<Utc>>,
+    pub last_legacy_verified_at: Option<DateTime<Utc>>,
+    pub legacy_deprecation_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OpaqueCredentialState {
+    Active,
+    Superseded,
+    Revoked,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpaqueCredentialRecord {
+    pub user_id: String,
+    pub protocol: String,
+    pub credential_blob: Vec<u8>,
+    pub server_key_ref: Option<String>,
+    pub envelope_kms_key_id: Option<String>,
+    pub state: OpaqueCredentialState,
+    pub migrated_from_legacy_at: Option<DateTime<Utc>>,
+    pub last_verified_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AuthFlowKind {
+    MethodsDiscovery,
+    PasswordLogin,
+    PasswordUpgrade,
+    PasskeyLogin,
+    PasskeyRegister,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AuthFlowStatus {
+    Pending,
+    Consumed,
+    Expired,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AuthFlowRecord {
+    pub flow_id: String,
+    pub subject_user_id: Option<String>,
+    pub subject_identifier_hash: Option<String>,
+    pub flow_kind: AuthFlowKind,
+    pub protocol: String,
+    pub state: serde_json::Value,
+    pub status: AuthFlowStatus,
+    pub rollout_channel: Option<String>,
+    pub fallback_policy: Option<String>,
+    pub trace_id: Option<String>,
+    pub issued_ip: Option<String>,
+    pub issued_user_agent: Option<String>,
+    pub attempt_count: u32,
+    pub expires_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VerificationTokenRecord {
     pub id: String,

@@ -6,11 +6,13 @@ use std::{collections::HashSet, net::IpAddr};
 pub struct AppConfig {
     pub bind_addr: String,
     pub auth_runtime: AuthRuntime,
+    pub auth_v2: AuthV2Config,
     pub enforce_secure_transport: bool,
     pub passkey_enabled: bool,
     pub passkey_rp_id: Option<String>,
     pub passkey_rp_origin: Option<String>,
     pub passkey_challenge_prune_interval_seconds: u64,
+    pub auth_v2_auth_flow_prune_interval_seconds: u64,
     pub metrics_bearer_token: Option<String>,
     pub metrics_allowed_cidrs: Vec<IpNet>,
     pub trust_x_forwarded_for: bool,
@@ -54,6 +56,35 @@ pub struct AppConfig {
     pub email_provider: EmailProviderConfig,
     pub email_delivery_mode: EmailDeliveryMode,
     pub email_outbox: EmailOutboxConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthV2Config {
+    pub enabled: bool,
+    pub methods_enabled: bool,
+    pub password_pake_enabled: bool,
+    pub password_upgrade_enabled: bool,
+    pub pake_provider: AuthV2PakeProvider,
+    pub opaque_server_setup: Option<String>,
+    pub opaque_server_key_ref: Option<String>,
+    pub passkey_namespace_enabled: bool,
+    pub auth_flows_enabled: bool,
+    pub legacy_fallback_mode: AuthV2LegacyFallbackMode,
+    pub client_allowlist: Vec<String>,
+    pub shadow_audit_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthV2PakeProvider {
+    Unavailable,
+    OpaqueKe,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthV2LegacyFallbackMode {
+    Disabled,
+    Allowlisted,
+    Broad,
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +174,58 @@ impl AppConfig {
         let auth_runtime = parse_auth_runtime(
             std::env::var("AUTH_RUNTIME").unwrap_or_else(|_| "postgres_redis".to_string()),
         )?;
+        let opaque_server_setup = resolve_optional_secret_from_env(
+            "AUTH_V2_OPAQUE_SERVER_SETUP",
+            std::env::var("AUTH_V2_OPAQUE_SERVER_SETUP").ok(),
+            "AUTH_V2_OPAQUE_SERVER_SETUP_FILE",
+            std::env::var("AUTH_V2_OPAQUE_SERVER_SETUP_FILE").ok(),
+        )?;
+        let auth_v2 = AuthV2Config {
+            enabled: std::env::var("AUTH_V2_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse::<bool>()
+                .context("AUTH_V2_ENABLED must be true or false")?,
+            methods_enabled: std::env::var("AUTH_V2_METHODS_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse::<bool>()
+                .context("AUTH_V2_METHODS_ENABLED must be true or false")?,
+            password_pake_enabled: std::env::var("AUTH_V2_PASSWORD_PAKE_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse::<bool>()
+                .context("AUTH_V2_PASSWORD_PAKE_ENABLED must be true or false")?,
+            password_upgrade_enabled: std::env::var("AUTH_V2_PASSWORD_UPGRADE_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse::<bool>()
+                .context("AUTH_V2_PASSWORD_UPGRADE_ENABLED must be true or false")?,
+            pake_provider: parse_auth_v2_pake_provider(
+                std::env::var("AUTH_V2_PAKE_PROVIDER")
+                    .unwrap_or_else(|_| "unavailable".to_string()),
+            )?,
+            opaque_server_setup,
+            opaque_server_key_ref: std::env::var("AUTH_V2_OPAQUE_SERVER_KEY_REF")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            passkey_namespace_enabled: std::env::var("AUTH_V2_PASSKEY_NAMESPACE_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse::<bool>()
+                .context("AUTH_V2_PASSKEY_NAMESPACE_ENABLED must be true or false")?,
+            auth_flows_enabled: std::env::var("AUTH_V2_AUTH_FLOWS_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse::<bool>()
+                .context("AUTH_V2_AUTH_FLOWS_ENABLED must be true or false")?,
+            legacy_fallback_mode: parse_auth_v2_legacy_fallback_mode(
+                std::env::var("AUTH_V2_LEGACY_FALLBACK_MODE")
+                    .unwrap_or_else(|_| "disabled".to_string()),
+            )?,
+            client_allowlist: parse_csv_non_empty_values(
+                std::env::var("AUTH_V2_CLIENT_ALLOWLIST").unwrap_or_default(),
+            ),
+            shadow_audit_only: std::env::var("AUTH_V2_SHADOW_AUDIT_ONLY")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse::<bool>()
+                .context("AUTH_V2_SHADOW_AUDIT_ONLY must be true or false")?,
+        };
         let allow_insecure_inmemory = std::env::var("ALLOW_INSECURE_INMEMORY")
             .unwrap_or_else(|_| "false".to_string())
             .parse::<bool>()
@@ -180,6 +263,11 @@ impl AppConfig {
             std::env::var("PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS").ok(),
             60,
             "PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS",
+        )?;
+        let auth_v2_auth_flow_prune_interval_seconds = parse_positive_u64_with_default(
+            std::env::var("AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS").ok(),
+            60,
+            "AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS",
         )?;
         let trusted_proxy_ips =
             parse_trusted_proxy_ips(std::env::var("TRUSTED_PROXY_IPS").unwrap_or_default())?;
@@ -470,11 +558,13 @@ impl AppConfig {
         Ok(Self {
             bind_addr,
             auth_runtime,
+            auth_v2,
             enforce_secure_transport,
             passkey_enabled,
             passkey_rp_id,
             passkey_rp_origin,
             passkey_challenge_prune_interval_seconds,
+            auth_v2_auth_flow_prune_interval_seconds,
             metrics_bearer_token,
             metrics_allowed_cidrs,
             trust_x_forwarded_for,
@@ -714,6 +804,25 @@ fn parse_login_risk_mode(value: String) -> Result<LoginRiskMode> {
         "allow_all" => Ok(LoginRiskMode::AllowAll),
         "baseline" => Ok(LoginRiskMode::Baseline),
         _ => anyhow::bail!("LOGIN_RISK_MODE must be one of: allow_all, baseline"),
+    }
+}
+
+fn parse_auth_v2_legacy_fallback_mode(value: String) -> Result<AuthV2LegacyFallbackMode> {
+    match value.to_ascii_lowercase().as_str() {
+        "disabled" => Ok(AuthV2LegacyFallbackMode::Disabled),
+        "allowlisted" => Ok(AuthV2LegacyFallbackMode::Allowlisted),
+        "broad" => Ok(AuthV2LegacyFallbackMode::Broad),
+        _ => anyhow::bail!(
+            "AUTH_V2_LEGACY_FALLBACK_MODE must be one of: disabled, allowlisted, broad"
+        ),
+    }
+}
+
+fn parse_auth_v2_pake_provider(value: String) -> Result<AuthV2PakeProvider> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "unavailable" => Ok(AuthV2PakeProvider::Unavailable),
+        "opaque_ke" => Ok(AuthV2PakeProvider::OpaqueKe),
+        _ => anyhow::bail!("AUTH_V2_PAKE_PROVIDER must be one of: unavailable, opaque_ke"),
     }
 }
 
@@ -1103,12 +1212,14 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        database_url_uses_secure_transport, parse_email_delivery_mode, parse_email_provider_config,
+        database_url_uses_secure_transport, parse_auth_v2_legacy_fallback_mode,
+        parse_auth_v2_pake_provider, parse_email_delivery_mode, parse_email_provider_config,
         parse_login_risk_blocked_cidrs, parse_login_risk_challenge_cidrs, parse_login_risk_mode,
         parse_metrics_allowed_cidrs, parse_positive_u64_with_default,
         redis_url_uses_secure_transport, resolve_jwt_key_configuration,
         resolve_optional_secret_from_env, validate_backend_transport_security, AuthRuntime,
-        EmailDeliveryMode, EmailProviderConfig, LoginRiskMode,
+        AuthV2LegacyFallbackMode, AuthV2PakeProvider, EmailDeliveryMode, EmailProviderConfig,
+        LoginRiskMode,
     };
 
     #[test]
@@ -1151,6 +1262,57 @@ mod tests {
         assert!(error
             .to_string()
             .contains("LOGIN_RISK_MODE must be one of: allow_all, baseline"));
+    }
+
+    #[test]
+    fn parse_auth_v2_legacy_fallback_mode_accepts_supported_values() {
+        assert_eq!(
+            parse_auth_v2_legacy_fallback_mode("disabled".to_string())
+                .expect("disabled should parse"),
+            AuthV2LegacyFallbackMode::Disabled
+        );
+        assert_eq!(
+            parse_auth_v2_legacy_fallback_mode("allowlisted".to_string())
+                .expect("allowlisted should parse"),
+            AuthV2LegacyFallbackMode::Allowlisted
+        );
+        assert_eq!(
+            parse_auth_v2_legacy_fallback_mode("broad".to_string()).expect("broad should parse"),
+            AuthV2LegacyFallbackMode::Broad
+        );
+    }
+
+    #[test]
+    fn parse_auth_v2_legacy_fallback_mode_rejects_unknown_value() {
+        let error = parse_auth_v2_legacy_fallback_mode("open".to_string())
+            .expect_err("unknown fallback mode should fail");
+
+        assert!(error
+            .to_string()
+            .contains("AUTH_V2_LEGACY_FALLBACK_MODE must be one of: disabled, allowlisted, broad"));
+    }
+
+    #[test]
+    fn parse_auth_v2_pake_provider_accepts_supported_values() {
+        assert_eq!(
+            parse_auth_v2_pake_provider("unavailable".to_string())
+                .expect("unavailable should parse"),
+            AuthV2PakeProvider::Unavailable
+        );
+        assert_eq!(
+            parse_auth_v2_pake_provider("opaque_ke".to_string()).expect("opaque_ke should parse"),
+            AuthV2PakeProvider::OpaqueKe
+        );
+    }
+
+    #[test]
+    fn parse_auth_v2_pake_provider_rejects_unknown_value() {
+        let error = parse_auth_v2_pake_provider("magic".to_string())
+            .expect_err("unknown pake provider should fail");
+
+        assert!(error
+            .to_string()
+            .contains("AUTH_V2_PAKE_PROVIDER must be one of: unavailable, opaque_ke"));
     }
 
     #[test]

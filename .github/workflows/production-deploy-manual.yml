@@ -234,12 +234,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts/production-deploy
-          kustomize build artifacts/production-overlay/generated \
-            > artifacts/production-deploy/production-manifests.yaml
-          printf '\n---\n' >> artifacts/production-deploy/production-manifests.yaml
-          cat artifacts/production-secrets/auth-jwt-keys.yaml >> artifacts/production-deploy/production-manifests.yaml
-          printf '\n---\n' >> artifacts/production-deploy/production-manifests.yaml
-          cat artifacts/production-secrets/auth-api-secrets.yaml >> artifacts/production-deploy/production-manifests.yaml
+          {
+            kustomize build artifacts/production-overlay/generated
+            printf '\n---\n'
+            cat artifacts/production-secrets/auth-jwt-keys.yaml
+            printf '\n---\n'
+            cat artifacts/production-secrets/auth-api-secrets.yaml
+          } > artifacts/production-deploy/production-manifests.yaml
 
       - name: Validate rendered manifests with kubeconform (strict)
         run: |

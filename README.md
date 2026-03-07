@@ -384,11 +384,8 @@ EMAIL_OUTBOX_BACKOFF_MAX_MS=60000
 - Tooling de rollout para compliance de `outbox_replay_audit` (inspect/remediate/validate/status): `scripts/outbox-replay-audit-compliance-tool.sh`.
 - Workflow manual para gate/auditoria de compliance: `.github/workflows/replay-audit-compliance-manual.yml`.
 - Workflow manual para smoke test de tooling operativo: `.github/workflows/ops-tooling-smoke-manual.yml`.
-- Workflow manual para validacion de manifiestos K8s: `.github/workflows/k8s-manifest-validation-manual.yml`.
-- Workflow manual para validacion de deploy readiness: `.github/workflows/deploy-readiness-validation-manual.yml`.
-- Workflow manual de promocion productiva (firma + readiness + render + schema): `.github/workflows/production-promotion-manual.yml`.
 - Workflow manual de deploy controlado a produccion (dry-run por defecto + apply opcional): `.github/workflows/production-deploy-manual.yml`.
-- Los workflows manuales `k8s-manifest-validation-manual` y `deploy-readiness-validation-manual` instalan versiones pineadas de `kustomize` y `kubeconform`, por lo que `strict_validation=true` queda soportado end-to-end tanto en runners hospedados como self-hosted.
+- Los workflows manuales redundantes de validacion/promocion se eliminaron; `production-deploy-manual` queda como gate unificado de firma, readiness, schema y deploy con `apply_changes=false|true`.
 - Snippets SQL parametrizados para el rollout de compliance: `scripts/sql/outbox-replay-audit-compliance-queries.sql`.
 - Snippets SQL DBA para verificar guardas append-only y smoke tests de rechazo: `scripts/sql/outbox-replay-audit-append-only-queries.sql`.
 - El comando `requeue` registra auditoria persistente en `outbox_replay_audit` tanto en dry-run como en apply (incluye actor, ticket, filtros, scope y conteos).
@@ -411,6 +408,7 @@ EMAIL_OUTBOX_BACKOFF_MAX_MS=60000
 - Baseline ingress is hostless (`deploy/k8s/ingress.yaml`); set host/TLS in your environment overlay.
 - Baseline network policy uses selector-based egress for in-cluster `postgres`/`redis` plus DNS; for external endpoints, add overlay egress rules instead of loosening baseline.
 - Gate de validacion de manifiestos K8s para pre-deploy/manual CI: `scripts/validate-k8s-manifests.sh`.
+- Gate unificado de GitHub para produccion: `production-deploy-manual` cubre firma, readiness, schema validation y cluster dry-run/apply.
 - Generador de secret JWT (PEM -> `auth-jwt-keys`): `scripts/generate-k8s-jwt-key-secret.sh`.
 - Checklist de despliegue productivo (pre, migrate, smoke, rollback, observabilidad): `docs/deployment-production-checklist.md`.
 
@@ -442,37 +440,6 @@ Pasos recomendados:
 5. Parchear manifiestos de baseline a digest inmutable:
    - `sed -i 's|ghcr.io/lu149e/system:[^[:space:]]*|ghcr.io/lu149e/system@sha256:TU_DIGEST|g' deploy/k8s/deployment.yaml deploy/k8s/migration-job.yaml`
 6. Validar render y aplicar con tu pipeline de despliegue.
-
-### Workflow manual: promotion artifact para produccion (sin apply)
-
-- Ejecutar: `Actions -> production-promotion-manual -> Run workflow`.
-- Input `runner_target`:
-  - `ubuntu-latest` (default): runner hospedado de GitHub.
-  - `self-hosted-auth-local`: runner self-hosted con labels `self-hosted,linux,x64,auth-local`.
-- Inputs obligatorios: `image_digest`, `ingress_host`, `tls_secret_name`, `postgres_cidr`, `redis_cidr`.
-- Inputs de seguridad runtime (opcionales, default `true`):
-  - `enforce_database_tls`
-  - `enforce_redis_tls`
-  - `enforce_secure_transport`
-- Inputs de riesgo login (runtime):
-  - `login_risk_mode` (`allow_all` o `baseline`, default `baseline`)
-  - `login_risk_blocked_cidrs` (CSV opcional)
-  - `login_risk_blocked_user_agent_substrings` (CSV opcional)
-  - `login_risk_blocked_email_domains` (CSV opcional)
-  - `login_risk_challenge_cidrs` (CSV opcional)
-  - `login_risk_challenge_user_agent_substrings` (CSV opcional)
-  - `login_risk_challenge_email_domains` (CSV opcional)
-- Secrets requeridos para generar manifiestos de runtime:
-  - `PROD_AUTH_DATABASE_URL`, `PROD_AUTH_REDIS_URL`, `PROD_AUTH_REFRESH_TOKEN_PEPPER`, `PROD_AUTH_MFA_ENCRYPTION_KEY_BASE64`, `PROD_AUTH_JWT_KEYSET`, `PROD_AUTH_JWT_PRIMARY_KID`.
-  - `PROD_AUTH_JWT_PRIVATE_KEY_PEM`, `PROD_AUTH_JWT_PUBLIC_KEY_PEM` (para generar `auth-jwt-keys`).
-  - Opcionales: `PROD_AUTH_METRICS_BEARER_TOKEN`, `PROD_AUTH_SENDGRID_API_KEY`, `PROD_AUTH_SENDGRID_FROM_EMAIL`, `PROD_AUTH_VERIFY_EMAIL_URL_BASE`, `PROD_AUTH_PASSWORD_RESET_URL_BASE`.
-- Gate de firma: valida keyless Cosign para `ghcr.io/lu149e/system@<digest>` con issuer `https://token.actions.githubusercontent.com` e identidad del workflow `release-image.yml` en `refs/heads/main` o `refs/tags/*`.
-- Gate de readiness: ejecuta `scripts/generate-production-overlay.sh` y luego `scripts/validate-deploy-readiness.sh` en modo estricto (`STRICT_DEPLOY_VALIDATION=true`).
-- Gate de manifiestos: renderiza `kustomize build artifacts/production-overlay/generated` y corre `kubeconform -strict` sobre el YAML renderizado.
-- Artifacts publicados siempre:
-  - `production-manifest-<run_id>` con `artifacts/production-promotion/production-manifests.yaml`.
-  - `production-promotion-evidence-<run_id>` con logs/evidencia (`artifacts/production-promotion/`, `artifacts/deploy-readiness/` y overlay generado).
-- Alcance intencional: este workflow NO aplica al cluster ni requiere credenciales de Kubernetes.
 
 ### Workflow manual: controlled deploy a produccion (dry-run default, apply opcional)
 

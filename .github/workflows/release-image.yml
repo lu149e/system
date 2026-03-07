@@ -11,14 +11,20 @@ on:
     tags:
       - "v*"
 
+concurrency:
+  group: release-image-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
   packages: write
   id-token: write
+  attestations: write
 
 jobs:
   build-push:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
       digest: ${{ steps.build.outputs.digest }}
       tags: ${{ steps.meta.outputs.tags }}
@@ -89,6 +95,13 @@ jobs:
         id: sign
         run: |
           cosign sign --yes ghcr.io/lu149e/system@${{ steps.build.outputs.digest }}
+
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ghcr.io/lu149e/system
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
       - name: Persist release metadata
         run: |

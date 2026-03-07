@@ -1,9 +1,16 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use webauthn_rs::prelude::{Passkey, PasskeyAuthentication, PasskeyRegistration};
+use serde_json::Value;
+use uuid::Uuid;
+use webauthn_rs::prelude::{
+    AuthenticationResult, CreationChallengeResponse, CredentialID, Passkey, PasskeyAuthentication,
+    PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
+    RequestChallengeResponse,
+};
 
 use crate::modules::auth::domain::{
-    EmailOutboxMessage, EmailOutboxPayload, EmailTemplate, MfaChallengeRecord, MfaFactorRecord,
+    AccountRecord, AuthFlowRecord, EmailOutboxMessage, EmailOutboxPayload, EmailTemplate,
+    LegacyPasswordRecord, MfaChallengeRecord, MfaFactorRecord, OpaqueCredentialRecord,
     PasswordResetTokenRecord, User, VerificationTokenRecord,
 };
 
@@ -23,6 +30,203 @@ pub trait UserRepository: Send + Sync {
         password_hash: &str,
         now: DateTime<Utc>,
     ) -> Result<(), String>;
+}
+
+#[async_trait]
+pub trait AccountRepository: Send + Sync {
+    async fn find_by_email(&self, email: &str) -> Option<AccountRecord>;
+    async fn find_by_id(&self, user_id: &str) -> Option<AccountRecord>;
+    async fn create_pending(
+        &self,
+        email: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<AccountRecord>, String>;
+    async fn activate(&self, user_id: &str, now: DateTime<Utc>) -> Result<(), String>;
+}
+
+#[async_trait]
+pub trait LegacyPasswordRepository: Send + Sync {
+    async fn find_by_user_id(&self, user_id: &str) -> Result<Option<LegacyPasswordRecord>, String>;
+    async fn upsert_hash(
+        &self,
+        user_id: &str,
+        password_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), String>;
+    async fn mark_verified(&self, user_id: &str, now: DateTime<Utc>) -> Result<(), String>;
+    async fn set_legacy_login_allowed(
+        &self,
+        user_id: &str,
+        allowed: bool,
+        now: DateTime<Utc>,
+    ) -> Result<(), String>;
+}
+
+#[async_trait]
+pub trait OpaqueCredentialRepository: Send + Sync {
+    async fn find_by_user_id(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<OpaqueCredentialRecord>, String>;
+    async fn upsert_for_user(&self, record: OpaqueCredentialRecord) -> Result<(), String>;
+    async fn mark_verified(&self, user_id: &str, now: DateTime<Utc>) -> Result<(), String>;
+    async fn revoke_for_user(&self, user_id: &str, now: DateTime<Utc>) -> Result<(), String>;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AuthFlowConsumeState {
+    Active(Box<AuthFlowRecord>),
+    NotFound,
+    AlreadyConsumed,
+    Expired,
+    Cancelled,
+}
+
+#[allow(dead_code)]
+#[async_trait]
+pub trait AuthFlowRepository: Send + Sync {
+    async fn issue(&self, flow: AuthFlowRecord) -> Result<(), String>;
+    async fn consume(
+        &self,
+        flow_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<AuthFlowConsumeState, String>;
+    async fn increment_attempts(&self, flow_id: &str, now: DateTime<Utc>) -> Result<(), String>;
+    async fn cancel_active_for_subject(
+        &self,
+        subject_user_id: Option<&str>,
+        subject_identifier_hash: Option<&str>,
+        flow_kind: &str,
+        now: DateTime<Utc>,
+    ) -> Result<u64, String>;
+    async fn prune_expired(&self, now: DateTime<Utc>) -> Result<u64, String>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum AuthMethodKind {
+    PasswordPake,
+    PasswordUpgrade,
+    Passkey,
+    LegacyPassword,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthMethodDescriptor {
+    pub kind: AuthMethodKind,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct AuthMethodDiscoveryRequest {
+    pub identifier: String,
+    pub client_id: Option<String>,
+    pub supports_passkeys: bool,
+    pub supports_pake: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct AuthMethodDiscoveryResult {
+    pub discovery_token: String,
+    pub recommended_method: Option<AuthMethodKind>,
+    pub methods: Vec<AuthMethodDescriptor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PakeLoginCredentialView {
+    pub user_id: Option<String>,
+    pub opaque_credential: Option<Vec<u8>>,
+    pub legacy_password_allowed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PakeStartRequest {
+    pub flow_id: String,
+    pub request: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PakeStartResult {
+    pub response: Value,
+    pub server_state: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PakeRegistrationStartRequest {
+    pub flow_id: String,
+    pub user_id: String,
+    pub request: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PakeRegistrationFinishResult {
+    pub credential_blob: Vec<u8>,
+    pub server_key_ref: Option<String>,
+    pub envelope_kms_key_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PakeFinishResult {
+    pub session_user_id: String,
+    pub session_device_info: Option<String>,
+}
+
+#[async_trait]
+pub trait PasswordPakeService: Send + Sync {
+    async fn start_login(
+        &self,
+        credential: PakeLoginCredentialView,
+        request: PakeStartRequest,
+    ) -> Result<PakeStartResult, String>;
+    async fn finish_login(
+        &self,
+        server_state: Value,
+        client_message: Value,
+    ) -> Result<PakeFinishResult, String>;
+    async fn start_registration(
+        &self,
+        request: PakeRegistrationStartRequest,
+    ) -> Result<PakeStartResult, String>;
+    async fn finish_registration(
+        &self,
+        server_state: Value,
+        client_message: Value,
+    ) -> Result<PakeRegistrationFinishResult, String>;
+}
+
+pub trait PasskeyService: Send + Sync {
+    fn start_registration(
+        &self,
+        user_unique_id: Uuid,
+        user_name: &str,
+        user_display_name: &str,
+        exclude_credentials: Option<Vec<CredentialID>>,
+    ) -> Result<(CreationChallengeResponse, PasskeyRegistration), String>;
+    fn finish_registration(
+        &self,
+        credential: &RegisterPublicKeyCredential,
+        state: &PasskeyRegistration,
+    ) -> Result<Passkey, String>;
+    fn start_authentication(
+        &self,
+        passkeys: &[Passkey],
+    ) -> Result<(RequestChallengeResponse, PasskeyAuthentication), String>;
+    fn finish_authentication(
+        &self,
+        credential: &PublicKeyCredential,
+        state: &PasskeyAuthentication,
+    ) -> Result<AuthenticationResult, String>;
+}
+
+#[allow(dead_code)]
+#[async_trait]
+pub trait AuthMethodDiscoveryService: Send + Sync {
+    async fn discover(
+        &self,
+        request: AuthMethodDiscoveryRequest,
+    ) -> Result<AuthMethodDiscoveryResult, String>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

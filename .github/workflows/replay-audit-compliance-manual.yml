@@ -105,9 +105,11 @@ jobs:
             cat "${log_out}"
           fi
 
-          echo "status_exit_code=${exit_code}" >> "${GITHUB_OUTPUT}"
-          echo "status_json_path=${json_out}" >> "${GITHUB_OUTPUT}"
-          echo "status_log_path=${log_out}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "status_exit_code=${exit_code}"
+            echo "status_json_path=${json_out}"
+            echo "status_log_path=${log_out}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Upload replay-audit compliance artifact
         if: always()

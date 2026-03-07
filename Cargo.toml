@@ -34,3 +34,7 @@ prometheus = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 webauthn-rs = { version = "0.5.4", default-features = false, features = ["danger-allow-state-serialisation"] }
 openssl = { version = "0.10", features = ["vendored"] }
+opaque-ke = { version = "4.1.0-pre.1", features = ["argon2"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
