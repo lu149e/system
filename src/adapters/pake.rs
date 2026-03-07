@@ -1,4 +1,3 @@
-use anyhow::Context;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use opaque_ke::{
@@ -9,7 +8,7 @@ use opaque_ke::{
 use serde_json::{json, Value};
 
 use crate::{
-    config::{AppConfig, AuthRuntime, AuthV2PakeProvider},
+    config::AuthV2PakeProvider,
     modules::auth::ports::{
         PakeFinishResult, PakeLoginCredentialView, PakeRegistrationFinishResult,
         PakeRegistrationStartRequest, PakeStartRequest, PakeStartResult, PasswordPakeService,
@@ -32,27 +31,23 @@ impl CipherSuite for OpaqueCipherSuite {
 }
 
 pub fn build_password_pake_service(
-    cfg: &AppConfig,
+    pake_provider: AuthV2PakeProvider,
+    opaque_server_setup: Option<&str>,
+    opaque_server_key_ref: Option<String>,
 ) -> anyhow::Result<std::sync::Arc<dyn PasswordPakeService>> {
-    match cfg.auth_v2.pake_provider {
+    match pake_provider {
         AuthV2PakeProvider::Unavailable => Ok(std::sync::Arc::new(UnavailablePasswordPakeService)),
         AuthV2PakeProvider::OpaqueKe => {
-            let serialized_setup = cfg
-                .auth_v2
-                .opaque_server_setup
-                .as_deref()
-                .context(
-                    "AUTH_V2_OPAQUE_SERVER_SETUP or AUTH_V2_OPAQUE_SERVER_SETUP_FILE is required when AUTH_V2_PAKE_PROVIDER=opaque_ke",
-                )?;
+            let serialized_setup = opaque_server_setup.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "opaque-ke server setup is required when AUTH_V2_PAKE_PROVIDER=opaque_ke"
+                )
+            })?;
 
             let service = OpaqueKePasswordPakeService::from_base64_server_setup(
                 serialized_setup,
-                cfg.auth_v2.opaque_server_key_ref.clone(),
+                opaque_server_key_ref,
             )?;
-
-            if cfg.auth_runtime == AuthRuntime::InMemory {
-                tracing::warn!("using opaque-ke PAKE with in-memory auth runtime");
-            }
 
             Ok(std::sync::Arc::new(service))
         }
@@ -108,11 +103,9 @@ impl OpaqueKePasswordPakeService {
         server_key_ref: Option<String>,
     ) -> anyhow::Result<Self> {
         let setup_bytes = decode_base64url(encoded_setup)
-            .context("AUTH_V2_OPAQUE_SERVER_SETUP must be valid base64url")?;
-        let server_setup =
-            ServerSetup::<OpaqueCipherSuite>::deserialize(&setup_bytes).map_err(|_| {
-                anyhow::anyhow!("AUTH_V2_OPAQUE_SERVER_SETUP is not a valid opaque-ke server setup")
-            })?;
+            .map_err(|_| anyhow::anyhow!("opaque-ke server setup must be valid base64url"))?;
+        let server_setup = ServerSetup::<OpaqueCipherSuite>::deserialize(&setup_bytes)
+            .map_err(|_| anyhow::anyhow!("opaque-ke server setup is invalid"))?;
 
         Ok(Self {
             server_setup,

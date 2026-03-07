@@ -342,7 +342,11 @@ async fn main() -> anyhow::Result<()> {
     ) = match cfg.auth_runtime {
         AuthRuntime::PostgresRedis => {
             let pg = PostgresAdapters::bootstrap(&cfg).await?;
-            let pake_service = build_password_pake_service(&cfg)?;
+            let pake_service = build_password_pake_service(
+                cfg.auth_v2.pake_provider,
+                cfg.auth_v2.opaque_server_setup.as_deref(),
+                cfg.auth_v2.opaque_server_key_ref.clone(),
+            )?;
             let redis = RedisLoginAbuseProtector::new(
                 &cfg.redis_url,
                 cfg.login_max_attempts,
