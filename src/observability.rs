@@ -4,20 +4,25 @@ use std::{
 };
 
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
-    Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 
-use crate::modules::auth::application::AuthError;
+use crate::modules::auth::{application::AuthError, ports::AuthFlowMetricsSnapshot};
 
 struct MetricsRegistry {
     registry: Registry,
     login_risk_decisions_total: IntCounterVec,
     login_risk_penalty_total: IntCounterVec,
     auth_v2_methods_requests_total: IntCounterVec,
+    auth_v2_methods_rejected_total: IntCounterVec,
+    auth_v2_methods_duration_seconds: HistogramVec,
     auth_v2_password_start_requests_total: IntCounterVec,
+    auth_v2_password_start_duration_seconds: HistogramVec,
     auth_v2_password_finish_requests_total: IntCounterVec,
+    auth_v2_password_finish_duration_seconds: HistogramVec,
     auth_v2_password_upgrade_requests_total: IntCounterVec,
+    auth_v2_password_upgrade_duration_seconds: HistogramVec,
     auth_v2_password_rejected_total: IntCounterVec,
     auth_v2_legacy_fallback_total: IntCounterVec,
     passkey_requests_total: IntCounterVec,
@@ -39,6 +44,9 @@ struct MetricsRegistry {
     auth_v2_auth_flow_prune_last_failure_unixtime: IntGauge,
     auth_v2_auth_flow_pruned_total: IntCounter,
     auth_v2_auth_flow_prune_errors_total: IntCounter,
+    auth_v2_auth_flows_active: IntGaugeVec,
+    auth_v2_auth_flows_expired_pending_total: IntGauge,
+    auth_v2_auth_flows_oldest_expired_pending_age_seconds: IntGauge,
     refresh_requests_total: IntCounterVec,
     refresh_rejected_total: IntCounterVec,
     refresh_duration_seconds: HistogramVec,
@@ -96,6 +104,24 @@ impl MetricsRegistry {
         )
         .expect("auth v2 methods requests metric should initialize");
 
+        let auth_v2_methods_rejected_total = IntCounterVec::new(
+            Opts::new(
+                "auth_v2_methods_rejected_total",
+                "Total auth v2 method discovery rejections partitioned by reason",
+            ),
+            &["reason"],
+        )
+        .expect("auth v2 methods rejected metric should initialize");
+
+        let auth_v2_methods_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "auth_v2_methods_duration_seconds",
+                "Auth v2 method discovery latency in seconds partitioned by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("auth v2 methods duration metric should initialize");
+
         let auth_v2_password_start_requests_total = IntCounterVec::new(
             Opts::new(
                 "auth_v2_password_start_requests_total",
@@ -104,6 +130,15 @@ impl MetricsRegistry {
             &["outcome", "channel"],
         )
         .expect("auth v2 password start requests metric should initialize");
+
+        let auth_v2_password_start_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "auth_v2_password_start_duration_seconds",
+                "Auth v2 password login start latency in seconds partitioned by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("auth v2 password start duration metric should initialize");
 
         let auth_v2_password_finish_requests_total = IntCounterVec::new(
             Opts::new(
@@ -114,6 +149,15 @@ impl MetricsRegistry {
         )
         .expect("auth v2 password finish requests metric should initialize");
 
+        let auth_v2_password_finish_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "auth_v2_password_finish_duration_seconds",
+                "Auth v2 password login finish latency in seconds partitioned by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("auth v2 password finish duration metric should initialize");
+
         let auth_v2_password_upgrade_requests_total = IntCounterVec::new(
             Opts::new(
                 "auth_v2_password_upgrade_requests_total",
@@ -122,6 +166,15 @@ impl MetricsRegistry {
             &["operation", "outcome"],
         )
         .expect("auth v2 password upgrade requests metric should initialize");
+
+        let auth_v2_password_upgrade_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "auth_v2_password_upgrade_duration_seconds",
+                "Auth v2 password upgrade latency in seconds partitioned by operation and outcome",
+            ),
+            &["operation", "outcome"],
+        )
+        .expect("auth v2 password upgrade duration metric should initialize");
 
         let auth_v2_password_rejected_total = IntCounterVec::new(
             Opts::new(
@@ -276,6 +329,27 @@ impl MetricsRegistry {
         )
         .expect("auth flow prune errors metric should initialize");
 
+        let auth_v2_auth_flows_active = IntGaugeVec::new(
+            Opts::new(
+                "auth_v2_auth_flows_active",
+                "Current active auth v2 auth flows partitioned by flow kind",
+            ),
+            &["flow_kind"],
+        )
+        .expect("auth flow active gauge should initialize");
+
+        let auth_v2_auth_flows_expired_pending_total = IntGauge::new(
+            "auth_v2_auth_flows_expired_pending_total",
+            "Current expired pending auth v2 auth flows awaiting janitor cleanup",
+        )
+        .expect("auth flow expired backlog gauge should initialize");
+
+        let auth_v2_auth_flows_oldest_expired_pending_age_seconds = IntGauge::new(
+            "auth_v2_auth_flows_oldest_expired_pending_age_seconds",
+            "Age in seconds of the oldest expired pending auth v2 auth flow awaiting janitor cleanup",
+        )
+        .expect("auth flow oldest expired backlog gauge should initialize");
+
         let refresh_rejected_total = IntCounterVec::new(
             Opts::new(
                 "auth_refresh_rejected_total",
@@ -398,14 +472,29 @@ impl MetricsRegistry {
             .register(Box::new(auth_v2_methods_requests_total.clone()))
             .expect("auth v2 methods requests metric should register");
         registry
+            .register(Box::new(auth_v2_methods_rejected_total.clone()))
+            .expect("auth v2 methods rejected metric should register");
+        registry
+            .register(Box::new(auth_v2_methods_duration_seconds.clone()))
+            .expect("auth v2 methods duration metric should register");
+        registry
             .register(Box::new(auth_v2_password_start_requests_total.clone()))
             .expect("auth v2 password start requests metric should register");
+        registry
+            .register(Box::new(auth_v2_password_start_duration_seconds.clone()))
+            .expect("auth v2 password start duration metric should register");
         registry
             .register(Box::new(auth_v2_password_finish_requests_total.clone()))
             .expect("auth v2 password finish requests metric should register");
         registry
+            .register(Box::new(auth_v2_password_finish_duration_seconds.clone()))
+            .expect("auth v2 password finish duration metric should register");
+        registry
             .register(Box::new(auth_v2_password_upgrade_requests_total.clone()))
             .expect("auth v2 password upgrade requests metric should register");
+        registry
+            .register(Box::new(auth_v2_password_upgrade_duration_seconds.clone()))
+            .expect("auth v2 password upgrade duration metric should register");
         registry
             .register(Box::new(auth_v2_password_rejected_total.clone()))
             .expect("auth v2 password rejected metric should register");
@@ -478,6 +567,17 @@ impl MetricsRegistry {
             .register(Box::new(auth_v2_auth_flow_prune_errors_total.clone()))
             .expect("auth flow prune errors metric should register");
         registry
+            .register(Box::new(auth_v2_auth_flows_active.clone()))
+            .expect("auth flow active gauge should register");
+        registry
+            .register(Box::new(auth_v2_auth_flows_expired_pending_total.clone()))
+            .expect("auth flow expired backlog gauge should register");
+        registry
+            .register(Box::new(
+                auth_v2_auth_flows_oldest_expired_pending_age_seconds.clone(),
+            ))
+            .expect("auth flow oldest expired backlog gauge should register");
+        registry
             .register(Box::new(refresh_requests_total.clone()))
             .expect("refresh requests metric should register");
         registry
@@ -528,9 +628,14 @@ impl MetricsRegistry {
             login_risk_decisions_total,
             login_risk_penalty_total,
             auth_v2_methods_requests_total,
+            auth_v2_methods_rejected_total,
+            auth_v2_methods_duration_seconds,
             auth_v2_password_start_requests_total,
+            auth_v2_password_start_duration_seconds,
             auth_v2_password_finish_requests_total,
+            auth_v2_password_finish_duration_seconds,
             auth_v2_password_upgrade_requests_total,
+            auth_v2_password_upgrade_duration_seconds,
             auth_v2_password_rejected_total,
             auth_v2_legacy_fallback_total,
             passkey_requests_total,
@@ -552,6 +657,9 @@ impl MetricsRegistry {
             auth_v2_auth_flow_prune_last_failure_unixtime,
             auth_v2_auth_flow_pruned_total,
             auth_v2_auth_flow_prune_errors_total,
+            auth_v2_auth_flows_active,
+            auth_v2_auth_flows_expired_pending_total,
+            auth_v2_auth_flows_oldest_expired_pending_age_seconds,
             refresh_requests_total,
             refresh_rejected_total,
             refresh_duration_seconds,
@@ -612,12 +720,30 @@ pub fn record_login_risk_penalty(profile: &str, reason: &str, units: u64) {
 pub fn record_auth_v2_methods_request(channel: &str, outcome: &str) {
     metrics()
         .auth_v2_methods_requests_total
-        .with_label_values(&[outcome, channel])
+        .with_label_values(&[
+            normalize_auth_v2_request_outcome(outcome),
+            normalize_auth_v2_rollout_channel(channel),
+        ])
+        .inc();
+}
+
+pub fn observe_auth_v2_methods_duration(outcome: &str, duration: Duration) {
+    metrics()
+        .auth_v2_methods_duration_seconds
+        .with_label_values(&[normalize_auth_v2_request_outcome(outcome)])
+        .observe(duration.as_secs_f64());
+}
+
+pub fn record_auth_v2_methods_rejected(reason: &str) {
+    metrics()
+        .auth_v2_methods_rejected_total
+        .with_label_values(&[normalize_auth_v2_rejection_reason(reason)])
         .inc();
 }
 
 pub fn record_auth_v2_password_request(operation: &str, outcome: &str, channel: &str) {
     let metrics = metrics();
+    let outcome = normalize_auth_v2_request_outcome(outcome);
     let channel = normalize_auth_v2_rollout_channel(channel);
     match operation {
         "login_start" => metrics
@@ -640,6 +766,30 @@ pub fn record_auth_v2_password_request(operation: &str, outcome: &str, channel: 
     }
 }
 
+pub fn observe_auth_v2_password_duration(operation: &str, outcome: &str, duration: Duration) {
+    let metrics = metrics();
+    let outcome = normalize_auth_v2_request_outcome(outcome);
+    match operation {
+        "login_start" => metrics
+            .auth_v2_password_start_duration_seconds
+            .with_label_values(&[outcome])
+            .observe(duration.as_secs_f64()),
+        "login_finish" => metrics
+            .auth_v2_password_finish_duration_seconds
+            .with_label_values(&[outcome])
+            .observe(duration.as_secs_f64()),
+        "upgrade_start" => metrics
+            .auth_v2_password_upgrade_duration_seconds
+            .with_label_values(&["start", outcome])
+            .observe(duration.as_secs_f64()),
+        "upgrade_finish" => metrics
+            .auth_v2_password_upgrade_duration_seconds
+            .with_label_values(&["finish", outcome])
+            .observe(duration.as_secs_f64()),
+        _ => {}
+    }
+}
+
 pub fn record_auth_v2_legacy_fallback(reason: &str, channel: &str) {
     metrics()
         .auth_v2_legacy_fallback_total
@@ -653,7 +803,7 @@ pub fn record_auth_v2_legacy_fallback(reason: &str, channel: &str) {
 pub fn record_auth_v2_password_rejected(reason: &str) {
     metrics()
         .auth_v2_password_rejected_total
-        .with_label_values(&[reason])
+        .with_label_values(&[normalize_auth_v2_rejection_reason(reason)])
         .inc();
 }
 
@@ -776,6 +926,36 @@ pub fn record_auth_v2_auth_flow_pruned(pruned: u64) {
 
 pub fn record_auth_v2_auth_flow_prune_error() {
     metrics().auth_v2_auth_flow_prune_errors_total.inc();
+}
+
+pub fn set_auth_v2_auth_flow_metrics(snapshot: &AuthFlowMetricsSnapshot) {
+    let metrics = metrics();
+    for flow_kind in [
+        "methods_discovery",
+        "password_login",
+        "password_upgrade",
+        "passkey_login",
+        "passkey_register",
+    ] {
+        metrics
+            .auth_v2_auth_flows_active
+            .with_label_values(&[flow_kind])
+            .set(0);
+    }
+
+    for bucket in &snapshot.active_by_kind {
+        metrics
+            .auth_v2_auth_flows_active
+            .with_label_values(&[auth_flow_kind_metric_label(&bucket.flow_kind)])
+            .set(bucket.pending_total as i64);
+    }
+
+    metrics
+        .auth_v2_auth_flows_expired_pending_total
+        .set(snapshot.expired_pending_total as i64);
+    metrics
+        .auth_v2_auth_flows_oldest_expired_pending_age_seconds
+        .set(snapshot.oldest_expired_pending_age_seconds as i64);
 }
 
 pub fn record_refresh_error(error: &AuthError, duration: Duration) {
@@ -969,6 +1149,56 @@ fn normalize_auth_v2_rollout_channel(channel: &str) -> &str {
     }
 }
 
+fn normalize_auth_v2_request_outcome(outcome: &str) -> &'static str {
+    match outcome {
+        "success" => "success",
+        "error" => "error",
+        "invalid_request" => "invalid_request",
+        "rollout_denied" => "rollout_denied",
+        "shadow_hidden" => "shadow_hidden",
+        _ => "other",
+    }
+}
+
+fn normalize_auth_v2_rejection_reason(reason: &str) -> &'static str {
+    match reason {
+        "invalid-request" | "invalid_request" | "https://example.com/problems/invalid-request" => {
+            "invalid_request"
+        }
+        "rollout_denied"
+        | "auth-v2-rollout-denied"
+        | "auth_v2_rollout_denied"
+        | "https://example.com/problems/auth-v2-rollout-denied" => "rollout_denied",
+        "shadow_hidden" => "shadow_hidden",
+        "invalid-token" | "invalid_token" | "https://example.com/problems/invalid-token" => {
+            "invalid_token"
+        }
+        "invalid-credentials"
+        | "invalid_credentials"
+        | "https://example.com/problems/invalid-credentials" => "invalid_credentials",
+        "login-locked" | "login_locked" | "https://example.com/problems/login-locked" => {
+            "login_locked"
+        }
+        "pake-unavailable"
+        | "pake_unavailable"
+        | "https://example.com/problems/pake-unavailable" => "pake_unavailable",
+        "opaque-credential-already-active"
+        | "opaque_credential_already_active"
+        | "https://example.com/problems/opaque-credential-already-active" => {
+            "opaque_credential_already_active"
+        }
+        "invalid-opaque-registration"
+        | "invalid_opaque_registration"
+        | "https://example.com/problems/invalid-opaque-registration" => {
+            "invalid_opaque_registration"
+        }
+        "internal-error" | "internal_error" | "https://example.com/problems/internal-error" => {
+            "internal_error"
+        }
+        _ => "other",
+    }
+}
+
 fn normalize_auth_v2_fallback_reason(reason: &str) -> &'static str {
     match reason {
         "allowlisted" => "allowlisted",
@@ -981,12 +1211,24 @@ fn normalize_auth_v2_fallback_reason(reason: &str) -> &'static str {
     }
 }
 
+fn auth_flow_kind_metric_label(kind: &crate::modules::auth::domain::AuthFlowKind) -> &'static str {
+    match kind {
+        crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery => "methods_discovery",
+        crate::modules::auth::domain::AuthFlowKind::PasswordLogin => "password_login",
+        crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade => "password_upgrade",
+        crate::modules::auth::domain::AuthFlowKind::PasskeyLogin => "passkey_login",
+        crate::modules::auth::domain::AuthFlowKind::PasskeyRegister => "passkey_register",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_email_metrics, record_auth_v2_auth_flow_prune_error,
+        configure_email_metrics, observe_auth_v2_methods_duration,
+        observe_auth_v2_password_duration, record_auth_v2_auth_flow_prune_error,
         record_auth_v2_auth_flow_prune_run, record_auth_v2_auth_flow_pruned,
-        record_auth_v2_legacy_fallback, record_auth_v2_password_request, record_email_delivery,
+        record_auth_v2_legacy_fallback, record_auth_v2_methods_rejected,
+        record_auth_v2_methods_request, record_auth_v2_password_request, record_email_delivery,
         record_email_outbox_claim_failure, record_email_outbox_claim_poll,
         record_email_outbox_dispatch, record_email_retry_intensity, record_login_risk_decision,
         record_login_risk_penalty, record_passkey_challenge_prune_error,
@@ -994,7 +1236,8 @@ mod tests {
         record_passkey_login_rejected, record_passkey_register_rejected, record_passkey_request,
         record_password_forgot_accepted, record_password_reset_rejected, record_problem_response,
         record_refresh_error, record_refresh_success, render_prometheus,
-        set_auth_v2_auth_flow_janitor_enabled, set_auth_v2_auth_flow_prune_interval_seconds,
+        set_auth_v2_auth_flow_janitor_enabled, set_auth_v2_auth_flow_metrics,
+        set_auth_v2_auth_flow_prune_interval_seconds,
         set_auth_v2_auth_flow_prune_last_failure_unixtime,
         set_auth_v2_auth_flow_prune_last_success_unixtime, set_email_outbox_oldest_due_age_seconds,
         set_email_outbox_oldest_pending_age_seconds, set_email_outbox_queue_depth,
@@ -1003,6 +1246,10 @@ mod tests {
         set_passkey_challenge_prune_last_success_unixtime,
     };
     use crate::modules::auth::application::AuthError;
+    use crate::modules::auth::{
+        domain::AuthFlowKind,
+        ports::{AuthFlowMetricBucket, AuthFlowMetricsSnapshot},
+    };
 
     #[test]
     fn prometheus_render_exposes_refresh_metrics() {
@@ -1014,10 +1261,34 @@ mod tests {
         );
         record_login_risk_decision("block", "blocked_source_ip");
         record_login_risk_penalty("aggressive", "blocked_source_ip", 5);
+        record_auth_v2_methods_request("web", "success");
+        record_auth_v2_methods_request("shadow", "shadow_hidden");
+        observe_auth_v2_methods_duration("success", std::time::Duration::from_millis(8));
+        record_auth_v2_methods_rejected("https://example.com/problems/auth-v2-rollout-denied");
         record_auth_v2_password_request("login_start", "success", "web");
         record_auth_v2_password_request("login_finish", "error", "android");
         record_auth_v2_password_request("upgrade_start", "success", "ios");
         record_auth_v2_password_request("upgrade_finish", "error", "ios");
+        observe_auth_v2_password_duration(
+            "login_start",
+            "success",
+            std::time::Duration::from_millis(11),
+        );
+        observe_auth_v2_password_duration(
+            "login_finish",
+            "error",
+            std::time::Duration::from_millis(13),
+        );
+        observe_auth_v2_password_duration(
+            "upgrade_start",
+            "success",
+            std::time::Duration::from_millis(17),
+        );
+        observe_auth_v2_password_duration(
+            "upgrade_finish",
+            "error",
+            std::time::Duration::from_millis(19),
+        );
         record_auth_v2_legacy_fallback("allowlisted", "web");
         record_auth_v2_legacy_fallback("client_not_allowlisted", "android");
         record_passkey_request("login_finish", "success");
@@ -1046,6 +1317,20 @@ mod tests {
         record_auth_v2_auth_flow_prune_run("error");
         set_auth_v2_auth_flow_prune_last_failure_unixtime(1_700_000_090);
         record_auth_v2_auth_flow_prune_error();
+        set_auth_v2_auth_flow_metrics(&AuthFlowMetricsSnapshot {
+            active_by_kind: vec![
+                AuthFlowMetricBucket {
+                    flow_kind: AuthFlowKind::MethodsDiscovery,
+                    pending_total: 2,
+                },
+                AuthFlowMetricBucket {
+                    flow_kind: AuthFlowKind::PasswordLogin,
+                    pending_total: 1,
+                },
+            ],
+            expired_pending_total: 3,
+            oldest_expired_pending_age_seconds: 120,
+        });
         record_problem_response(429, "https://example.com/problems/login-locked");
         record_email_delivery(
             "sendgrid",
@@ -1066,6 +1351,9 @@ mod tests {
         assert!(payload.contains("auth_refresh_requests_total"));
         assert!(payload.contains("auth_login_risk_decisions_total"));
         assert!(payload.contains("auth_login_risk_penalty_total"));
+        assert!(payload.contains("auth_v2_methods_requests_total"));
+        assert!(payload.contains("auth_v2_methods_rejected_total"));
+        assert!(payload.contains("auth_v2_methods_duration_seconds"));
         assert!(payload.contains("auth_passkey_requests_total"));
         assert!(payload.contains("auth_passkey_login_rejected_total"));
         assert!(payload.contains("auth_passkey_register_rejected_total"));
@@ -1080,8 +1368,11 @@ mod tests {
         assert!(payload.contains("auth_passkey_challenge_prune_errors_total"));
         assert!(payload.contains("auth_v2_auth_flow_janitor_enabled"));
         assert!(payload.contains("auth_v2_password_start_requests_total"));
+        assert!(payload.contains("auth_v2_password_start_duration_seconds"));
         assert!(payload.contains("auth_v2_password_finish_requests_total"));
+        assert!(payload.contains("auth_v2_password_finish_duration_seconds"));
         assert!(payload.contains("auth_v2_password_upgrade_requests_total"));
+        assert!(payload.contains("auth_v2_password_upgrade_duration_seconds"));
         assert!(!payload.contains("auth_v2_password_requests_total"));
         assert!(payload.contains("auth_v2_legacy_fallback_total"));
         assert!(payload.contains("auth_v2_auth_flow_prune_interval_seconds"));
@@ -1090,6 +1381,9 @@ mod tests {
         assert!(payload.contains("auth_v2_auth_flow_prune_last_failure_unixtime"));
         assert!(payload.contains("auth_v2_auth_flow_pruned_total"));
         assert!(payload.contains("auth_v2_auth_flow_prune_errors_total"));
+        assert!(payload.contains("auth_v2_auth_flows_active"));
+        assert!(payload.contains("auth_v2_auth_flows_expired_pending_total"));
+        assert!(payload.contains("auth_v2_auth_flows_oldest_expired_pending_age_seconds"));
         assert!(payload.contains("auth_refresh_rejected_total"));
         assert!(payload.contains("auth_refresh_duration_seconds"));
         assert!(payload.contains("auth_problem_responses_total"));
@@ -1117,6 +1411,10 @@ mod tests {
         assert!(payload.contains("outcome=\"existing_not_active\""));
         assert!(payload.contains("channel=\"web\""));
         assert!(payload.contains("channel=\"android\""));
+        assert!(payload.contains("outcome=\"shadow_hidden\""));
+        assert!(payload.contains("reason=\"rollout_denied\""));
+        assert!(payload.contains("flow_kind=\"methods_discovery\""));
+        assert!(payload.contains("flow_kind=\"password_login\""));
         assert!(payload.contains("reason=\"allowlisted\""));
         assert!(payload.contains("reason=\"client_not_allowlisted\""));
     }

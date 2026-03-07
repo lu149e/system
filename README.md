@@ -452,9 +452,23 @@ Pasos recomendados:
   - `enforce_database_tls` (boolean, default `true`): valor aplicado a `ENFORCE_DATABASE_TLS` en overlay generado.
   - `enforce_redis_tls` (boolean, default `true`): valor aplicado a `ENFORCE_REDIS_TLS` en overlay generado.
   - `enforce_secure_transport` (boolean, default `true`): valor aplicado a `ENFORCE_SECURE_TRANSPORT` en overlay generado.
+  - `auth_v2_rollout_env` (string multilinea): bloque `KEY=VALUE` para los knobs `AUTH_V2_*`; mantiene el workflow por debajo del limite real de 25 inputs de `workflow_dispatch`.
   - `login_risk_mode` (choice, default `baseline`): valor aplicado a `LOGIN_RISK_MODE`.
   - `login_risk_blocked_cidrs` / `login_risk_blocked_user_agent_substrings` / `login_risk_blocked_email_domains` (string CSV opcional): valores aplicados a `LOGIN_RISK_BLOCKED_*`.
   - `login_risk_challenge_cidrs` / `login_risk_challenge_user_agent_substrings` / `login_risk_challenge_email_domains` (string CSV opcional): valores aplicados a `LOGIN_RISK_CHALLENGE_*`.
+  - `auth_v2_rollout_env` default:
+    ```text
+    AUTH_V2_ENABLED=false
+    AUTH_V2_METHODS_ENABLED=false
+    AUTH_V2_PASSWORD_PAKE_ENABLED=false
+    AUTH_V2_PASSWORD_UPGRADE_ENABLED=false
+    AUTH_V2_PASSKEY_NAMESPACE_ENABLED=false
+    AUTH_V2_AUTH_FLOWS_ENABLED=false
+    AUTH_V2_LEGACY_FALLBACK_MODE=disabled
+    AUTH_V2_CLIENT_ALLOWLIST=
+    AUTH_V2_SHADOW_AUDIT_ONLY=false
+    AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS=60
+    ```
   - `apply_changes` (boolean, default `false`): en `false` ejecuta solo dry-run server-side; en `true` aplica manifiestos al cluster.
   - `allow_client_dry_run_fallback` (boolean, default `false`): solo para simulacion; si el server-side dry-run no puede contactar el API server y `apply_changes=false`, permite continuar sin el gate de `kubectl --dry-run=server`.
   - `namespace` (default `auth`): namespace destino para dry-run/apply/smoke.

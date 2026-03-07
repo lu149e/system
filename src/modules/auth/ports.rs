@@ -14,6 +14,19 @@ use crate::modules::auth::domain::{
     PasswordResetTokenRecord, User, VerificationTokenRecord,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthFlowMetricBucket {
+    pub flow_kind: crate::modules::auth::domain::AuthFlowKind,
+    pub pending_total: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct AuthFlowMetricsSnapshot {
+    pub active_by_kind: Vec<AuthFlowMetricBucket>,
+    pub expired_pending_total: u64,
+    pub oldest_expired_pending_age_seconds: u64,
+}
+
 #[async_trait]
 pub trait UserRepository: Send + Sync {
     async fn find_by_email(&self, email: &str) -> Option<User>;
@@ -99,6 +112,8 @@ pub trait AuthFlowRepository: Send + Sync {
         flow_kind: &str,
         now: DateTime<Utc>,
     ) -> Result<u64, String>;
+    async fn metrics_snapshot(&self, now: DateTime<Utc>)
+        -> Result<AuthFlowMetricsSnapshot, String>;
     async fn prune_expired(&self, now: DateTime<Utc>) -> Result<u64, String>;
 }
 

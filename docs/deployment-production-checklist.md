@@ -41,7 +41,7 @@ Optional variables (included only when set):
 - `VERIFY_EMAIL_URL_BASE`
 - `PASSWORD_RESET_URL_BASE`
 
-Login risk controls (`LOGIN_RISK_MODE`, `LOGIN_RISK_BLOCKED_*`, `LOGIN_RISK_CHALLENGE_*`) and passkey runtime flags (`PASSKEY_ENABLED`, `PASSKEY_RP_ID`, `PASSKEY_RP_ORIGIN`, `PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS`) are non-secret settings and should be managed through ConfigMap/overlay values, not secret manifests.
+Login risk controls (`LOGIN_RISK_MODE`, `LOGIN_RISK_BLOCKED_*`, `LOGIN_RISK_CHALLENGE_*`), passkey runtime flags (`PASSKEY_ENABLED`, `PASSKEY_RP_ID`, `PASSKEY_RP_ORIGIN`, `PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS`), and auth v2 rollout knobs (`AUTH_V2_ENABLED`, `AUTH_V2_METHODS_ENABLED`, `AUTH_V2_PASSWORD_PAKE_ENABLED`, `AUTH_V2_PASSWORD_UPGRADE_ENABLED`, `AUTH_V2_PASSKEY_NAMESPACE_ENABLED`, `AUTH_V2_AUTH_FLOWS_ENABLED`, `AUTH_V2_LEGACY_FALLBACK_MODE`, `AUTH_V2_CLIENT_ALLOWLIST`, `AUTH_V2_SHADOW_AUDIT_ONLY`, `AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS`) are non-secret settings and should be managed through ConfigMap/overlay values, not secret manifests.
 
 Quick generation helpers:
 
@@ -131,6 +131,16 @@ POSTGRES_CIDR='10.20.30.0/24' \
 REDIS_CIDR='10.20.40.0/24' \
 ENFORCE_SECURE_TRANSPORT='true' \
 LOGIN_RISK_MODE='baseline' \
+# AUTH_V2_ENABLED='true' \
+# AUTH_V2_METHODS_ENABLED='true' \
+# AUTH_V2_PASSWORD_PAKE_ENABLED='true' \
+# AUTH_V2_PASSWORD_UPGRADE_ENABLED='false' \
+# AUTH_V2_PASSKEY_NAMESPACE_ENABLED='false' \
+# AUTH_V2_AUTH_FLOWS_ENABLED='true' \
+# AUTH_V2_LEGACY_FALLBACK_MODE='allowlisted' \
+# AUTH_V2_CLIENT_ALLOWLIST='internal-web,ios-beta' \
+# AUTH_V2_SHADOW_AUDIT_ONLY='false' \
+# AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS='300' \
 # PASSKEY_ENABLED='true' \
 # PASSKEY_RP_ID='example.com' \
 # PASSKEY_RP_ORIGIN='https://auth.example.com' \
@@ -178,6 +188,18 @@ STRICT_DEPLOY_VALIDATION=true ./scripts/validate-deploy-readiness.sh
 # - login_risk_challenge_cidrs (optional CSV)
 # - login_risk_challenge_user_agent_substrings (optional CSV)
 # - login_risk_challenge_email_domains (optional CSV)
+# Auth v2 rollout input:
+# - auth_v2_rollout_env (multiline KEY=VALUE block for AUTH_V2_* knobs)
+#   AUTH_V2_ENABLED=false
+#   AUTH_V2_METHODS_ENABLED=false
+#   AUTH_V2_PASSWORD_PAKE_ENABLED=false
+#   AUTH_V2_PASSWORD_UPGRADE_ENABLED=false
+#   AUTH_V2_PASSKEY_NAMESPACE_ENABLED=false
+#   AUTH_V2_AUTH_FLOWS_ENABLED=false
+#   AUTH_V2_LEGACY_FALLBACK_MODE=disabled
+#   AUTH_V2_CLIENT_ALLOWLIST=
+#   AUTH_V2_SHADOW_AUDIT_ONLY=false
+#   AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS=60
 # - apply_changes=false (default)
 ```
 
@@ -221,6 +243,7 @@ JWT_PUBLIC_KEY_PEM="$(cat /path/to/v2-public.pem)" \
 # - login_risk_mode=baseline (default)
 # - login_risk_blocked_cidrs / login_risk_blocked_user_agent_substrings / login_risk_blocked_email_domains (optional CSV)
 # - login_risk_challenge_cidrs / login_risk_challenge_user_agent_substrings / login_risk_challenge_email_domains (optional CSV)
+# - auth_v2_rollout_env (multiline KEY=VALUE block for AUTH_V2_* knobs; default block keeps all auth v2 flags fail-closed)
 # - apply_changes=false (default; non-destructive dry-run mode)
 # - allow_client_dry_run_fallback=false (default; only for simulation when API server is unreachable)
 # - namespace=auth
@@ -309,11 +332,22 @@ After applying `deployment.yaml`, `service.yaml`, and `ingress.yaml`:
 - Validate metrics protection works:
   - without token expect `401` when token is configured
   - with token expect `200` and Prometheus payload
+- Validate auth v2 routing explicitly when rollout is enabled:
+  - `curl -fsS -X POST http://localhost:8080/v2/auth/methods -H 'content-type: application/json' -d '{"identifier":"pilot@example.com","channel":"web","client":{"supports_pake":true,"supports_passkeys":true,"platform":"web"}}'`
+  - expect success for allowlisted/shadow-safe cohorts and the documented denial contract for everything else
+- Validate auth v2 janitor readiness when `AUTH_V2_AUTH_FLOWS_ENABLED=true`:
+  - `/readyz` should keep the auth-flow janitor component healthy
+  - `/metrics` should expose `auth_v2_auth_flow_janitor_enabled`, `auth_v2_auth_flow_prune_runs_total`, `auth_v2_auth_flows_expired_pending_total`, and `auth_v2_auth_flows_oldest_expired_pending_age_seconds`
 
 ## Rollback Strategy
 
 - Roll back workload first:
   - `kubectl rollout undo deployment/auth-api -n auth`
+- If the incident is auth v2 specific, also roll back runtime flags in the production overlay/config workflow:
+  - set `AUTH_V2_PASSWORD_PAKE_ENABLED=false`
+  - keep `AUTH_V2_METHODS_ENABLED` on only if it can safely recommend passkeys or legacy fallback
+  - set `AUTH_V2_LEGACY_FALLBACK_MODE=allowlisted` or `broad` only as a short-lived break-glass
+  - set `AUTH_V2_AUTH_FLOWS_ENABLED=false` if janitor backlog or flow-store health is degraded
 - If release included DB changes, use forward-fix migrations rather than destructive down migrations.
 - Re-run smoke checks after rollback and verify auth/login/refresh baseline behavior.
 
@@ -332,6 +366,10 @@ Verify the following during rollout and for at least one full traffic cycle:
 - `auth_problem_responses_total` does not spike unexpectedly.
 - `auth_refresh_rejected_total{reason="token_rotation_error"}` remains at baseline.
 - `auth_email_outbox_queue_depth` and `auth_email_outbox_oldest_due_age_seconds` remain within expected thresholds.
+- `auth_v2_methods_requests_total` and `auth_v2_password_finish_requests_total` show expected success/error mix for the intended cohort only.
+- `auth:auth_v2_password_finish_error_ratio_10m` stays below rollout thresholds and `auth_v2_password_rejected_total{reason="rollout_denied"}` does not spike for allowlisted cohorts.
+- `auth:auth_v2_legacy_fallback_ratio_15m` stays inside the go/no-go window for the current rollout phase.
+- `auth_v2_auth_flows_expired_pending_total` and `auth_v2_auth_flows_oldest_expired_pending_age_seconds` remain near baseline, with successful janitor runs continuing.
 - Pod restart count is stable (`kubectl get pods -n auth`).
 - Ingress 5xx and upstream latency stay within SLO budgets.
 

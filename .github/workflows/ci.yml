@@ -119,3 +119,44 @@ jobs:
 
       - name: Validate observability artifacts
         run: ./scripts/validate-observability-artifacts.sh
+
+  deploy-assets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      KUSTOMIZE_VERSION: "5.4.3"
+      IMAGE_DIGEST: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      INGRESS_HOST: "auth.example.org"
+      TLS_SECRET_NAME: "auth-prod-tls"
+      POSTGRES_CIDR: "10.20.0.0/24"
+      REDIS_CIDR: "10.30.0.0/24"
+      AUTH_V2_ENABLED: "true"
+      AUTH_V2_METHODS_ENABLED: "true"
+      AUTH_V2_PASSWORD_PAKE_ENABLED: "true"
+      AUTH_V2_PASSWORD_UPGRADE_ENABLED: "true"
+      AUTH_V2_PASSKEY_NAMESPACE_ENABLED: "false"
+      AUTH_V2_AUTH_FLOWS_ENABLED: "true"
+      AUTH_V2_LEGACY_FALLBACK_MODE: "allowlisted"
+      AUTH_V2_CLIENT_ALLOWLIST: "internal-web,ios-beta"
+      AUTH_V2_SHADOW_AUDIT_ONLY: "false"
+      AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS: "300"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install kustomize
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          tar -xzf /tmp/kustomize.tar.gz -C /tmp
+          install -m 0755 /tmp/kustomize /usr/local/bin/kustomize
+
+      - name: Generate production overlay with auth v2 rollout sample
+        run: ./scripts/generate-production-overlay.sh
+
+      - name: Validate deploy readiness in strict mode
+        env:
+          STRICT_DEPLOY_VALIDATION: "true"
+        run: ./scripts/validate-deploy-readiness.sh

@@ -19,15 +19,16 @@ use crate::{
                 VerificationTokenRecord,
             },
             ports::{
-                AccountRepository, AuthFlowConsumeState, AuthFlowRepository,
-                LegacyPasswordRepository, MfaBackupCodeConsumeState, MfaBackupCodeRepository,
-                MfaChallengeFailureState, MfaChallengeLookupState, MfaChallengeRepository,
-                MfaFactorRepository, OpaqueCredentialRepository,
-                PasskeyAuthenticationChallengeConsumeState, PasskeyAuthenticationChallengeRecord,
-                PasskeyChallengeRepository, PasskeyCredentialRepository,
-                PasskeyRegistrationChallengeConsumeState, PasskeyRegistrationChallengeRecord,
-                PasswordResetTokenConsumeState, PasswordResetTokenRepository, UserRepository,
-                VerificationTokenConsumeState, VerificationTokenRepository,
+                AccountRepository, AuthFlowConsumeState, AuthFlowMetricBucket,
+                AuthFlowMetricsSnapshot, AuthFlowRepository, LegacyPasswordRepository,
+                MfaBackupCodeConsumeState, MfaBackupCodeRepository, MfaChallengeFailureState,
+                MfaChallengeLookupState, MfaChallengeRepository, MfaFactorRepository,
+                OpaqueCredentialRepository, PasskeyAuthenticationChallengeConsumeState,
+                PasskeyAuthenticationChallengeRecord, PasskeyChallengeRepository,
+                PasskeyCredentialRepository, PasskeyRegistrationChallengeConsumeState,
+                PasskeyRegistrationChallengeRecord, PasswordResetTokenConsumeState,
+                PasswordResetTokenRepository, UserRepository, VerificationTokenConsumeState,
+                VerificationTokenRepository,
             },
         },
         sessions::{
@@ -729,6 +730,62 @@ impl AuthFlowRepository for PostgresAuthFlowRepository {
         .map_err(|_| "auth flow cancel failed".to_string())?;
 
         Ok(updated.rows_affected())
+    }
+
+    async fn metrics_snapshot(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<AuthFlowMetricsSnapshot, String> {
+        let active_rows = sqlx::query(
+            "SELECT flow_kind, COUNT(*)::bigint AS pending_total
+             FROM auth_flows
+             WHERE status = 'pending' AND expires_at > $1
+             GROUP BY flow_kind",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| "auth flow metrics snapshot failed".to_string())?;
+
+        let mut active_by_kind = active_rows
+            .into_iter()
+            .map(|row| {
+                Ok(AuthFlowMetricBucket {
+                    flow_kind: parse_auth_flow_kind(
+                        row.try_get::<String, _>("flow_kind")
+                            .map_err(|_| "invalid auth flow metrics flow_kind".to_string())?,
+                    ),
+                    pending_total: row
+                        .try_get::<i64, _>("pending_total")
+                        .map_err(|_| "invalid auth flow metrics pending_total".to_string())?
+                        .max(0) as u64,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        active_by_kind.sort_by_key(|bucket| auth_flow_kind_to_db(&bucket.flow_kind));
+
+        let backlog_row = sqlx::query(
+            "SELECT COUNT(*)::bigint AS expired_pending_total,
+                    COALESCE(EXTRACT(EPOCH FROM ($1 - MIN(expires_at))), 0)::bigint AS oldest_expired_pending_age_seconds
+             FROM auth_flows
+             WHERE status = 'pending' AND expires_at <= $1",
+        )
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| "auth flow backlog metrics failed".to_string())?;
+
+        Ok(AuthFlowMetricsSnapshot {
+            active_by_kind,
+            expired_pending_total: backlog_row
+                .try_get::<i64, _>("expired_pending_total")
+                .map_err(|_| "invalid auth flow expired_pending_total".to_string())?
+                .max(0) as u64,
+            oldest_expired_pending_age_seconds: backlog_row
+                .try_get::<i64, _>("oldest_expired_pending_age_seconds")
+                .map_err(|_| "invalid auth flow oldest_expired_pending_age_seconds".to_string())?
+                .max(0) as u64,
+        })
     }
 
     async fn prune_expired(&self, now: DateTime<Utc>) -> Result<u64, String> {

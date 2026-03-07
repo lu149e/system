@@ -1238,7 +1238,9 @@ fn normalize_pem(value: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
 
     use super::{
         database_url_uses_secure_transport, parse_auth_v2_client_allowlist,
@@ -1247,7 +1249,7 @@ mod tests {
         parse_login_risk_challenge_cidrs, parse_login_risk_mode, parse_metrics_allowed_cidrs,
         parse_positive_u64_with_default, redis_url_uses_secure_transport,
         resolve_jwt_key_configuration, resolve_optional_secret_from_env,
-        validate_backend_transport_security, AuthRuntime, AuthV2LegacyFallbackMode,
+        validate_backend_transport_security, AppConfig, AuthRuntime, AuthV2LegacyFallbackMode,
         AuthV2PakeProvider, EmailDeliveryMode, EmailProviderConfig, LoginRiskMode,
     };
 
@@ -1372,6 +1374,111 @@ mod tests {
         assert!(error
             .to_string()
             .contains("AUTH_V2_PAKE_PROVIDER must be one of: unavailable, opaque_ke"));
+    }
+
+    #[test]
+    fn app_config_from_env_maps_auth_v2_rollout_values() {
+        let _guard = env_lock();
+        let private_key_path = write_temp_secret_file(TEST_PRIVATE_KEY_PEM);
+        let public_key_path = write_temp_secret_file(TEST_PUBLIC_KEY_PEM);
+        let keyset = format!(
+            "primary|{}|{}",
+            private_key_path.to_string_lossy(),
+            public_key_path.to_string_lossy()
+        );
+
+        with_env_vars(
+            &[
+                ("REFRESH_TOKEN_PEPPER", Some("test-refresh-pepper")),
+                (
+                    "MFA_ENCRYPTION_KEY_BASE64",
+                    Some("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
+                ),
+                (
+                    "DATABASE_URL",
+                    Some("postgres://auth:auth@127.0.0.1:5432/auth"),
+                ),
+                ("REDIS_URL", Some("redis://127.0.0.1:6379")),
+                ("JWT_PRIMARY_KID", None),
+                ("JWT_PRIVATE_KEY_PEM", None),
+                ("JWT_PUBLIC_KEY_PEM", None),
+                ("JWT_KEY_ID", None),
+                ("JWT_KEYSET", Some(keyset.as_str())),
+                ("AUTH_V2_ENABLED", Some("true")),
+                ("AUTH_V2_METHODS_ENABLED", Some("true")),
+                ("AUTH_V2_PASSWORD_PAKE_ENABLED", Some("true")),
+                ("AUTH_V2_PASSWORD_UPGRADE_ENABLED", Some("true")),
+                ("AUTH_V2_PASSKEY_NAMESPACE_ENABLED", Some("true")),
+                ("AUTH_V2_AUTH_FLOWS_ENABLED", Some("true")),
+                ("AUTH_V2_LEGACY_FALLBACK_MODE", Some("allowlisted")),
+                ("AUTH_V2_CLIENT_ALLOWLIST", Some(" web,ios ,, android ")),
+                ("AUTH_V2_SHADOW_AUDIT_ONLY", Some("true")),
+                ("AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS", Some("90")),
+            ],
+            || {
+                let config = AppConfig::from_env().expect("auth v2 env should parse");
+
+                assert!(config.auth_v2.enabled);
+                assert!(config.auth_v2.methods_enabled);
+                assert!(config.auth_v2.password_pake_enabled);
+                assert!(config.auth_v2.password_upgrade_enabled);
+                assert!(config.auth_v2.passkey_namespace_enabled);
+                assert!(config.auth_v2.auth_flows_enabled);
+                assert_eq!(
+                    config.auth_v2.legacy_fallback_mode,
+                    AuthV2LegacyFallbackMode::Allowlisted
+                );
+                assert_eq!(
+                    config.auth_v2.client_allowlist,
+                    vec!["web", "ios", "android"]
+                );
+                assert!(config.auth_v2.shadow_audit_only);
+                assert_eq!(config.auth_v2_auth_flow_prune_interval_seconds, 90);
+            },
+        );
+    }
+
+    #[test]
+    fn app_config_from_env_rejects_invalid_auth_v2_fallback_mode() {
+        let _guard = env_lock();
+        let private_key_path = write_temp_secret_file(TEST_PRIVATE_KEY_PEM);
+        let public_key_path = write_temp_secret_file(TEST_PUBLIC_KEY_PEM);
+        let keyset = format!(
+            "primary|{}|{}",
+            private_key_path.to_string_lossy(),
+            public_key_path.to_string_lossy()
+        );
+
+        with_env_vars(
+            &[
+                ("REFRESH_TOKEN_PEPPER", Some("test-refresh-pepper")),
+                (
+                    "MFA_ENCRYPTION_KEY_BASE64",
+                    Some("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
+                ),
+                (
+                    "DATABASE_URL",
+                    Some("postgres://auth:auth@127.0.0.1:5432/auth"),
+                ),
+                ("REDIS_URL", Some("redis://127.0.0.1:6379")),
+                ("JWT_PRIMARY_KID", None),
+                ("JWT_PRIVATE_KEY_PEM", None),
+                ("JWT_PUBLIC_KEY_PEM", None),
+                ("JWT_KEY_ID", None),
+                ("JWT_KEYSET", Some(keyset.as_str())),
+                ("AUTH_V2_LEGACY_FALLBACK_MODE", Some("open")),
+            ],
+            || {
+                let error = match AppConfig::from_env() {
+                    Ok(_) => panic!("invalid auth v2 fallback mode should fail"),
+                    Err(error) => error,
+                };
+
+                assert!(error.to_string().contains(
+                    "AUTH_V2_LEGACY_FALLBACK_MODE must be one of: disabled, allowlisted, broad"
+                ));
+            },
+        );
     }
 
     #[test]
@@ -1820,11 +1927,48 @@ mod tests {
     const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIMn3Wcxxd4JzzjbshVFXz8jSGuF9ErqngPTzYhbfm6hd\n-----END PRIVATE KEY-----\n";
     const TEST_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAdIROjbNDN9NHACJMCdMbdRjmUZp05u0E+QVRzrqB6eM=\n-----END PUBLIC KEY-----\n";
 
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
     fn write_temp_secret_file(content: &str) -> PathBuf {
         let file_path =
             std::env::temp_dir().join(format!("auth-metrics-secret-{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&file_path, content).expect("temp secret file should be written");
         file_path
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock should not be poisoned")
+    }
+
+    fn with_env_vars<T>(vars: &[(&str, Option<&str>)], test: impl FnOnce() -> T) -> T {
+        let original = vars
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+
+        for (key, value) in vars {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(test));
+
+        for (key, value) in original {
+            match value {
+                Some(value) => std::env::set_var(&key, value),
+                None => std::env::remove_var(&key),
+            }
+        }
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => resume_unwind(payload),
+        }
     }
 
     fn sendgrid_env() -> super::SendGridEnvConfig {

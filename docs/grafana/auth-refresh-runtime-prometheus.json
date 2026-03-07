@@ -1203,6 +1203,297 @@
       ],
       "title": "Login Risk Penalty Units by Profile/Reason",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 136
+      },
+      "id": 29,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (channel, outcome) (rate(auth_v2_methods_requests_total[5m]))",
+          "legendFormat": "{{channel}} {{outcome}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (channel) (rate(auth_v2_password_finish_requests_total{outcome=\"success\"}[5m]))",
+          "legendFormat": "finish success {{channel}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Auth V2 Rollout Rate by Channel/Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 4,
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 136
+      },
+      "id": 30,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "auth:auth_v2_password_finish_error_ratio_10m",
+          "legendFormat": "finish_error_ratio_10m",
+          "refId": "A"
+        },
+        {
+          "expr": "auth:auth_v2_legacy_fallback_ratio_15m",
+          "legendFormat": "legacy_fallback_ratio_15m",
+          "refId": "B"
+        }
+      ],
+      "title": "Auth V2 Error and Fallback Ratios",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 144
+      },
+      "id": 31,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, outcome) (rate(auth_v2_password_start_duration_seconds_bucket[5m])))",
+          "legendFormat": "start p95 {{outcome}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, outcome) (rate(auth_v2_password_finish_duration_seconds_bucket[5m])))",
+          "legendFormat": "finish p95 {{outcome}}",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, operation, outcome) (rate(auth_v2_password_upgrade_duration_seconds_bucket[5m])))",
+          "legendFormat": "upgrade {{operation}} {{outcome}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Auth V2 Password Latency P95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 144
+      },
+      "id": 32,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(auth_v2_password_rejected_total[5m]))",
+          "legendFormat": "password rejected {{reason}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (reason, channel) (rate(auth_v2_legacy_fallback_total[5m]))",
+          "legendFormat": "fallback {{reason}} {{channel}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (reason) (rate(auth_v2_methods_rejected_total[5m]))",
+          "legendFormat": "methods rejected {{reason}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Auth V2 Rejections and Fallback Pressure",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 152
+      },
+      "id": 33,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (flow_kind) (auth_v2_auth_flows_active)",
+          "legendFormat": "active {{flow_kind}}",
+          "refId": "A"
+        },
+        {
+          "expr": "auth_v2_auth_flows_expired_pending_total",
+          "legendFormat": "expired_pending_total",
+          "refId": "B"
+        },
+        {
+          "expr": "auth_v2_auth_flows_oldest_expired_pending_age_seconds",
+          "legendFormat": "oldest_expired_pending_age_seconds",
+          "refId": "C"
+        }
+      ],
+      "title": "Auth V2 Auth-Flow Backlog",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 152
+      },
+      "id": 34,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "max(auth_v2_auth_flow_janitor_enabled)",
+          "legendFormat": "janitor_enabled",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(auth_v2_auth_flow_prune_runs_total{outcome=\"success\"}[15m]))",
+          "legendFormat": "successful_runs_last_15m",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(increase(auth_v2_auth_flow_prune_runs_total{outcome=\"error\"}[15m]))",
+          "legendFormat": "error_runs_last_15m",
+          "refId": "C"
+        },
+        {
+          "expr": "auth:auth_v2_auth_flow_prune_errors_10m",
+          "legendFormat": "prune_errors_10m",
+          "refId": "D"
+        },
+        {
+          "expr": "auth:auth_v2_auth_flow_oldest_expired_pending_age_seconds_max_15m",
+          "legendFormat": "oldest_expired_pending_age_max_15m",
+          "refId": "E"
+        }
+      ],
+      "title": "Auth V2 Janitor Snapshot",
+      "type": "stat"
     }
   ],
   "refresh": "30s",
@@ -1225,6 +1516,6 @@
   "timezone": "browser",
   "title": "Auth Refresh Runtime Metrics",
   "uid": "auth-refresh-runtime-metrics",
-  "version": 13,
+  "version": 14,
   "weekStart": ""
 }

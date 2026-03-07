@@ -880,14 +880,20 @@ pub async fn auth_methods_v2(
     headers: HeaderMap,
     Json(payload): Json<AuthMethodsRequest>,
 ) -> Result<NoStoreJson<AuthMethodsContractResponse>, ApiProblem> {
+    let started_at = Instant::now();
     let trace_id = trace_id(&headers);
     let client_id = payload
         .channel
         .clone()
         .or_else(|| payload.client.platform.clone());
     let channel = client_id.clone().unwrap_or_else(|| "unknown".to_string());
-    enforce_auth_v2_rollout_access(&state, client_id.as_deref(), &trace_id)
-        .map_err(|problem| *problem)?;
+    if let Err(problem) = enforce_auth_v2_rollout_access(&state, client_id.as_deref(), &trace_id) {
+        let rejection_reason = auth_v2_gate_rejection_reason(&state);
+        observability::record_auth_v2_methods_request(&channel, rejection_reason);
+        observability::observe_auth_v2_methods_duration(rejection_reason, started_at.elapsed());
+        observability::record_auth_v2_methods_rejected(rejection_reason);
+        return Err(*problem);
+    }
     let ctx = request_context(
         &headers,
         trace_id.clone(),
@@ -908,17 +914,25 @@ pub async fn auth_methods_v2(
             },
             ctx,
         )
-        .await
-        .map_err(|err| {
+        .await;
+
+    match response {
+        Ok(response) => {
+            observability::record_auth_v2_methods_request(&channel, "success");
+            observability::observe_auth_v2_methods_duration("success", started_at.elapsed());
+
+            Ok(NoStoreJson(auth_methods_contract_response(
+                trace_id, response,
+            )))
+        }
+        Err(err) => {
+            let problem = from_auth_error(err, trace_id.clone());
             observability::record_auth_v2_methods_request(&channel, "error");
-            from_auth_error(err, trace_id.clone())
-        })?;
-
-    observability::record_auth_v2_methods_request(&channel, "success");
-
-    Ok(NoStoreJson(auth_methods_contract_response(
-        trace_id, response,
-    )))
+            observability::observe_auth_v2_methods_duration("error", started_at.elapsed());
+            observability::record_auth_v2_methods_rejected(&problem.body.type_url);
+            Err(problem)
+        }
+    }
 }
 
 pub async fn password_login_start_v2(
@@ -927,9 +941,16 @@ pub async fn password_login_start_v2(
     headers: HeaderMap,
     Json(payload): Json<PasswordLoginStartRequest>,
 ) -> Result<NoStoreJson<PasswordLoginStartContractResponse>, ApiProblem> {
+    let started_at = Instant::now();
     let trace_id = trace_id(&headers);
+    let channel = payload.client.platform.as_deref().unwrap_or("unknown");
     if !payload.client.supports_pake {
-        observability::record_auth_v2_password_request("login_start", "error", "unknown");
+        observability::record_auth_v2_password_request("login_start", "invalid_request", channel);
+        observability::observe_auth_v2_password_duration(
+            "login_start",
+            "invalid_request",
+            started_at.elapsed(),
+        );
         observability::record_auth_v2_password_rejected("invalid-request");
         return Err(from_auth_error(AuthError::InvalidRequest, trace_id));
     }
@@ -1013,12 +1034,15 @@ pub async fn password_upgrade_start_v2(
     headers: HeaderMap,
     Json(payload): Json<PasswordUpgradeStartRequest>,
 ) -> Result<NoStoreJson<PasswordUpgradeStartContractResponse>, ApiProblem> {
+    let started_at = Instant::now();
     let trace_id = trace_id(&headers);
+    let channel = payload.client.platform.as_deref().unwrap_or("unknown");
     if payload.upgrade_context != "session" || !payload.client.supports_pake {
-        observability::record_auth_v2_password_request(
+        observability::record_auth_v2_password_request("upgrade_start", "invalid_request", channel);
+        observability::observe_auth_v2_password_duration(
             "upgrade_start",
-            "error",
-            payload.client.platform.as_deref().unwrap_or("unknown"),
+            "invalid_request",
+            started_at.elapsed(),
         );
         observability::record_auth_v2_password_rejected("invalid-request");
         return Err(from_auth_error(AuthError::InvalidRequest, trace_id));
@@ -1026,8 +1050,17 @@ pub async fn password_upgrade_start_v2(
 
     let principal = extract_principal(&state, &headers, trace_id.clone()).await?;
     let client_id = payload.client.platform.clone();
-    enforce_auth_v2_rollout_access(&state, client_id.as_deref(), &trace_id)
-        .map_err(|problem| *problem)?;
+    if let Err(problem) = enforce_auth_v2_rollout_access(&state, client_id.as_deref(), &trace_id) {
+        let rejection_reason = auth_v2_gate_rejection_reason(&state);
+        observability::record_auth_v2_password_request("upgrade_start", rejection_reason, channel);
+        observability::observe_auth_v2_password_duration(
+            "upgrade_start",
+            rejection_reason,
+            started_at.elapsed(),
+        );
+        observability::record_auth_v2_password_rejected(rejection_reason);
+        return Err(*problem);
+    }
     let mut ctx = request_context(
         &headers,
         trace_id.clone(),
@@ -1816,6 +1849,15 @@ fn enforce_auth_v2_rollout_access(
             trace_id.to_string(),
         )))
     }
+}
+
+fn auth_v2_gate_rejection_reason(state: &AppState) -> &'static str {
+    state
+        .auth_service
+        .auth_v2_config()
+        .filter(|config| config.shadow_audit_only)
+        .map(|_| "shadow_hidden")
+        .unwrap_or("rollout_denied")
 }
 
 fn parse_x_forwarded_for(value: &str) -> Option<String> {
@@ -3480,6 +3522,24 @@ mod tests {
             problem.body.type_url,
             "https://example.com/problems/auth-v2-rollout-denied"
         );
+
+        let metrics_response = super::metrics(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-methods-denied-metrics"),
+        )
+        .await
+        .expect("metrics should succeed")
+        .into_response();
+        let metrics_body = to_bytes(metrics_response.into_body(), 1024 * 1024)
+            .await
+            .expect("metrics body should be readable");
+        let metrics_payload =
+            String::from_utf8(metrics_body.to_vec()).expect("metrics payload should be utf-8");
+
+        assert!(metrics_payload.contains("auth_v2_methods_rejected_total"));
+        assert!(metrics_payload.contains("reason=\"rollout_denied\""));
+        assert!(metrics_payload.contains("outcome=\"rollout_denied\""));
     }
 
     #[tokio::test]
@@ -3514,6 +3574,24 @@ mod tests {
             problem.body.type_url,
             "https://example.com/problems/auth-v2-rollout-denied"
         );
+
+        let metrics_response = super::metrics(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-methods-shadow-metrics"),
+        )
+        .await
+        .expect("metrics should succeed")
+        .into_response();
+        let metrics_body = to_bytes(metrics_response.into_body(), 1024 * 1024)
+            .await
+            .expect("metrics body should be readable");
+        let metrics_payload =
+            String::from_utf8(metrics_body.to_vec()).expect("metrics payload should be utf-8");
+
+        assert!(metrics_payload.contains("auth_v2_methods_rejected_total"));
+        assert!(metrics_payload.contains("reason=\"shadow_hidden\""));
+        assert!(metrics_payload.contains("outcome=\"shadow_hidden\""));
     }
 
     #[tokio::test]
@@ -3606,6 +3684,25 @@ mod tests {
             problem.body.type_url,
             "https://example.com/problems/invalid-request"
         );
+
+        let metrics_response = super::metrics(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-start-invalid-metrics"),
+        )
+        .await
+        .expect("metrics should succeed")
+        .into_response();
+        let metrics_body = to_bytes(metrics_response.into_body(), 1024 * 1024)
+            .await
+            .expect("metrics body should be readable");
+        let metrics_payload =
+            String::from_utf8(metrics_body.to_vec()).expect("metrics payload should be utf-8");
+
+        assert!(metrics_payload.contains("auth_v2_password_start_requests_total"));
+        assert!(metrics_payload.contains("outcome=\"invalid_request\""));
+        assert!(metrics_payload.contains("auth_v2_password_rejected_total"));
+        assert!(metrics_payload.contains("reason=\"invalid_request\""));
     }
 
     #[tokio::test]
@@ -3746,6 +3843,25 @@ mod tests {
             problem.body.type_url,
             "https://example.com/problems/auth-v2-rollout-denied"
         );
+
+        let metrics_response = super::metrics(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-password-upgrade-denied-metrics"),
+        )
+        .await
+        .expect("metrics should succeed")
+        .into_response();
+        let metrics_body = to_bytes(metrics_response.into_body(), 1024 * 1024)
+            .await
+            .expect("metrics body should be readable");
+        let metrics_payload =
+            String::from_utf8(metrics_body.to_vec()).expect("metrics payload should be utf-8");
+
+        assert!(metrics_payload.contains("auth_v2_password_upgrade_requests_total"));
+        assert!(metrics_payload.contains("operation=\"start\",outcome=\"rollout_denied\""));
+        assert!(metrics_payload.contains("auth_v2_password_rejected_total"));
+        assert!(metrics_payload.contains("reason=\"rollout_denied\""));
     }
 
     #[tokio::test]
@@ -4566,6 +4682,66 @@ mod tests {
             _now: chrono::DateTime<Utc>,
         ) -> Result<u64, String> {
             Ok(0)
+        }
+
+        async fn metrics_snapshot(
+            &self,
+            now: chrono::DateTime<Utc>,
+        ) -> Result<crate::modules::auth::ports::AuthFlowMetricsSnapshot, String> {
+            let flows = self
+                .flows
+                .lock()
+                .map_err(|_| "auth flow storage unavailable".to_string())?;
+            let mut active_counts = [0_u64; 5];
+            let mut expired_pending_total = 0_u64;
+            let mut oldest_expired_pending_age_seconds = 0_u64;
+
+            for flow in flows.values() {
+                if flow.status != crate::modules::auth::domain::AuthFlowStatus::Pending {
+                    continue;
+                }
+
+                if flow.expires_at > now {
+                    let index = match flow.flow_kind {
+                        crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery => 0,
+                        crate::modules::auth::domain::AuthFlowKind::PasswordLogin => 1,
+                        crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade => 2,
+                        crate::modules::auth::domain::AuthFlowKind::PasskeyLogin => 3,
+                        crate::modules::auth::domain::AuthFlowKind::PasskeyRegister => 4,
+                    };
+                    active_counts[index] += 1;
+                    continue;
+                }
+
+                expired_pending_total += 1;
+                let age_seconds = (now - flow.expires_at).num_seconds().max(0) as u64;
+                oldest_expired_pending_age_seconds =
+                    oldest_expired_pending_age_seconds.max(age_seconds);
+            }
+
+            let active_by_kind = [
+                crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery,
+                crate::modules::auth::domain::AuthFlowKind::PasswordLogin,
+                crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade,
+                crate::modules::auth::domain::AuthFlowKind::PasskeyLogin,
+                crate::modules::auth::domain::AuthFlowKind::PasskeyRegister,
+            ]
+            .into_iter()
+            .zip(active_counts)
+            .filter(|(_, pending_total)| *pending_total > 0)
+            .map(
+                |(flow_kind, pending_total)| crate::modules::auth::ports::AuthFlowMetricBucket {
+                    flow_kind,
+                    pending_total,
+                },
+            )
+            .collect::<Vec<_>>();
+
+            Ok(crate::modules::auth::ports::AuthFlowMetricsSnapshot {
+                active_by_kind,
+                expired_pending_total,
+                oldest_expired_pending_age_seconds,
+            })
         }
 
         async fn prune_expired(&self, now: chrono::DateTime<Utc>) -> Result<u64, String> {
