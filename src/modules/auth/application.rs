@@ -25,12 +25,12 @@ use crate::modules::{
             LoginAbuseProtector, LoginGateDecision, LoginRiskAnalyzer, LoginRiskDecision,
             MfaBackupCodeConsumeState, MfaBackupCodeRepository, MfaChallengeFailureState,
             MfaChallengeLookupState, MfaChallengeRepository, MfaFactorRepository,
-            PasskeyService,
             PasskeyAuthenticationChallengeConsumeState, PasskeyAuthenticationChallengeRecord,
             PasskeyChallengeRepository, PasskeyCredentialRepository,
             PasskeyRegistrationChallengeConsumeState, PasskeyRegistrationChallengeRecord,
-            PasswordResetTokenConsumeState, PasswordResetTokenRepository, TransactionalEmailSender,
-            UserRepository, VerificationTokenConsumeState, VerificationTokenRepository,
+            PasskeyService, PasswordResetTokenConsumeState, PasswordResetTokenRepository,
+            TransactionalEmailSender, UserRepository, VerificationTokenConsumeState,
+            VerificationTokenRepository,
         },
     },
     sessions::{
@@ -3472,10 +3472,10 @@ mod tests {
     };
 
     use crate::{
-        adapters::passkey::WebauthnPasskeyService,
         adapters::inmemory::{
             InMemoryAdapters, InMemoryAuditRepository, JwtEdDsaService, RefreshCryptoHmacService,
         },
+        adapters::passkey::WebauthnPasskeyService,
         config::{
             AppConfig, AuthRuntime, AuthV2Config, AuthV2LegacyFallbackMode, LoginAbuseBucketMode,
             LoginAbuseRedisFailMode,
@@ -3536,10 +3536,13 @@ mod tests {
             user_name: &str,
             user_display_name: &str,
             exclude_credentials: Option<Vec<CredentialID>>,
-        ) -> Result<(
-            webauthn_rs::prelude::CreationChallengeResponse,
-            PasskeyRegistration,
-        ), String> {
+        ) -> Result<
+            (
+                webauthn_rs::prelude::CreationChallengeResponse,
+                PasskeyRegistration,
+            ),
+            String,
+        > {
             self.inner
                 .start_passkey_registration(
                     user_unique_id,
@@ -3567,10 +3570,13 @@ mod tests {
         fn start_authentication(
             &self,
             passkeys: &[Passkey],
-        ) -> Result<(
-            webauthn_rs::prelude::RequestChallengeResponse,
-            PasskeyAuthentication,
-        ), String> {
+        ) -> Result<
+            (
+                webauthn_rs::prelude::RequestChallengeResponse,
+                PasskeyAuthentication,
+            ),
+            String,
+        > {
             self.inner
                 .start_passkey_authentication(passkeys)
                 .map_err(|err| err.to_string())
@@ -6475,9 +6481,8 @@ mod tests {
             .expect("passkey test webauthn builder should initialize")
             .build()
             .expect("passkey test webauthn should build");
-        harness.service.passkey_service = Some(Arc::new(SuccessfulFinishPasskeyService::new(
-            webauthn,
-        )));
+        harness.service.passkey_service =
+            Some(Arc::new(SuccessfulFinishPasskeyService::new(webauthn)));
     }
 
     fn dummy_passkey_login_credential() -> PublicKeyCredential {

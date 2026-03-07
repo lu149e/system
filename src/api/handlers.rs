@@ -1862,8 +1862,8 @@ mod tests {
     use sha1::Sha1;
     use uuid::Uuid;
     use webauthn_rs::prelude::{
-        AuthenticationResult, CredentialID, Passkey, PasskeyAuthentication,
-        PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential, Webauthn,
+        AuthenticationResult, CredentialID, Passkey, PasskeyAuthentication, PasskeyRegistration,
+        PublicKeyCredential, RegisterPublicKeyCredential, Webauthn,
     };
 
     use crate::{
@@ -1925,10 +1925,13 @@ mod tests {
             user_name: &str,
             user_display_name: &str,
             exclude_credentials: Option<Vec<CredentialID>>,
-        ) -> Result<(
-            webauthn_rs::prelude::CreationChallengeResponse,
-            PasskeyRegistration,
-        ), String> {
+        ) -> Result<
+            (
+                webauthn_rs::prelude::CreationChallengeResponse,
+                PasskeyRegistration,
+            ),
+            String,
+        > {
             self.inner
                 .start_passkey_registration(
                     user_unique_id,
@@ -1956,10 +1959,13 @@ mod tests {
         fn start_authentication(
             &self,
             passkeys: &[Passkey],
-        ) -> Result<(
-            webauthn_rs::prelude::RequestChallengeResponse,
-            PasskeyAuthentication,
-        ), String> {
+        ) -> Result<
+            (
+                webauthn_rs::prelude::RequestChallengeResponse,
+                PasskeyAuthentication,
+            ),
+            String,
+        > {
             self.inner
                 .start_passkey_authentication(passkeys)
                 .map_err(|err| err.to_string())
@@ -3871,13 +3877,7 @@ mod tests {
     }
 
     async fn build_v2_harness_with_successful_finish_passkey_service() -> HandlerHarness {
-        build_v2_harness_with_options_and_passkey_service(
-            false,
-            true,
-            true,
-            true,
-        )
-        .await
+        build_v2_harness_with_options_and_passkey_service(false, true, true, true).await
     }
 
     async fn build_v2_harness_with_options(

@@ -3,9 +3,9 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 use webauthn_rs::prelude::{
-    AuthenticationResult, CreationChallengeResponse, CredentialID, Passkey,
-    PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential,
-    RegisterPublicKeyCredential, RequestChallengeResponse,
+    AuthenticationResult, CreationChallengeResponse, CredentialID, Passkey, PasskeyAuthentication,
+    PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
+    RequestChallengeResponse,
 };
 
 use crate::modules::auth::domain::{
