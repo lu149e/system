@@ -11,6 +11,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  checks: read
 
 concurrency:
   group: dependabot-auto-merge-${{ github.event.pull_request.number }}
@@ -22,6 +23,7 @@ jobs:
       github.event.pull_request.user.login == 'dependabot[bot]' &&
       github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Fetch Dependabot metadata
         id: metadata
@@ -42,7 +44,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
-        run: gh pr merge --auto --rebase "$PR_URL"
+        run: |
+          gh pr checks "$PR_URL" || true
+          gh pr merge --auto --rebase "$PR_URL"
 
       - name: Skip auto-merge for runtime or high-risk updates
         if: >-
