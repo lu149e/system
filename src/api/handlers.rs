@@ -886,7 +886,8 @@ pub async fn auth_methods_v2(
         .clone()
         .or_else(|| payload.client.platform.clone());
     let channel = client_id.clone().unwrap_or_else(|| "unknown".to_string());
-    enforce_auth_v2_rollout_access(&state, client_id.as_deref(), &trace_id)?;
+    enforce_auth_v2_rollout_access(&state, client_id.as_deref(), &trace_id)
+        .map_err(|problem| *problem)?;
     let ctx = request_context(
         &headers,
         trace_id.clone(),
@@ -1025,7 +1026,8 @@ pub async fn password_upgrade_start_v2(
 
     let principal = extract_principal(&state, &headers, trace_id.clone()).await?;
     let client_id = payload.client.platform.clone();
-    enforce_auth_v2_rollout_access(&state, client_id.as_deref(), &trace_id)?;
+    enforce_auth_v2_rollout_access(&state, client_id.as_deref(), &trace_id)
+        .map_err(|problem| *problem)?;
     let mut ctx = request_context(
         &headers,
         trace_id.clone(),
@@ -1798,18 +1800,21 @@ fn enforce_auth_v2_rollout_access(
     state: &AppState,
     client_id: Option<&str>,
     trace_id: &str,
-) -> Result<(), ApiProblem> {
+) -> Result<(), Box<ApiProblem>> {
     let Some(config) = state.auth_service.auth_v2_config() else {
-        return Err(from_auth_error(AuthError::Internal, trace_id.to_string()));
+        return Err(Box::new(from_auth_error(
+            AuthError::Internal,
+            trace_id.to_string(),
+        )));
     };
     let rollout = evaluate_auth_v2_rollout(&config, client_id, None);
     if auth_v2_allows_external_access(&config, &rollout) {
         Ok(())
     } else {
-        Err(from_auth_error(
+        Err(Box::new(from_auth_error(
             AuthError::AuthV2RolloutDenied,
             trace_id.to_string(),
-        ))
+        )))
     }
 }
 
