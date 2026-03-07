@@ -652,7 +652,9 @@ impl AuthFlowRepository for PostgresAuthFlowRepository {
         .map_err(|_| "auth flow consume failed".to_string())?;
 
         if let Some(row) = row {
-            return Ok(AuthFlowConsumeState::Active(auth_flow_from_row(row)?));
+            return Ok(AuthFlowConsumeState::Active(Box::new(auth_flow_from_row(
+                row,
+            )?)));
         }
 
         let row = sqlx::query(
@@ -2170,15 +2172,6 @@ fn parse_uuids(values: &[String]) -> Vec<Uuid> {
         .iter()
         .filter_map(|id| Uuid::parse_str(id).ok())
         .collect()
-}
-
-fn parse_user_status(value: String) -> UserStatus {
-    match value.as_str() {
-        "active" => UserStatus::Active,
-        "pending_verification" => UserStatus::PendingVerification,
-        "locked" => UserStatus::Locked,
-        _ => UserStatus::Locked,
-    }
 }
 
 fn parse_account_status(value: String) -> AccountStatus {

@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use opaque_ke::{
     argon2::Argon2, ciphersuite::CipherSuite, rand::rngs::OsRng, CredentialFinalization,
-    CredentialRequest, RegistrationRequest, RegistrationResponse, RegistrationUpload, ServerLogin,
-    ServerLoginParameters, ServerRegistration, ServerSetup,
+    CredentialRequest, RegistrationRequest, RegistrationUpload, ServerLogin, ServerLoginParameters,
+    ServerRegistration, ServerSetup,
 };
 use serde_json::{json, Value};
 
@@ -51,9 +51,7 @@ pub fn build_password_pake_service(
             )?;
 
             if cfg.auth_runtime == AuthRuntime::InMemory {
-                tracing::warn!(
-                    "using opaque-ke PAKE with AUTH_RUNTIME=inmemory; server setup is process-local"
-                );
+                tracing::warn!("using opaque-ke PAKE with in-memory auth runtime");
             }
 
             Ok(std::sync::Arc::new(service))
@@ -311,7 +309,7 @@ mod tests {
     use super::*;
     use opaque_ke::{
         ClientLogin, ClientLoginFinishParameters, ClientRegistration,
-        ClientRegistrationFinishParameters, CredentialResponse,
+        ClientRegistrationFinishParameters, CredentialResponse, RegistrationResponse,
     };
 
     #[tokio::test]

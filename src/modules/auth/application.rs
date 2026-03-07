@@ -1379,7 +1379,7 @@ impl AuthService {
                     crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery
                 ) =>
             {
-                flow
+                *flow
             }
             _ => return Err(AuthError::InvalidToken),
         };
@@ -1771,7 +1771,7 @@ impl AuthService {
                     crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery
                 ) =>
             {
-                flow
+                *flow
             }
             _ => return Err(AuthError::InvalidToken),
         };
@@ -1900,7 +1900,7 @@ impl AuthService {
                     crate::modules::auth::domain::AuthFlowKind::PasswordLogin
                 ) =>
             {
-                flow
+                *flow
             }
             _ => return Err(AuthError::InvalidCredentials),
         };
@@ -2117,7 +2117,7 @@ impl AuthService {
                     crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade
                 ) =>
             {
-                flow
+                *flow
             }
             _ => return Err(AuthError::InvalidToken),
         };
@@ -3801,7 +3801,7 @@ mod tests {
             flow.status = AuthFlowStatus::Consumed;
             flow.consumed_at = Some(now);
             flow.updated_at = now;
-            Ok(AuthFlowConsumeState::Active(flow.clone()))
+            Ok(AuthFlowConsumeState::Active(Box::new(flow.clone())))
         }
 
         async fn increment_attempts(
@@ -4672,7 +4672,7 @@ mod tests {
                     && event.trace_id == "passkey-login-finish-v2-success"
             })
             .expect("v2 passkey login success audit should exist");
-        assert_eq!(event.metadata["challenge_created_at"].is_null(), false);
+        assert!(!event.metadata["challenge_created_at"].is_null());
     }
 
     #[tokio::test]
@@ -4714,7 +4714,7 @@ mod tests {
                     && event.trace_id == "passkey-register-finish-v2-success"
             })
             .expect("v2 passkey enroll success audit should exist");
-        assert_eq!(event.metadata["challenge_created_at"].is_null(), false);
+        assert!(!event.metadata["challenge_created_at"].is_null());
     }
 
     #[tokio::test]

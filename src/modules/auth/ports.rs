@@ -75,13 +75,14 @@ pub trait OpaqueCredentialRepository: Send + Sync {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AuthFlowConsumeState {
-    Active(AuthFlowRecord),
+    Active(Box<AuthFlowRecord>),
     NotFound,
     AlreadyConsumed,
     Expired,
     Cancelled,
 }
 
+#[allow(dead_code)]
 #[async_trait]
 pub trait AuthFlowRepository: Send + Sync {
     async fn issue(&self, flow: AuthFlowRecord) -> Result<(), String>;
@@ -102,6 +103,7 @@ pub trait AuthFlowRepository: Send + Sync {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum AuthMethodKind {
     PasswordPake,
     PasswordUpgrade,
@@ -116,6 +118,7 @@ pub struct AuthMethodDescriptor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct AuthMethodDiscoveryRequest {
     pub identifier: String,
     pub client_id: Option<String>,
@@ -124,6 +127,7 @@ pub struct AuthMethodDiscoveryRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct AuthMethodDiscoveryResult {
     pub discovery_token: String,
     pub recommended_method: Option<AuthMethodKind>,
@@ -216,6 +220,7 @@ pub trait PasskeyService: Send + Sync {
     ) -> Result<AuthenticationResult, String>;
 }
 
+#[allow(dead_code)]
 #[async_trait]
 pub trait AuthMethodDiscoveryService: Send + Sync {
     async fn discover(

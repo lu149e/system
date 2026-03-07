@@ -108,8 +108,10 @@ pub struct PasskeyChallengeResponse {
 #[derive(Debug, Deserialize)]
 pub struct PasskeyRegisterStartV2Request {
     #[serde(default)]
+    #[allow(dead_code)]
     pub label: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub authenticator_preference: Option<String>,
 }
 
@@ -154,6 +156,7 @@ pub struct AuthMethodsRequest {
 pub struct AuthClientCapabilitiesRequest {
     pub supports_pake: bool,
     pub supports_passkeys: bool,
+    #[allow(dead_code)]
     pub supports_conditional_mediation: Option<bool>,
     pub platform: Option<String>,
 }
@@ -4315,7 +4318,7 @@ mod tests {
             flow.consumed_at = Some(now);
             flow.updated_at = now;
             Ok(crate::modules::auth::ports::AuthFlowConsumeState::Active(
-                flow.clone(),
+                Box::new(flow.clone()),
             ))
         }
 
