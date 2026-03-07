@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use argon2::{password_hash::SaltString, Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
@@ -590,7 +590,7 @@ impl AuthService {
             .append(AuditEvent {
                 event_type: "auth.verify_email.success".to_string(),
                 actor_user_id: Some(user_id),
-                trace_id: ctx.trace_id,
+                trace_id: ctx.trace_id.clone(),
                 metadata: json!({"ip": ctx.ip, "user_agent": ctx.user_agent}),
                 created_at: now,
             })
@@ -719,7 +719,7 @@ impl AuthService {
             .append(AuditEvent {
                 event_type: "auth.password.reset.success".to_string(),
                 actor_user_id: Some(user_id),
-                trace_id: ctx.trace_id,
+                trace_id: ctx.trace_id.clone(),
                 metadata: json!({"revoked_sessions": session_ids.len(), "ip": ctx.ip, "user_agent": ctx.user_agent}),
                 created_at: now,
             })
@@ -799,7 +799,7 @@ impl AuthService {
             .append(AuditEvent {
                 event_type: "auth.password.change.success".to_string(),
                 actor_user_id: Some(cmd.user_id),
-                trace_id: ctx.trace_id,
+                trace_id: ctx.trace_id.clone(),
                 metadata: json!({"revoked_sessions": session_ids.len(), "ip": ctx.ip, "user_agent": ctx.user_agent}),
                 created_at: now,
             })
@@ -849,7 +849,7 @@ impl AuthService {
             .append(AuditEvent {
                 event_type: "auth.mfa.enroll.issued".to_string(),
                 actor_user_id: Some(user_id.to_string()),
-                trace_id: ctx.trace_id,
+                trace_id: ctx.trace_id.clone(),
                 metadata: json!({"ip": ctx.ip, "user_agent": ctx.user_agent}),
                 created_at: now,
             })
@@ -916,7 +916,7 @@ impl AuthService {
             .append(AuditEvent {
                 event_type: "auth.mfa.activate.success".to_string(),
                 actor_user_id: Some(cmd.user_id),
-                trace_id: ctx.trace_id,
+                trace_id: ctx.trace_id.clone(),
                 metadata: json!({"backup_codes": backup_codes.len(), "ip": ctx.ip, "user_agent": ctx.user_agent}),
                 created_at: now,
             })
@@ -1028,7 +1028,7 @@ impl AuthService {
             .append(AuditEvent {
                 event_type: "auth.mfa.verify.success".to_string(),
                 actor_user_id: Some(user_id),
-                trace_id: ctx.trace_id,
+                trace_id: ctx.trace_id.clone(),
                 metadata: json!({"session_id": principal.session_id, "ip": ctx.ip, "user_agent": ctx.user_agent}),
                 created_at: now,
             })
@@ -1120,7 +1120,7 @@ impl AuthService {
             .append(AuditEvent {
                 event_type: "auth.mfa.disable.success".to_string(),
                 actor_user_id: Some(cmd.user_id),
-                trace_id: ctx.trace_id,
+                trace_id: ctx.trace_id.clone(),
                 metadata: json!({"ip": ctx.ip, "user_agent": ctx.user_agent, "revoked_sessions": session_ids.len()}),
                 created_at: now,
             })
@@ -1190,8 +1190,11 @@ impl AuthService {
                 }
                 .to_string(),
                 actor_user_id: Some(user.id),
-                trace_id: ctx.trace_id,
-                metadata: json!({"ip": ctx.ip, "user_agent": ctx.user_agent}),
+                trace_id: ctx.trace_id.clone(),
+                metadata: auth_v2_passkey_audit_metadata(
+                    &ctx,
+                    json!({"ip": ctx.ip, "user_agent": ctx.user_agent}),
+                ),
                 created_at: now,
             })
             .await;
@@ -1284,8 +1287,11 @@ impl AuthService {
                 }
                 .to_string(),
                 actor_user_id: Some(user_id.to_string()),
-                trace_id: ctx.trace_id,
-                metadata: json!({"ip": ctx.ip, "user_agent": ctx.user_agent, "challenge_created_at": pending.created_at}),
+                trace_id: ctx.trace_id.clone(),
+                metadata: auth_v2_passkey_audit_metadata(
+                    &ctx,
+                    json!({"ip": ctx.ip, "user_agent": ctx.user_agent, "challenge_created_at": pending.created_at}),
+                ),
                 created_at: Utc::now(),
             })
             .await;
@@ -1368,8 +1374,11 @@ impl AuthService {
                 }
                 .to_string(),
                 actor_user_id: Some(user.id),
-                trace_id: ctx.trace_id,
-                metadata: json!({"ip": ctx.ip, "user_agent": ctx.user_agent}),
+                trace_id: ctx.trace_id.clone(),
+                metadata: auth_v2_passkey_audit_metadata(
+                    &ctx,
+                    json!({"ip": ctx.ip, "user_agent": ctx.user_agent}),
+                ),
                 created_at: now,
             })
             .await;
@@ -1427,6 +1436,8 @@ impl AuthService {
             return Err(AuthError::AuthV2RolloutDenied);
         }
 
+        let mut ctx = ctx;
+        ctx.client_id = Some(rollout.rollout_channel);
         self.passkey_login_start(identifier, ctx).await
     }
 
@@ -1563,8 +1574,11 @@ impl AuthService {
                 }
                 .to_string(),
                 actor_user_id: Some(user.id),
-                trace_id: ctx.trace_id,
-                metadata: json!({"session_id": principal.session_id, "ip": ctx.ip, "user_agent": ctx.user_agent, "challenge_created_at": pending.created_at}),
+                trace_id: ctx.trace_id.clone(),
+                metadata: auth_v2_passkey_audit_metadata(
+                    &ctx,
+                    json!({"session_id": principal.session_id, "ip": ctx.ip, "user_agent": ctx.user_agent, "challenge_created_at": pending.created_at}),
+                ),
                 created_at: Utc::now(),
             })
             .await;
@@ -1669,7 +1683,7 @@ impl AuthService {
             .append(AuditEvent {
                 event_type: "auth.login.success".to_string(),
                 actor_user_id: Some(user.id),
-                trace_id: ctx.trace_id,
+                trace_id: ctx.trace_id.clone(),
                 metadata: json!({"session_id": principal.session_id, "ip": ctx.ip, "user_agent": ctx.user_agent}),
                 created_at: now,
             })
@@ -1752,7 +1766,7 @@ impl AuthService {
             .append(AuditEvent {
                 event_type: "auth.v2.methods.requested".to_string(),
                 actor_user_id: account.map(|record| record.id),
-                trace_id: ctx.trace_id,
+                trace_id: ctx.trace_id.clone(),
                 metadata: json!({
                     "methods": methods.iter().map(|method| auth_method_kind_label(&method.kind)).collect::<Vec<_>>(),
                     "recommended_method": recommended_method_label.clone(),
@@ -1788,7 +1802,11 @@ impl AuthService {
         if !v2.config.enabled || !v2.config.password_pake_enabled {
             return Err(AuthError::Internal);
         }
+        let started_at = Instant::now();
         let mut metrics_channel = auth_v2_rollout_channel_hint(ctx.client_id.as_deref());
+        let mut audit_actor_user_id: Option<String> = None;
+        let mut audit_fallback_policy: Option<String> = None;
+        let mut audit_flow_id: Option<String> = None;
         let result = async {
             let identifier = cmd.identifier.to_ascii_lowercase();
             let now = Utc::now();
@@ -1842,6 +1860,8 @@ impl AuthService {
             };
             let rollout = auth_v2_rollout_from_flow(&v2.config, &discovery_flow, legacy.as_ref());
             metrics_channel = rollout.rollout_channel.clone();
+            audit_actor_user_id = account.as_ref().map(|record| record.id.clone());
+            audit_fallback_policy = Some(rollout.fallback_policy.as_str().to_string());
             crate::observability::record_auth_v2_legacy_fallback(
                 auth_v2_fallback_reason(&v2.config, legacy.as_ref(), &rollout),
                 &rollout.rollout_channel,
@@ -1851,6 +1871,7 @@ impl AuthService {
             }
 
             let flow_id = Uuid::new_v4().to_string();
+            audit_flow_id = Some(flow_id.clone());
             let result = v2
                 .pake_service
                 .start_login(
@@ -1930,10 +1951,33 @@ impl AuthService {
             })
         }
         .await;
+        if let Some(reason) = result.as_ref().err().map(auth_v2_error_reason) {
+            self.audit
+                .append(AuditEvent {
+                    event_type: "auth.v2.password.login.rejected".to_string(),
+                    actor_user_id: audit_actor_user_id,
+                    trace_id: ctx.trace_id.clone(),
+                    metadata: json!({
+                        "reason": reason,
+                        "flow_id": audit_flow_id,
+                        "rollout_channel": metrics_channel,
+                        "fallback_policy": audit_fallback_policy,
+                        "ip": ctx.ip,
+                        "user_agent": ctx.user_agent,
+                    }),
+                    created_at: Utc::now(),
+                })
+                .await;
+        }
         crate::observability::record_auth_v2_password_request(
             "login_start",
             auth_v2_request_outcome(&result),
             &metrics_channel,
+        );
+        crate::observability::observe_auth_v2_password_duration(
+            "login_start",
+            auth_v2_request_outcome(&result),
+            started_at.elapsed(),
         );
         result
     }
@@ -1947,7 +1991,10 @@ impl AuthService {
         if !v2.config.enabled || !v2.config.password_pake_enabled {
             return Err(AuthError::Internal);
         }
+        let started_at = Instant::now();
         let mut metrics_channel = "unknown".to_string();
+        let mut audit_actor_user_id: Option<String> = None;
+        let mut audit_fallback_policy: Option<String> = None;
         let result = async {
             let now = Utc::now();
             let flow_state = v2
@@ -1968,6 +2015,7 @@ impl AuthService {
             };
             let rollout = auth_v2_rollout_from_flow(&v2.config, &flow, None);
             metrics_channel = rollout.rollout_channel.clone();
+            audit_fallback_policy = Some(rollout.fallback_policy.as_str().to_string());
 
             let server_state = flow
                 .state
@@ -1991,6 +2039,7 @@ impl AuthService {
                 .find_by_id(&finish.session_user_id)
                 .await
                 .ok_or(AuthError::InvalidCredentials)?;
+            audit_actor_user_id = Some(account.id.clone());
             if account.status != crate::modules::auth::domain::AccountStatus::Active {
                 return Err(AuthError::InvalidCredentials);
             }
@@ -2041,7 +2090,7 @@ impl AuthService {
                 .append(AuditEvent {
                     event_type: "auth.v2.password.login.success".to_string(),
                     actor_user_id: Some(account.id),
-                    trace_id: ctx.trace_id,
+                    trace_id: ctx.trace_id.clone(),
                     metadata: json!({
                         "session_id": principal.session_id,
                         "rollout_channel": rollout.rollout_channel,
@@ -2056,10 +2105,33 @@ impl AuthService {
             Ok(LoginResult::Authenticated { tokens, principal })
         }
         .await;
+        if let Some(reason) = result.as_ref().err().map(auth_v2_error_reason) {
+            self.audit
+                .append(AuditEvent {
+                    event_type: "auth.v2.password.login.rejected".to_string(),
+                    actor_user_id: audit_actor_user_id,
+                    trace_id: ctx.trace_id.clone(),
+                    metadata: json!({
+                        "reason": reason,
+                        "flow_id": cmd.flow_id,
+                        "rollout_channel": metrics_channel,
+                        "fallback_policy": audit_fallback_policy,
+                        "ip": ctx.ip,
+                        "user_agent": ctx.user_agent,
+                    }),
+                    created_at: Utc::now(),
+                })
+                .await;
+        }
         crate::observability::record_auth_v2_password_request(
             "login_finish",
             auth_v2_request_outcome(&result),
             &metrics_channel,
+        );
+        crate::observability::observe_auth_v2_password_duration(
+            "login_finish",
+            auth_v2_request_outcome(&result),
+            started_at.elapsed(),
         );
         result
     }
@@ -2077,7 +2149,9 @@ impl AuthService {
             return Err(AuthError::Internal);
         }
 
+        let started_at = Instant::now();
         let mut metrics_channel = auth_v2_rollout_channel_hint(ctx.client_id.as_deref());
+        let mut audit_fallback_policy: Option<String> = None;
         let result = async {
             let now = Utc::now();
             let account = v2
@@ -2108,6 +2182,7 @@ impl AuthService {
             let rollout =
                 evaluate_auth_v2_rollout(&v2.config, ctx.client_id.as_deref(), Some(&legacy));
             metrics_channel = rollout.rollout_channel.clone();
+            audit_fallback_policy = Some(rollout.fallback_policy.as_str().to_string());
             if !auth_v2_allows_external_access(&v2.config, &rollout) {
                 return Err(AuthError::AuthV2RolloutDenied);
             }
@@ -2161,7 +2236,7 @@ impl AuthService {
                 .append(AuditEvent {
                     event_type: "auth.v2.password.upgrade.started".to_string(),
                     actor_user_id: Some(account.id),
-                    trace_id: ctx.trace_id,
+                    trace_id: ctx.trace_id.clone(),
                     metadata: json!({
                         "rollout_channel": rollout.rollout_channel,
                         "fallback_policy": rollout.fallback_policy.as_str(),
@@ -2180,10 +2255,32 @@ impl AuthService {
             })
         }
         .await;
+        if let Some(reason) = result.as_ref().err().map(auth_v2_error_reason) {
+            self.audit
+                .append(AuditEvent {
+                    event_type: "auth.v2.password.upgrade.rejected".to_string(),
+                    actor_user_id: Some(cmd.user_id.clone()),
+                    trace_id: ctx.trace_id.clone(),
+                    metadata: json!({
+                        "reason": reason,
+                        "rollout_channel": metrics_channel,
+                        "fallback_policy": audit_fallback_policy,
+                        "ip": ctx.ip,
+                        "user_agent": ctx.user_agent,
+                    }),
+                    created_at: Utc::now(),
+                })
+                .await;
+        }
         crate::observability::record_auth_v2_password_request(
             "upgrade_start",
             auth_v2_request_outcome(&result),
             &metrics_channel,
+        );
+        crate::observability::observe_auth_v2_password_duration(
+            "upgrade_start",
+            auth_v2_request_outcome(&result),
+            started_at.elapsed(),
         );
         result
     }
@@ -2201,7 +2298,10 @@ impl AuthService {
             return Err(AuthError::Internal);
         }
 
+        let started_at = Instant::now();
         let mut metrics_channel = "unknown".to_string();
+        let mut audit_actor_user_id: Option<String> = None;
+        let mut audit_fallback_policy: Option<String> = None;
         let result = async {
             let now = Utc::now();
             let flow_state = v2
@@ -2222,8 +2322,10 @@ impl AuthService {
             };
             let rollout = auth_v2_rollout_from_flow(&v2.config, &flow, None);
             metrics_channel = rollout.rollout_channel.clone();
+            audit_fallback_policy = Some(rollout.fallback_policy.as_str().to_string());
 
             let user_id = flow.subject_user_id.ok_or(AuthError::InvalidToken)?;
+            audit_actor_user_id = Some(user_id.clone());
             let legacy = v2
                 .legacy_passwords
                 .find_by_user_id(&user_id)
@@ -2275,7 +2377,7 @@ impl AuthService {
                 .append(AuditEvent {
                     event_type: "auth.v2.password.upgrade.completed".to_string(),
                     actor_user_id: Some(user_id),
-                    trace_id: ctx.trace_id,
+                    trace_id: ctx.trace_id.clone(),
                     metadata: json!({
                         "rollout_channel": rollout.rollout_channel,
                         "fallback_policy": rollout.fallback_policy.as_str(),
@@ -2300,10 +2402,33 @@ impl AuthService {
             })
         }
         .await;
+        if let Some(reason) = result.as_ref().err().map(auth_v2_error_reason) {
+            self.audit
+                .append(AuditEvent {
+                    event_type: "auth.v2.password.upgrade.rejected".to_string(),
+                    actor_user_id: audit_actor_user_id,
+                    trace_id: ctx.trace_id.clone(),
+                    metadata: json!({
+                        "reason": reason,
+                        "flow_id": cmd.flow_id,
+                        "rollout_channel": metrics_channel,
+                        "fallback_policy": audit_fallback_policy,
+                        "ip": ctx.ip,
+                        "user_agent": ctx.user_agent,
+                    }),
+                    created_at: Utc::now(),
+                })
+                .await;
+        }
         crate::observability::record_auth_v2_password_request(
             "upgrade_finish",
             auth_v2_request_outcome(&result),
             &metrics_channel,
+        );
+        crate::observability::observe_auth_v2_password_duration(
+            "upgrade_finish",
+            auth_v2_request_outcome(&result),
+            started_at.elapsed(),
         );
         result
     }
@@ -3162,7 +3287,10 @@ impl AuthService {
                 .to_string(),
                 actor_user_id: actor_user_id.map(str::to_string),
                 trace_id: ctx.trace_id.clone(),
-                metadata: json!({"reason": reason, "flow_id": flow_id, "ip": ctx.ip, "user_agent": ctx.user_agent}),
+                metadata: auth_v2_passkey_audit_metadata(
+                    ctx,
+                    json!({"reason": reason, "flow_id": flow_id, "ip": ctx.ip, "user_agent": ctx.user_agent}),
+                ),
                 created_at: Utc::now(),
             })
             .await;
@@ -3185,7 +3313,10 @@ impl AuthService {
                 .to_string(),
                 actor_user_id: actor_user_id.map(str::to_string),
                 trace_id: ctx.trace_id.clone(),
-                metadata: json!({"reason": reason, "flow_id": flow_id, "ip": ctx.ip, "user_agent": ctx.user_agent}),
+                metadata: auth_v2_passkey_audit_metadata(
+                    ctx,
+                    json!({"reason": reason, "flow_id": flow_id, "ip": ctx.ip, "user_agent": ctx.user_agent}),
+                ),
                 created_at: Utc::now(),
             })
             .await;
@@ -3585,8 +3716,47 @@ fn auth_v2_request_outcome<T>(result: &Result<T, AuthError>) -> &'static str {
     }
 }
 
+fn auth_v2_error_reason(error: &AuthError) -> &'static str {
+    match error {
+        AuthError::InvalidRequest => "invalid_request",
+        AuthError::InvalidCredentials => "invalid_credentials",
+        AuthError::InvalidToken => "invalid_token",
+        AuthError::LoginLocked { .. } => "login_locked",
+        AuthError::OpaqueCredentialAlreadyActive => "opaque_credential_already_active",
+        AuthError::InvalidOpaqueRegistration => "invalid_opaque_registration",
+        AuthError::PakeUnavailable => "pake_unavailable",
+        AuthError::AuthV2RolloutDenied => "rollout_denied",
+        AuthError::Internal => "internal_error",
+        _ => "other",
+    }
+}
+
 fn auth_v2_rollout_channel_hint(client_id: Option<&str>) -> String {
     AuthV2Config::normalized_client_id(client_id).unwrap_or_else(|| "unknown".to_string())
+}
+
+fn auth_v2_passkey_audit_metadata(
+    ctx: &RequestContext,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    match ctx.auth_api_surface {
+        AuthApiSurface::V1 => extra,
+        AuthApiSurface::V2 => {
+            let mut payload = match extra {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::new(),
+            };
+            payload.insert(
+                "rollout_channel".to_string(),
+                serde_json::Value::String(auth_v2_rollout_channel_hint(ctx.client_id.as_deref())),
+            );
+            payload.insert(
+                "fallback_policy".to_string(),
+                serde_json::Value::String(AuthV2FallbackPolicy::Disabled.as_str().to_string()),
+            );
+            serde_json::Value::Object(payload)
+        }
+    }
 }
 
 fn auth_v2_fallback_reason(
@@ -4008,6 +4178,66 @@ mod tests {
             _now: DateTime<Utc>,
         ) -> Result<u64, String> {
             Ok(0)
+        }
+
+        async fn metrics_snapshot(
+            &self,
+            now: DateTime<Utc>,
+        ) -> Result<crate::modules::auth::ports::AuthFlowMetricsSnapshot, String> {
+            let flows = self
+                .flows
+                .lock()
+                .map_err(|_| "flow lock unavailable".to_string())?;
+            let mut active_counts = [0_u64; 5];
+            let mut expired_pending_total = 0_u64;
+            let mut oldest_expired_pending_age_seconds = 0_u64;
+
+            for flow in flows.values() {
+                if flow.status != AuthFlowStatus::Pending {
+                    continue;
+                }
+
+                if flow.expires_at > now {
+                    let index = match flow.flow_kind {
+                        crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery => 0,
+                        crate::modules::auth::domain::AuthFlowKind::PasswordLogin => 1,
+                        crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade => 2,
+                        crate::modules::auth::domain::AuthFlowKind::PasskeyLogin => 3,
+                        crate::modules::auth::domain::AuthFlowKind::PasskeyRegister => 4,
+                    };
+                    active_counts[index] += 1;
+                    continue;
+                }
+
+                expired_pending_total += 1;
+                let age_seconds = (now - flow.expires_at).num_seconds().max(0) as u64;
+                oldest_expired_pending_age_seconds =
+                    oldest_expired_pending_age_seconds.max(age_seconds);
+            }
+
+            let active_by_kind = [
+                crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery,
+                crate::modules::auth::domain::AuthFlowKind::PasswordLogin,
+                crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade,
+                crate::modules::auth::domain::AuthFlowKind::PasskeyLogin,
+                crate::modules::auth::domain::AuthFlowKind::PasskeyRegister,
+            ]
+            .into_iter()
+            .zip(active_counts)
+            .filter(|(_, pending_total)| *pending_total > 0)
+            .map(
+                |(flow_kind, pending_total)| crate::modules::auth::ports::AuthFlowMetricBucket {
+                    flow_kind,
+                    pending_total,
+                },
+            )
+            .collect::<Vec<_>>();
+
+            Ok(crate::modules::auth::ports::AuthFlowMetricsSnapshot {
+                active_by_kind,
+                expired_pending_total,
+                oldest_expired_pending_age_seconds,
+            })
         }
 
         async fn prune_expired(&self, _now: DateTime<Utc>) -> Result<u64, String> {
@@ -4548,10 +4778,15 @@ mod tests {
             .events
             .lock()
             .expect("audit lock should be available");
-        assert!(events.iter().any(|event| {
-            event.event_type == "auth.v2.passkey.enroll.started"
-                && event.trace_id == "passkey-register-start-v2-audit"
-        }));
+        let event = events
+            .iter()
+            .find(|event| {
+                event.event_type == "auth.v2.passkey.enroll.started"
+                    && event.trace_id == "passkey-register-start-v2-audit"
+            })
+            .expect("v2 passkey register start audit should exist");
+        assert_eq!(event.metadata["fallback_policy"], "disabled");
+        assert!(!event.metadata["rollout_channel"].is_null());
     }
 
     #[tokio::test]
@@ -4721,10 +4956,15 @@ mod tests {
             .events
             .lock()
             .expect("audit lock should be available");
-        assert!(events.iter().any(|event| {
-            event.event_type == "auth.v2.passkey.login.challenge.issued"
-                && event.trace_id == "passkey-login-start-v2-audit"
-        }));
+        let event = events
+            .iter()
+            .find(|event| {
+                event.event_type == "auth.v2.passkey.login.challenge.issued"
+                    && event.trace_id == "passkey-login-start-v2-audit"
+            })
+            .expect("v2 passkey login challenge audit should exist");
+        assert_eq!(event.metadata["fallback_policy"], "disabled");
+        assert!(!event.metadata["rollout_channel"].is_null());
     }
 
     #[tokio::test]
@@ -4852,6 +5092,8 @@ mod tests {
             })
             .expect("v2 passkey login success audit should exist");
         assert!(!event.metadata["challenge_created_at"].is_null());
+        assert_eq!(event.metadata["fallback_policy"], "disabled");
+        assert!(!event.metadata["rollout_channel"].is_null());
     }
 
     #[tokio::test]
@@ -4894,6 +5136,8 @@ mod tests {
             })
             .expect("v2 passkey enroll success audit should exist");
         assert!(!event.metadata["challenge_created_at"].is_null());
+        assert_eq!(event.metadata["fallback_policy"], "disabled");
+        assert!(!event.metadata["rollout_channel"].is_null());
     }
 
     #[tokio::test]
@@ -7380,5 +7624,7 @@ mod tests {
             .expect("v2 passkey audit event should exist");
 
         assert_eq!(event.metadata["flow_id"], flow_id);
+        assert_eq!(event.metadata["fallback_policy"], "disabled");
+        assert!(!event.metadata["rollout_channel"].is_null());
     }
 }

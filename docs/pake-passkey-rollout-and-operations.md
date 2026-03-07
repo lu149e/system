@@ -4,7 +4,7 @@
 
 - This doc covers how to roll out auth v2 without kidding ourselves about readiness.
 - Current repo already has useful production building blocks: audit events, sessions, refresh rotation, risk decisions, passkey metrics, readiness endpoints, and passkey challenge janitor plumbing (`src/observability.rs:13`-`src/observability.rs:44`, `src/health.rs:149`-`src/health.rs:168`, `docs/observability-auth-refresh.md:1`).
-- Target state adds PAKE-specific controls, dashboards, alerts, feature flags, and rollback procedures. Those are recommendations until implemented.
+- Target state adds PAKE-specific controls, dashboards, alerts, feature flags, and rollback procedures. The runtime metrics now exist in `src/observability.rs`, and the shipped operational assets live in `docs/grafana/auth-refresh-runtime-prometheus.json`, `docs/alerts/auth-refresh-alert-rules.yaml`, and `docs/deployment-production-checklist.md`.
 
 ## Current vs target
 
@@ -107,6 +107,7 @@ Each auth event should include rollout channel in audit metadata.
 ## Metrics to add for v2
 
 - `auth_v2_methods_requests_total{outcome,channel}`
+- `auth_v2_methods_rejected_total{reason}`
 - `auth_v2_methods_duration_seconds{outcome}`
 - `auth_v2_password_start_requests_total{outcome,channel}`
 - `auth_v2_password_start_duration_seconds{outcome}`
@@ -114,11 +115,18 @@ Each auth event should include rollout channel in audit metadata.
 - `auth_v2_password_finish_duration_seconds{outcome}`
 - `auth_v2_password_rejected_total{reason}`
 - `auth_v2_password_upgrade_requests_total{operation,outcome}`
-- `auth_v2_password_upgrade_completed_total{mode}`
+- `auth_v2_password_upgrade_duration_seconds{operation,outcome}`
 - `auth_v2_legacy_fallback_total{reason,channel}`
-- `auth_v2_auth_flows_prune_runs_total{outcome}`
-- `auth_v2_auth_flows_pruned_total{flow_kind}`
+- `auth_v2_auth_flow_janitor_enabled`
+- `auth_v2_auth_flow_prune_interval_seconds`
+- `auth_v2_auth_flow_prune_runs_total{outcome}`
+- `auth_v2_auth_flow_prune_last_success_unixtime`
+- `auth_v2_auth_flow_prune_last_failure_unixtime`
+- `auth_v2_auth_flow_pruned_total`
+- `auth_v2_auth_flow_prune_errors_total`
 - `auth_v2_auth_flows_active{flow_kind}`
+- `auth_v2_auth_flows_expired_pending_total`
+- `auth_v2_auth_flows_oldest_expired_pending_age_seconds`
 
 ## Audit events to add
 
@@ -150,6 +158,12 @@ Minimum dashboards before broad rollout:
 - 401/429/5xx problem rate by endpoint and client version
 - upgrade completion ratio for legacy accounts
 
+Shipped repo assets now cover the baseline rollout views:
+
+- `docs/grafana/auth-refresh-runtime-prometheus.json` includes auth v2 success/error ratio, password latency, fallback pressure, and auth-flow janitor/backlog panels.
+- `docs/alerts/auth-refresh-alert-rules.yaml` includes the matching recording and alert rules for password finish error ratio, fallback ratio, and auth-flow prune/backlog degradation.
+- `scripts/validate-observability-artifacts.sh` validates the Grafana JSON and Prometheus rules before anyone calls the assets production-ready.
+
 ## Alerts
 
 Minimum alert set before external rollout:
@@ -160,6 +174,18 @@ Minimum alert set before external rollout:
 - active expired flow backlog above threshold
 - v2 5xx rate above threshold
 - passkey registration or login rejection spike after release
+
+Current shipped alerts and records live in `docs/alerts/auth-refresh-alert-rules.yaml` and include:
+
+- `auth:auth_v2_password_finish_error_ratio_10m`
+- `auth:auth_v2_legacy_fallback_ratio_15m`
+- `auth:auth_v2_auth_flow_prune_errors_10m`
+- `auth:auth_v2_auth_flow_oldest_expired_pending_age_seconds_max_15m`
+- `AuthV2PasswordFinishErrorRatioHigh`
+- `AuthV2PasswordFinishErrorRatioCritical`
+- `AuthV2LegacyFallbackRatioHigh`
+- `AuthV2AuthFlowPruneErrorsSustained`
+- `AuthV2AuthFlowExpiredBacklogHigh`
 
 ## Suggested initial thresholds
 
@@ -212,14 +238,14 @@ Minimum alert set before external rollout:
 
 1. Confirm whether the issue is isolated to one client channel/version.
 2. Check `auth_v2_password_finish_requests_total` and `auth_v2_password_rejected_total{reason}`.
-3. Compare fallback ratio and problem response rate.
+3. Compare `auth:auth_v2_password_finish_error_ratio_10m`, `auth:auth_v2_legacy_fallback_ratio_15m`, and problem response rate in `docs/grafana/auth-refresh-runtime-prometheus.json`.
 4. If impact is material, disable `AUTH_V2_PASSWORD_PAKE_ENABLED` for affected channels.
 5. Keep `AUTH_V2_METHODS_ENABLED` on only if it can safely recommend passkeys or v1 fallback.
 6. Capture sample traces via `trace_id` and audit rows before changing more flags.
 
 ## Runbook: auth flow store degradation
 
-1. Check DB health and janitor metrics.
+1. Check DB health plus `auth_v2_auth_flow_prune_runs_total`, `auth_v2_auth_flows_expired_pending_total`, and `auth_v2_auth_flows_oldest_expired_pending_age_seconds`.
 2. If `auth_flows` writes or consumes fail, disable `AUTH_V2_PASSWORD_PAKE_ENABLED` and `AUTH_V2_PASSWORD_UPGRADE_ENABLED`.
 3. Keep existing passkey path on `passkey_challenges` only if it is isolated and healthy.
 4. Do not leave partially working shared flow storage enabled.
@@ -227,7 +253,7 @@ Minimum alert set before external rollout:
 ## Runbook: fallback explosion
 
 1. Check if the cause is new cohort onboarding, specific client version, or protocol service failure.
-2. If fallback ratio exceeds go/no-go limits, move affected cohort back to v1.
+2. If `auth:auth_v2_legacy_fallback_ratio_15m` exceeds go/no-go limits, move the affected cohort back to v1.
 3. Audit every fallback reason bucket; unexpected `internal_error` or `unknown` buckets are release blockers.
 
 ## Runbook: passkey regression during v2 rollout
@@ -243,6 +269,8 @@ Minimum alert set before external rollout:
 - Turn off `AUTH_V2_PASSWORD_PAKE_ENABLED`.
 - Keep `AUTH_V2_METHODS_ENABLED` only if it can safely recommend the remaining valid path.
 - Set `AUTH_V2_LEGACY_FALLBACK_MODE=allowlisted` or `broad` only as a time-bounded emergency measure.
+- If janitor backlog is growing, also turn off `AUTH_V2_AUTH_FLOWS_ENABLED` and confirm `auth_v2_auth_flow_janitor_enabled` drops to `0` after rollout.
+- Re-run the smoke and observability checks from `docs/deployment-production-checklist.md` before calling the rollback complete.
 
 ### What rollback does not mean
 

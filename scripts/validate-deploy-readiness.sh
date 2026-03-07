@@ -6,6 +6,17 @@ PRODUCTION_OVERLAY_GENERATED_DIR="${ROOT_DIR}/artifacts/production-overlay/gener
 ARTIFACT_DIR="${ROOT_DIR}/artifacts/deploy-readiness"
 STRICT_DEPLOY_VALIDATION="${STRICT_DEPLOY_VALIDATION:-false}"
 
+AUTH_V2_ENABLED="${AUTH_V2_ENABLED:-false}"
+AUTH_V2_METHODS_ENABLED="${AUTH_V2_METHODS_ENABLED:-false}"
+AUTH_V2_PASSWORD_PAKE_ENABLED="${AUTH_V2_PASSWORD_PAKE_ENABLED:-false}"
+AUTH_V2_PASSWORD_UPGRADE_ENABLED="${AUTH_V2_PASSWORD_UPGRADE_ENABLED:-false}"
+AUTH_V2_PASSKEY_NAMESPACE_ENABLED="${AUTH_V2_PASSKEY_NAMESPACE_ENABLED:-false}"
+AUTH_V2_AUTH_FLOWS_ENABLED="${AUTH_V2_AUTH_FLOWS_ENABLED:-false}"
+AUTH_V2_LEGACY_FALLBACK_MODE="${AUTH_V2_LEGACY_FALLBACK_MODE:-disabled}"
+AUTH_V2_CLIENT_ALLOWLIST="${AUTH_V2_CLIENT_ALLOWLIST:-}"
+AUTH_V2_SHADOW_AUDIT_ONLY="${AUTH_V2_SHADOW_AUDIT_ONLY:-false}"
+AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS="${AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS:-60}"
+
 failures=0
 warnings=0
 
@@ -136,6 +147,93 @@ check_production_images_digest_pinned() {
   info "Production image digest pinning check passed"
 }
 
+check_auth_v2_rollout_contract() {
+  info "Checking auth v2 rollout contract in generated production overlay"
+
+  local configmap_patch="${PRODUCTION_OVERLAY_GENERATED_DIR}/configmap-runtime-security.patch.yaml"
+  local report_file="${ARTIFACT_DIR}/production-auth-v2-rollout-report.txt"
+
+  if [[ ! -f "${configmap_patch}" ]]; then
+    fail "missing generated configmap patch: ${configmap_patch}"
+    return
+  fi
+
+  if ! python3 - "${configmap_patch}" "${report_file}" \
+    "AUTH_V2_ENABLED=${AUTH_V2_ENABLED}" \
+    "AUTH_V2_METHODS_ENABLED=${AUTH_V2_METHODS_ENABLED}" \
+    "AUTH_V2_PASSWORD_PAKE_ENABLED=${AUTH_V2_PASSWORD_PAKE_ENABLED}" \
+    "AUTH_V2_PASSWORD_UPGRADE_ENABLED=${AUTH_V2_PASSWORD_UPGRADE_ENABLED}" \
+    "AUTH_V2_PASSKEY_NAMESPACE_ENABLED=${AUTH_V2_PASSKEY_NAMESPACE_ENABLED}" \
+    "AUTH_V2_AUTH_FLOWS_ENABLED=${AUTH_V2_AUTH_FLOWS_ENABLED}" \
+    "AUTH_V2_LEGACY_FALLBACK_MODE=${AUTH_V2_LEGACY_FALLBACK_MODE}" \
+    "AUTH_V2_CLIENT_ALLOWLIST=${AUTH_V2_CLIENT_ALLOWLIST}" \
+    "AUTH_V2_SHADOW_AUDIT_ONLY=${AUTH_V2_SHADOW_AUDIT_ONLY}" \
+    "AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS=${AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS}" <<'PY'
+import pathlib
+import re
+import sys
+
+patch_path = pathlib.Path(sys.argv[1])
+report_path = pathlib.Path(sys.argv[2])
+expected_pairs = [arg.split("=", 1) for arg in sys.argv[3:]]
+content = patch_path.read_text(encoding="utf-8")
+errors = []
+lines = []
+
+for key, expected in expected_pairs:
+    pattern = re.compile(rf"^\s*{re.escape(key)}:\s*\"(.*)\"\s*$", re.MULTILINE)
+    match = pattern.search(content)
+    if match is None:
+        errors.append(f"missing key in generated configmap patch: {key}")
+        continue
+
+    actual = match.group(1)
+    if actual != expected:
+        errors.append(
+            f"{key} mismatch: expected {expected!r}, found {actual!r} in generated configmap patch"
+        )
+    else:
+        lines.append(f"OK {key}={actual!r}")
+
+feature_flags = {
+    "AUTH_V2_METHODS_ENABLED": dict(expected_pairs).get("AUTH_V2_METHODS_ENABLED", "false"),
+    "AUTH_V2_PASSWORD_PAKE_ENABLED": dict(expected_pairs).get("AUTH_V2_PASSWORD_PAKE_ENABLED", "false"),
+    "AUTH_V2_PASSWORD_UPGRADE_ENABLED": dict(expected_pairs).get("AUTH_V2_PASSWORD_UPGRADE_ENABLED", "false"),
+    "AUTH_V2_PASSKEY_NAMESPACE_ENABLED": dict(expected_pairs).get("AUTH_V2_PASSKEY_NAMESPACE_ENABLED", "false"),
+    "AUTH_V2_AUTH_FLOWS_ENABLED": dict(expected_pairs).get("AUTH_V2_AUTH_FLOWS_ENABLED", "false"),
+}
+
+auth_v2_enabled = dict(expected_pairs).get("AUTH_V2_ENABLED", "false")
+if auth_v2_enabled != "true":
+    enabled_children = [name for name, value in feature_flags.items() if value == "true"]
+    if enabled_children:
+        errors.append(
+            "AUTH_V2_ENABLED=false is inconsistent with enabled child rollout flags: "
+            + ", ".join(enabled_children)
+        )
+
+report_lines = [f"Validated auth v2 rollout contract in {patch_path}."]
+report_lines.extend(lines)
+if errors:
+    report_lines.append("")
+    report_lines.append("Errors:")
+    report_lines.extend(f"- {error}" for error in errors)
+
+report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+
+if errors:
+    for error in errors:
+        print(f"ERROR: {error}", file=sys.stderr)
+    sys.exit(1)
+PY
+  then
+    fail "auth v2 rollout contract validation failed (see ${report_file})"
+    return
+  fi
+
+  info "Auth v2 rollout contract check passed"
+}
+
 main() {
   cd "${ROOT_DIR}"
   mkdir -p "${ARTIFACT_DIR}"
@@ -147,6 +245,7 @@ main() {
   check_unresolved_placeholders
   render_production_overlay_if_available
   check_production_images_digest_pinned
+  check_auth_v2_rollout_contract
 
   if [[ ${failures} -gt 0 ]]; then
     echo ""

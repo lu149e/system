@@ -277,6 +277,9 @@ async fn main() -> anyhow::Result<()> {
     observability::set_auth_v2_auth_flow_prune_interval_seconds(
         cfg.auth_v2_auth_flow_prune_interval_seconds,
     );
+    observability::set_auth_v2_auth_flow_metrics(
+        &crate::modules::auth::ports::AuthFlowMetricsSnapshot::default(),
+    );
     let jwks_inputs = cfg
         .jwt_keys
         .iter()
@@ -622,6 +625,11 @@ async fn main() -> anyhow::Result<()> {
                             observability::record_auth_v2_auth_flow_pruned(pruned);
                             tracing::info!(pruned, "pruned expired auth v2 auth flows");
                         }
+                        if let Ok(snapshot) =
+                            auth_flow_janitor_repository.metrics_snapshot(now).await
+                        {
+                            observability::set_auth_v2_auth_flow_metrics(&snapshot);
+                        }
                     }
                     Err(error) => {
                         observability::record_auth_v2_auth_flow_prune_run("error");
@@ -630,6 +638,11 @@ async fn main() -> anyhow::Result<()> {
                         );
                         auth_flow_janitor_health_for_worker.record_failure(now, error.clone());
                         observability::record_auth_v2_auth_flow_prune_error();
+                        if let Ok(snapshot) =
+                            auth_flow_janitor_repository.metrics_snapshot(now).await
+                        {
+                            observability::set_auth_v2_auth_flow_metrics(&snapshot);
+                        }
                         tracing::warn!(error = %error, "failed to prune expired auth v2 auth flows");
                     }
                 }

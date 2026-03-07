@@ -46,6 +46,59 @@ on:
         required: true
         default: true
         type: boolean
+      auth_v2_enabled:
+        description: "Set AUTH_V2_ENABLED in generated production overlay"
+        required: true
+        default: false
+        type: boolean
+      auth_v2_methods_enabled:
+        description: "Set AUTH_V2_METHODS_ENABLED in generated production overlay"
+        required: true
+        default: false
+        type: boolean
+      auth_v2_password_pake_enabled:
+        description: "Set AUTH_V2_PASSWORD_PAKE_ENABLED in generated production overlay"
+        required: true
+        default: false
+        type: boolean
+      auth_v2_password_upgrade_enabled:
+        description: "Set AUTH_V2_PASSWORD_UPGRADE_ENABLED in generated production overlay"
+        required: true
+        default: false
+        type: boolean
+      auth_v2_passkey_namespace_enabled:
+        description: "Set AUTH_V2_PASSKEY_NAMESPACE_ENABLED in generated production overlay"
+        required: true
+        default: false
+        type: boolean
+      auth_v2_auth_flows_enabled:
+        description: "Set AUTH_V2_AUTH_FLOWS_ENABLED in generated production overlay"
+        required: true
+        default: false
+        type: boolean
+      auth_v2_legacy_fallback_mode:
+        description: "Set AUTH_V2_LEGACY_FALLBACK_MODE in generated production overlay"
+        required: true
+        default: disabled
+        type: choice
+        options:
+          - disabled
+          - allowlisted
+          - broad
+      auth_v2_client_allowlist:
+        description: "Optional CSV for AUTH_V2_CLIENT_ALLOWLIST"
+        required: false
+        type: string
+      auth_v2_shadow_audit_only:
+        description: "Set AUTH_V2_SHADOW_AUDIT_ONLY in generated production overlay"
+        required: true
+        default: false
+        type: boolean
+      auth_v2_auth_flow_prune_interval_seconds:
+        description: "Set AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS in generated production overlay"
+        required: true
+        default: "60"
+        type: string
       passkey_enabled:
         description: "Set PASSKEY_ENABLED in generated production overlay"
         required: true
@@ -209,6 +262,16 @@ jobs:
           ENFORCE_DATABASE_TLS: ${{ github.event.inputs.enforce_database_tls }}
           ENFORCE_REDIS_TLS: ${{ github.event.inputs.enforce_redis_tls }}
           ENFORCE_SECURE_TRANSPORT: ${{ github.event.inputs.enforce_secure_transport }}
+          AUTH_V2_ENABLED: ${{ github.event.inputs.auth_v2_enabled }}
+          AUTH_V2_METHODS_ENABLED: ${{ github.event.inputs.auth_v2_methods_enabled }}
+          AUTH_V2_PASSWORD_PAKE_ENABLED: ${{ github.event.inputs.auth_v2_password_pake_enabled }}
+          AUTH_V2_PASSWORD_UPGRADE_ENABLED: ${{ github.event.inputs.auth_v2_password_upgrade_enabled }}
+          AUTH_V2_PASSKEY_NAMESPACE_ENABLED: ${{ github.event.inputs.auth_v2_passkey_namespace_enabled }}
+          AUTH_V2_AUTH_FLOWS_ENABLED: ${{ github.event.inputs.auth_v2_auth_flows_enabled }}
+          AUTH_V2_LEGACY_FALLBACK_MODE: ${{ github.event.inputs.auth_v2_legacy_fallback_mode }}
+          AUTH_V2_CLIENT_ALLOWLIST: ${{ github.event.inputs.auth_v2_client_allowlist }}
+          AUTH_V2_SHADOW_AUDIT_ONLY: ${{ github.event.inputs.auth_v2_shadow_audit_only }}
+          AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS: ${{ github.event.inputs.auth_v2_auth_flow_prune_interval_seconds }}
           PASSKEY_ENABLED: ${{ github.event.inputs.passkey_enabled }}
           PASSKEY_RP_ID: ${{ github.event.inputs.passkey_rp_id }}
           PASSKEY_RP_ORIGIN: ${{ github.event.inputs.passkey_rp_origin }}
@@ -395,6 +458,16 @@ jobs:
             echo "- apply_changes input: ${APPLY_CHANGES}"
             echo "- allow_client_dry_run_fallback input: ${CLIENT_FALLBACK}"
             echo "- client fallback used: ${FALLBACK_USED:-false}"
+            echo "- AUTH_V2_ENABLED: ${{ github.event.inputs.auth_v2_enabled }}"
+            echo "- AUTH_V2_METHODS_ENABLED: ${{ github.event.inputs.auth_v2_methods_enabled }}"
+            echo "- AUTH_V2_PASSWORD_PAKE_ENABLED: ${{ github.event.inputs.auth_v2_password_pake_enabled }}"
+            echo "- AUTH_V2_PASSWORD_UPGRADE_ENABLED: ${{ github.event.inputs.auth_v2_password_upgrade_enabled }}"
+            echo "- AUTH_V2_PASSKEY_NAMESPACE_ENABLED: ${{ github.event.inputs.auth_v2_passkey_namespace_enabled }}"
+            echo "- AUTH_V2_AUTH_FLOWS_ENABLED: ${{ github.event.inputs.auth_v2_auth_flows_enabled }}"
+            echo "- AUTH_V2_LEGACY_FALLBACK_MODE: ${{ github.event.inputs.auth_v2_legacy_fallback_mode }}"
+            echo "- AUTH_V2_CLIENT_ALLOWLIST: ${{ github.event.inputs.auth_v2_client_allowlist || '(empty)' }}"
+            echo "- AUTH_V2_SHADOW_AUDIT_ONLY: ${{ github.event.inputs.auth_v2_shadow_audit_only }}"
+            echo "- AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS: ${{ github.event.inputs.auth_v2_auth_flow_prune_interval_seconds }}"
             echo "- Job status: ${JOB_STATUS}"
             if [ "${MODE}" = "dry-run" ]; then
               echo "- Cluster mutation: no (dry-run only)"

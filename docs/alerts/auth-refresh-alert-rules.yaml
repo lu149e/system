@@ -100,6 +100,30 @@ groups:
         expr: |
           sum(increase(auth_email_outbox_claim_failures_total[10m]))
 
+      - record: auth:auth_v2_password_finish_error_ratio_10m
+        expr: |
+          sum(rate(auth_v2_password_finish_requests_total{outcome="error"}[10m]))
+          /
+          clamp_min(sum(rate(auth_v2_password_finish_requests_total[10m])), 0.0001)
+
+      - record: auth:auth_v2_legacy_fallback_ratio_15m
+        expr: |
+          sum(rate(auth_v2_legacy_fallback_total[15m]))
+          /
+          clamp_min(sum(rate(auth_v2_password_finish_requests_total[15m])), 0.0001)
+
+      - record: auth:auth_v2_auth_flow_prune_errors_10m
+        expr: |
+          sum(increase(auth_v2_auth_flow_prune_errors_total[10m]))
+
+      - record: auth:auth_v2_auth_flow_expired_pending_max_15m
+        expr: |
+          max_over_time(auth_v2_auth_flows_expired_pending_total[15m])
+
+      - record: auth:auth_v2_auth_flow_oldest_expired_pending_age_seconds_max_15m
+        expr: |
+          max_over_time(auth_v2_auth_flows_oldest_expired_pending_age_seconds[15m])
+
       - alert: AuthRefreshReuseDetectedSpike
         expr: sum(increase(auth_refresh_rejected_total{reason="refresh_reuse_detected"}[5m])) >= 10
         for: 2m
@@ -482,4 +506,76 @@ groups:
           summary: "Email outbox claim failures sustained"
           description: "El worker de outbox acumula fallos de claim/fetch por >=10m. Revisar salud de DB/pool, locks y errores de query antes de que escale a backlog."
           runbook: "docs/observability-auth-refresh.md (Runbook por alerta Prometheus)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthV2PasswordFinishErrorRatioHigh
+        expr: |
+          auth:auth_v2_password_finish_error_ratio_10m >= 0.05
+          and
+          sum(increase(auth_v2_password_finish_requests_total[10m])) >= 50
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Auth v2 password finish error ratio high"
+          description: "El ratio de error de `password/login/finish` en auth v2 supera 5% por 10m con volumen relevante. Revisar PAKE, clientes afectados, fallback y regressions de rollout."
+          runbook: "docs/pake-passkey-rollout-and-operations.md (Runbook: PAKE finish failure spike)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthV2PasswordFinishErrorRatioCritical
+        expr: |
+          auth:auth_v2_password_finish_error_ratio_10m >= 0.10
+          and
+          sum(increase(auth_v2_password_finish_requests_total[10m])) >= 100
+        for: 10m
+        labels:
+          severity: critical
+          area: auth
+        annotations:
+          summary: "Auth v2 password finish error ratio critical"
+          description: "El ratio de error de `password/login/finish` en auth v2 supera 10% por 10m. Esto ya es incidente de rollout, no una curiosidad de dashboard."
+          runbook: "docs/pake-passkey-rollout-and-operations.md (Runbook: PAKE finish failure spike)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthV2LegacyFallbackRatioHigh
+        expr: |
+          auth:auth_v2_legacy_fallback_ratio_15m >= 0.03
+          and
+          sum(increase(auth_v2_password_finish_requests_total[15m])) >= 50
+        for: 15m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Auth v2 legacy fallback ratio high"
+          description: "El fallback a v1 supera 3% por 15m. Revisar cohorts, reasons dominantes en `auth_v2_legacy_fallback_total` y si el rollout debe frenarse."
+          runbook: "docs/pake-passkey-rollout-and-operations.md (Runbook: fallback explosion)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthV2AuthFlowPruneErrorsSustained
+        expr: auth:auth_v2_auth_flow_prune_errors_10m >= 5
+        for: 10m
+        labels:
+          severity: warning
+          area: auth
+        annotations:
+          summary: "Auth v2 auth-flow prune errors sustained"
+          description: "El janitor de auth flows acumula errores de poda por 10m. Revisar DB, locks, scheduler del janitor y riesgo de backlog expirado creciendo."
+          runbook: "docs/pake-passkey-rollout-and-operations.md (Runbook: auth flow store degradation)"
+          dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
+
+      - alert: AuthV2AuthFlowExpiredBacklogHigh
+        expr: |
+          auth:auth_v2_auth_flow_oldest_expired_pending_age_seconds_max_15m >= 900
+          and
+          auth:auth_v2_auth_flow_expired_pending_max_15m >= 20
+        for: 15m
+        labels:
+          severity: critical
+          area: auth
+        annotations:
+          summary: "Auth v2 expired auth-flow backlog high"
+          description: "La backlog de auth flows expirados sigue creciendo: la edad maxima supera 900s y hay al menos 20 flows pendientes de limpieza por 15m. Frenar rollout y arreglar el store/janitor."
+          runbook: "docs/pake-passkey-rollout-and-operations.md (Runbook: auth flow store degradation)"
           dashboard: "docs/grafana/auth-refresh-runtime-prometheus.json"
