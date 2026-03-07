@@ -13,12 +13,16 @@ use crate::{
         audit::{domain::AuditEvent, ports::AuditRepository},
         auth::{
             domain::{
-                MfaChallengeRecord, MfaFactorRecord, PasswordResetTokenRecord, User, UserStatus,
+                AccountRecord, AccountStatus, AuthFlowKind, AuthFlowRecord, AuthFlowStatus,
+                LegacyPasswordRecord, MfaChallengeRecord, MfaFactorRecord, OpaqueCredentialRecord,
+                OpaqueCredentialState, PasswordResetTokenRecord, User, UserStatus,
                 VerificationTokenRecord,
             },
             ports::{
-                MfaBackupCodeConsumeState, MfaBackupCodeRepository, MfaChallengeFailureState,
-                MfaChallengeLookupState, MfaChallengeRepository, MfaFactorRepository,
+                AccountRepository, AuthFlowConsumeState, AuthFlowRepository,
+                LegacyPasswordRepository, MfaBackupCodeConsumeState, MfaBackupCodeRepository,
+                MfaChallengeFailureState, MfaChallengeLookupState, MfaChallengeRepository,
+                MfaFactorRepository, OpaqueCredentialRepository,
                 PasskeyAuthenticationChallengeConsumeState, PasskeyAuthenticationChallengeRecord,
                 PasskeyChallengeRepository, PasskeyCredentialRepository,
                 PasskeyRegistrationChallengeConsumeState, PasskeyRegistrationChallengeRecord,
@@ -41,6 +45,10 @@ use crate::{
 pub struct PostgresAdapters {
     pub pool: PgPool,
     pub users: PostgresUserRepository,
+    pub accounts: PostgresAccountRepository,
+    pub legacy_passwords: PostgresLegacyPasswordRepository,
+    pub opaque_credentials: PostgresOpaqueCredentialRepository,
+    pub auth_flows: PostgresAuthFlowRepository,
     pub verification_tokens: PostgresVerificationTokenRepository,
     pub password_reset_tokens: PostgresPasswordResetTokenRepository,
     pub mfa_factors: PostgresMfaFactorRepository,
@@ -64,11 +72,17 @@ impl PostgresAdapters {
         run_migrations(&pool).await?;
 
         let users = PostgresUserRepository { pool: pool.clone() };
+        let accounts = PostgresAccountRepository { pool: pool.clone() };
+        let legacy_passwords = PostgresLegacyPasswordRepository { pool: pool.clone() };
         users.ensure_bootstrap_user(cfg).await?;
 
         Ok(Self {
             pool: pool.clone(),
             users,
+            accounts,
+            legacy_passwords,
+            opaque_credentials: PostgresOpaqueCredentialRepository { pool: pool.clone() },
+            auth_flows: PostgresAuthFlowRepository { pool: pool.clone() },
             verification_tokens: PostgresVerificationTokenRepository { pool: pool.clone() },
             password_reset_tokens: PostgresPasswordResetTokenRepository { pool: pool.clone() },
             mfa_factors: PostgresMfaFactorRepository { pool: pool.clone() },
@@ -150,47 +164,46 @@ impl PostgresUserRepository {
             }
         }
     }
+
+    async fn account_by_email(&self, email: &str) -> Option<AccountRecord> {
+        fetch_account_by_email(&self.pool, email).await
+    }
+
+    async fn account_by_id(&self, user_id: &str) -> Option<AccountRecord> {
+        fetch_account_by_id(&self.pool, user_id).await
+    }
+
+    async fn legacy_password_by_user_id(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<LegacyPasswordRecord>, String> {
+        fetch_legacy_password_by_user_id(&self.pool, user_id).await
+    }
 }
 
 #[async_trait]
 impl UserRepository for PostgresUserRepository {
     async fn find_by_email(&self, email: &str) -> Option<User> {
-        let row = sqlx::query(
-            "SELECT u.id::text AS id, u.email, c.password_hash, u.status
-             FROM users u
-             INNER JOIN credentials c ON c.user_id = u.id
-             WHERE u.email = $1",
-        )
-        .bind(email.to_ascii_lowercase())
-        .fetch_optional(&self.pool)
-        .await
-        .ok()??;
+        let account = self.account_by_email(email).await?;
+        let password = self.legacy_password_by_user_id(&account.id).await.ok()??;
 
         Some(User {
-            id: row.try_get("id").ok()?,
-            email: row.try_get("email").ok()?,
-            password_hash: row.try_get("password_hash").ok()?,
-            status: parse_user_status(row.try_get::<String, _>("status").ok()?),
+            id: account.id,
+            email: account.email,
+            password_hash: password.password_hash,
+            status: account_status_to_user_status(account.status),
         })
     }
 
     async fn find_by_id(&self, user_id: &str) -> Option<User> {
-        let row = sqlx::query(
-            "SELECT u.id::text AS id, u.email, c.password_hash, u.status
-             FROM users u
-             INNER JOIN credentials c ON c.user_id = u.id
-             WHERE u.id = $1::uuid",
-        )
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await
-        .ok()??;
+        let account = self.account_by_id(user_id).await?;
+        let password = self.legacy_password_by_user_id(&account.id).await.ok()??;
 
         Some(User {
-            id: row.try_get("id").ok()?,
-            email: row.try_get("email").ok()?,
-            password_hash: row.try_get("password_hash").ok()?,
-            status: parse_user_status(row.try_get::<String, _>("status").ok()?),
+            id: account.id,
+            email: account.email,
+            password_hash: password.password_hash,
+            status: account_status_to_user_status(account.status),
         })
     }
 
@@ -288,6 +301,634 @@ impl UserRepository for PostgresUserRepository {
 
         Ok(())
     }
+}
+
+#[derive(Clone)]
+pub struct PostgresAccountRepository {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl AccountRepository for PostgresAccountRepository {
+    async fn find_by_email(&self, email: &str) -> Option<AccountRecord> {
+        fetch_account_by_email(&self.pool, email).await
+    }
+
+    async fn find_by_id(&self, user_id: &str) -> Option<AccountRecord> {
+        fetch_account_by_id(&self.pool, user_id).await
+    }
+
+    async fn create_pending(
+        &self,
+        email: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<AccountRecord>, String> {
+        let user_id = Uuid::new_v4().to_string();
+        let row = sqlx::query(
+            "INSERT INTO users (id, email, status, created_at, updated_at)
+             VALUES ($1::uuid, $2, 'pending_verification', $3, $3)
+             ON CONFLICT (email) DO NOTHING
+             RETURNING id::text AS id, email, status, created_at, updated_at",
+        )
+        .bind(&user_id)
+        .bind(email.to_ascii_lowercase())
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| "account insert failed".to_string())?;
+
+        row.map(account_from_row).transpose()
+    }
+
+    async fn activate(&self, user_id: &str, now: DateTime<Utc>) -> Result<(), String> {
+        let updated = sqlx::query(
+            "UPDATE users
+             SET status = 'active', email_verified_at = $2, updated_at = $2
+             WHERE id = $1::uuid",
+        )
+        .bind(user_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "account activation failed".to_string())?;
+
+        if updated.rows_affected() == 0 {
+            return Err("account not found".to_string());
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresLegacyPasswordRepository {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl LegacyPasswordRepository for PostgresLegacyPasswordRepository {
+    async fn find_by_user_id(&self, user_id: &str) -> Result<Option<LegacyPasswordRecord>, String> {
+        fetch_legacy_password_by_user_id(&self.pool, user_id).await
+    }
+
+    async fn upsert_hash(
+        &self,
+        user_id: &str,
+        password_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO credentials (
+                user_id,
+                password_hash,
+                password_changed_at,
+                legacy_login_allowed,
+                migrated_to_opaque_at,
+                last_legacy_verified_at,
+                legacy_deprecation_at
+             )
+             VALUES ($1::uuid, $2, $3, TRUE, NULL, NULL, NULL)
+             ON CONFLICT (user_id)
+             DO UPDATE SET
+                password_hash = EXCLUDED.password_hash,
+                password_changed_at = EXCLUDED.password_changed_at,
+                legacy_login_allowed = TRUE,
+                migrated_to_opaque_at = NULL,
+                legacy_deprecation_at = NULL",
+        )
+        .bind(user_id)
+        .bind(password_hash)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "legacy password upsert failed".to_string())?;
+
+        Ok(())
+    }
+
+    async fn mark_verified(&self, user_id: &str, now: DateTime<Utc>) -> Result<(), String> {
+        let updated = sqlx::query(
+            "UPDATE credentials
+             SET last_legacy_verified_at = $2
+             WHERE user_id = $1::uuid",
+        )
+        .bind(user_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "legacy password verification mark failed".to_string())?;
+
+        if updated.rows_affected() == 0 {
+            return Err("legacy password not found".to_string());
+        }
+
+        Ok(())
+    }
+
+    async fn set_legacy_login_allowed(
+        &self,
+        user_id: &str,
+        allowed: bool,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let updated = sqlx::query(
+            "UPDATE credentials
+             SET legacy_login_allowed = $2,
+                 legacy_deprecation_at = CASE WHEN $2 THEN NULL ELSE COALESCE(legacy_deprecation_at, $3) END
+             WHERE user_id = $1::uuid",
+        )
+        .bind(user_id)
+        .bind(allowed)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "legacy password policy update failed".to_string())?;
+
+        if updated.rows_affected() == 0 {
+            return Err("legacy password not found".to_string());
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresOpaqueCredentialRepository {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl OpaqueCredentialRepository for PostgresOpaqueCredentialRepository {
+    async fn find_by_user_id(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<OpaqueCredentialRecord>, String> {
+        let row = sqlx::query(
+            "SELECT user_id::text AS user_id, protocol, credential_blob, server_key_ref,
+                    envelope_kms_key_id, state, migrated_from_legacy_at, last_verified_at,
+                    created_at, updated_at
+             FROM opaque_credentials
+             WHERE user_id = $1::uuid",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| "opaque credential fetch failed".to_string())?;
+
+        row.map(opaque_credential_from_row).transpose()
+    }
+
+    async fn upsert_for_user(&self, record: OpaqueCredentialRecord) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO opaque_credentials (
+                user_id,
+                protocol,
+                credential_blob,
+                server_key_ref,
+                envelope_kms_key_id,
+                state,
+                migrated_from_legacy_at,
+                last_verified_at,
+                created_at,
+                updated_at
+             )
+             VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (user_id)
+             DO UPDATE SET
+                protocol = EXCLUDED.protocol,
+                credential_blob = EXCLUDED.credential_blob,
+                server_key_ref = EXCLUDED.server_key_ref,
+                envelope_kms_key_id = EXCLUDED.envelope_kms_key_id,
+                state = EXCLUDED.state,
+                migrated_from_legacy_at = EXCLUDED.migrated_from_legacy_at,
+                last_verified_at = EXCLUDED.last_verified_at,
+                updated_at = EXCLUDED.updated_at",
+        )
+        .bind(record.user_id)
+        .bind(record.protocol)
+        .bind(record.credential_blob)
+        .bind(record.server_key_ref)
+        .bind(record.envelope_kms_key_id)
+        .bind(opaque_credential_state_to_db(&record.state))
+        .bind(record.migrated_from_legacy_at)
+        .bind(record.last_verified_at)
+        .bind(record.created_at)
+        .bind(record.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "opaque credential upsert failed".to_string())?;
+
+        Ok(())
+    }
+
+    async fn mark_verified(&self, user_id: &str, now: DateTime<Utc>) -> Result<(), String> {
+        let updated = sqlx::query(
+            "UPDATE opaque_credentials
+             SET last_verified_at = $2, updated_at = $2
+             WHERE user_id = $1::uuid",
+        )
+        .bind(user_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "opaque credential verify mark failed".to_string())?;
+
+        if updated.rows_affected() == 0 {
+            return Err("opaque credential not found".to_string());
+        }
+
+        Ok(())
+    }
+
+    async fn revoke_for_user(&self, user_id: &str, now: DateTime<Utc>) -> Result<(), String> {
+        let updated = sqlx::query(
+            "UPDATE opaque_credentials
+             SET state = 'revoked', updated_at = $2
+             WHERE user_id = $1::uuid",
+        )
+        .bind(user_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "opaque credential revoke failed".to_string())?;
+
+        if updated.rows_affected() == 0 {
+            return Err("opaque credential not found".to_string());
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresAuthFlowRepository {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl AuthFlowRepository for PostgresAuthFlowRepository {
+    async fn issue(&self, flow: AuthFlowRecord) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO auth_flows (
+                flow_id,
+                subject_user_id,
+                subject_identifier_hash,
+                flow_kind,
+                protocol,
+                state,
+                status,
+                rollout_channel,
+                fallback_policy,
+                trace_id,
+                issued_ip,
+                issued_user_agent,
+                attempt_count,
+                expires_at,
+                consumed_at,
+                created_at,
+                updated_at
+             )
+             VALUES ($1, $2::uuid, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11::inet, $12, $13, $14, $15, $16, $17)
+             ON CONFLICT (flow_id)
+             DO UPDATE SET
+                subject_user_id = EXCLUDED.subject_user_id,
+                subject_identifier_hash = EXCLUDED.subject_identifier_hash,
+                flow_kind = EXCLUDED.flow_kind,
+                protocol = EXCLUDED.protocol,
+                state = EXCLUDED.state,
+                status = EXCLUDED.status,
+                rollout_channel = EXCLUDED.rollout_channel,
+                fallback_policy = EXCLUDED.fallback_policy,
+                trace_id = EXCLUDED.trace_id,
+                issued_ip = EXCLUDED.issued_ip,
+                issued_user_agent = EXCLUDED.issued_user_agent,
+                attempt_count = EXCLUDED.attempt_count,
+                expires_at = EXCLUDED.expires_at,
+                consumed_at = EXCLUDED.consumed_at,
+                updated_at = EXCLUDED.updated_at",
+        )
+        .bind(flow.flow_id)
+        .bind(flow.subject_user_id)
+        .bind(flow.subject_identifier_hash)
+        .bind(auth_flow_kind_to_db(&flow.flow_kind))
+        .bind(flow.protocol)
+        .bind(flow.state)
+        .bind(auth_flow_status_to_db(&flow.status))
+        .bind(flow.rollout_channel)
+        .bind(flow.fallback_policy)
+        .bind(flow.trace_id)
+        .bind(flow.issued_ip)
+        .bind(flow.issued_user_agent)
+        .bind(flow.attempt_count as i32)
+        .bind(flow.expires_at)
+        .bind(flow.consumed_at)
+        .bind(flow.created_at)
+        .bind(flow.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "auth flow upsert failed".to_string())?;
+
+        Ok(())
+    }
+
+    async fn consume(
+        &self,
+        flow_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<AuthFlowConsumeState, String> {
+        let row = sqlx::query(
+            "UPDATE auth_flows
+             SET status = 'consumed', consumed_at = $2, updated_at = $2
+             WHERE flow_id = $1 AND status = 'pending' AND expires_at > $2
+             RETURNING flow_id, subject_user_id::text AS subject_user_id, subject_identifier_hash,
+                       flow_kind, protocol, state, status, rollout_channel, fallback_policy,
+                       trace_id, issued_ip::text AS issued_ip, issued_user_agent, attempt_count,
+                       expires_at, consumed_at, created_at, updated_at",
+        )
+        .bind(flow_id)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| "auth flow consume failed".to_string())?;
+
+        if let Some(row) = row {
+            return Ok(AuthFlowConsumeState::Active(auth_flow_from_row(row)?));
+        }
+
+        let row = sqlx::query(
+            "SELECT flow_id, subject_user_id::text AS subject_user_id, subject_identifier_hash,
+                    flow_kind, protocol, state, status, rollout_channel, fallback_policy,
+                    trace_id, issued_ip::text AS issued_ip, issued_user_agent, attempt_count,
+                    expires_at, consumed_at, created_at, updated_at
+             FROM auth_flows
+             WHERE flow_id = $1",
+        )
+        .bind(flow_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| "auth flow fetch failed".to_string())?;
+
+        let Some(row) = row else {
+            return Ok(AuthFlowConsumeState::NotFound);
+        };
+
+        let record = auth_flow_from_row(row)?;
+        if record.expires_at <= now {
+            return Ok(AuthFlowConsumeState::Expired);
+        }
+
+        Ok(match record.status {
+            AuthFlowStatus::Consumed => AuthFlowConsumeState::AlreadyConsumed,
+            AuthFlowStatus::Cancelled => AuthFlowConsumeState::Cancelled,
+            AuthFlowStatus::Expired => AuthFlowConsumeState::Expired,
+            AuthFlowStatus::Pending => AuthFlowConsumeState::AlreadyConsumed,
+        })
+    }
+
+    async fn increment_attempts(&self, flow_id: &str, now: DateTime<Utc>) -> Result<(), String> {
+        let updated = sqlx::query(
+            "UPDATE auth_flows
+             SET attempt_count = attempt_count + 1, updated_at = $2
+             WHERE flow_id = $1",
+        )
+        .bind(flow_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "auth flow attempt increment failed".to_string())?;
+
+        if updated.rows_affected() == 0 {
+            return Err("auth flow not found".to_string());
+        }
+
+        Ok(())
+    }
+
+    async fn cancel_active_for_subject(
+        &self,
+        subject_user_id: Option<&str>,
+        subject_identifier_hash: Option<&str>,
+        flow_kind: &str,
+        now: DateTime<Utc>,
+    ) -> Result<u64, String> {
+        let updated = sqlx::query(
+            "UPDATE auth_flows
+             SET status = 'cancelled', updated_at = $4
+             WHERE flow_kind = $3
+               AND status = 'pending'
+               AND ((subject_user_id = $1::uuid) OR (subject_identifier_hash = $2))",
+        )
+        .bind(subject_user_id)
+        .bind(subject_identifier_hash)
+        .bind(flow_kind)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "auth flow cancel failed".to_string())?;
+
+        Ok(updated.rows_affected())
+    }
+
+    async fn prune_expired(&self, now: DateTime<Utc>) -> Result<u64, String> {
+        let updated = sqlx::query(
+            "UPDATE auth_flows
+             SET status = 'expired', updated_at = $1
+             WHERE status = 'pending' AND expires_at <= $1",
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "auth flow prune failed".to_string())?;
+
+        Ok(updated.rows_affected())
+    }
+}
+
+async fn fetch_account_by_email(pool: &PgPool, email: &str) -> Option<AccountRecord> {
+    let row = sqlx::query(
+        "SELECT id::text AS id, email, status, created_at, updated_at
+         FROM users
+         WHERE email = $1",
+    )
+    .bind(email.to_ascii_lowercase())
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+
+    account_from_row(row).ok()
+}
+
+async fn fetch_account_by_id(pool: &PgPool, user_id: &str) -> Option<AccountRecord> {
+    let row = sqlx::query(
+        "SELECT id::text AS id, email, status, created_at, updated_at
+         FROM users
+         WHERE id = $1::uuid",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+
+    account_from_row(row).ok()
+}
+
+async fn fetch_legacy_password_by_user_id(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<Option<LegacyPasswordRecord>, String> {
+    let row = sqlx::query(
+        "SELECT user_id::text AS user_id, password_hash, legacy_login_allowed,
+                migrated_to_opaque_at, last_legacy_verified_at, legacy_deprecation_at
+         FROM credentials
+         WHERE user_id = $1::uuid",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| "legacy password fetch failed".to_string())?;
+
+    row.map(legacy_password_from_row).transpose()
+}
+
+fn account_from_row(row: sqlx::postgres::PgRow) -> Result<AccountRecord, String> {
+    Ok(AccountRecord {
+        id: row
+            .try_get("id")
+            .map_err(|_| "invalid account id".to_string())?,
+        email: row
+            .try_get("email")
+            .map_err(|_| "invalid account email".to_string())?,
+        status: parse_account_status(
+            row.try_get::<String, _>("status")
+                .map_err(|_| "invalid account status".to_string())?,
+        ),
+        created_at: row
+            .try_get("created_at")
+            .map_err(|_| "invalid account created_at".to_string())?,
+        updated_at: row
+            .try_get("updated_at")
+            .map_err(|_| "invalid account updated_at".to_string())?,
+    })
+}
+
+fn legacy_password_from_row(row: sqlx::postgres::PgRow) -> Result<LegacyPasswordRecord, String> {
+    Ok(LegacyPasswordRecord {
+        user_id: row
+            .try_get("user_id")
+            .map_err(|_| "invalid legacy password user_id".to_string())?,
+        password_hash: row
+            .try_get("password_hash")
+            .map_err(|_| "invalid legacy password hash".to_string())?,
+        legacy_login_allowed: row
+            .try_get("legacy_login_allowed")
+            .map_err(|_| "invalid legacy login policy".to_string())?,
+        migrated_to_opaque_at: row
+            .try_get("migrated_to_opaque_at")
+            .map_err(|_| "invalid migrated_to_opaque_at".to_string())?,
+        last_legacy_verified_at: row
+            .try_get("last_legacy_verified_at")
+            .map_err(|_| "invalid last_legacy_verified_at".to_string())?,
+        legacy_deprecation_at: row
+            .try_get("legacy_deprecation_at")
+            .map_err(|_| "invalid legacy_deprecation_at".to_string())?,
+    })
+}
+
+fn opaque_credential_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<OpaqueCredentialRecord, String> {
+    Ok(OpaqueCredentialRecord {
+        user_id: row
+            .try_get("user_id")
+            .map_err(|_| "invalid opaque credential user_id".to_string())?,
+        protocol: row
+            .try_get("protocol")
+            .map_err(|_| "invalid opaque credential protocol".to_string())?,
+        credential_blob: row
+            .try_get("credential_blob")
+            .map_err(|_| "invalid opaque credential blob".to_string())?,
+        server_key_ref: row
+            .try_get("server_key_ref")
+            .map_err(|_| "invalid opaque credential server key ref".to_string())?,
+        envelope_kms_key_id: row
+            .try_get("envelope_kms_key_id")
+            .map_err(|_| "invalid opaque credential envelope key id".to_string())?,
+        state: parse_opaque_credential_state(
+            row.try_get::<String, _>("state")
+                .map_err(|_| "invalid opaque credential state".to_string())?,
+        ),
+        migrated_from_legacy_at: row
+            .try_get("migrated_from_legacy_at")
+            .map_err(|_| "invalid migrated_from_legacy_at".to_string())?,
+        last_verified_at: row
+            .try_get("last_verified_at")
+            .map_err(|_| "invalid last_verified_at".to_string())?,
+        created_at: row
+            .try_get("created_at")
+            .map_err(|_| "invalid opaque credential created_at".to_string())?,
+        updated_at: row
+            .try_get("updated_at")
+            .map_err(|_| "invalid opaque credential updated_at".to_string())?,
+    })
+}
+
+fn auth_flow_from_row(row: sqlx::postgres::PgRow) -> Result<AuthFlowRecord, String> {
+    Ok(AuthFlowRecord {
+        flow_id: row
+            .try_get("flow_id")
+            .map_err(|_| "invalid auth flow id".to_string())?,
+        subject_user_id: row
+            .try_get("subject_user_id")
+            .map_err(|_| "invalid auth flow subject user".to_string())?,
+        subject_identifier_hash: row
+            .try_get("subject_identifier_hash")
+            .map_err(|_| "invalid auth flow identifier hash".to_string())?,
+        flow_kind: parse_auth_flow_kind(
+            row.try_get::<String, _>("flow_kind")
+                .map_err(|_| "invalid auth flow kind".to_string())?,
+        ),
+        protocol: row
+            .try_get("protocol")
+            .map_err(|_| "invalid auth flow protocol".to_string())?,
+        state: row
+            .try_get("state")
+            .map_err(|_| "invalid auth flow state".to_string())?,
+        status: parse_auth_flow_status(
+            row.try_get::<String, _>("status")
+                .map_err(|_| "invalid auth flow status".to_string())?,
+        ),
+        rollout_channel: row
+            .try_get("rollout_channel")
+            .map_err(|_| "invalid auth flow rollout channel".to_string())?,
+        fallback_policy: row
+            .try_get("fallback_policy")
+            .map_err(|_| "invalid auth flow fallback policy".to_string())?,
+        trace_id: row
+            .try_get("trace_id")
+            .map_err(|_| "invalid auth flow trace id".to_string())?,
+        issued_ip: row
+            .try_get("issued_ip")
+            .map_err(|_| "invalid auth flow ip".to_string())?,
+        issued_user_agent: row
+            .try_get("issued_user_agent")
+            .map_err(|_| "invalid auth flow user agent".to_string())?,
+        attempt_count: row
+            .try_get::<i32, _>("attempt_count")
+            .map_err(|_| "invalid auth flow attempts".to_string())?
+            .max(0) as u32,
+        expires_at: row
+            .try_get("expires_at")
+            .map_err(|_| "invalid auth flow expires_at".to_string())?,
+        consumed_at: row
+            .try_get("consumed_at")
+            .map_err(|_| "invalid auth flow consumed_at".to_string())?,
+        created_at: row
+            .try_get("created_at")
+            .map_err(|_| "invalid auth flow created_at".to_string())?,
+        updated_at: row
+            .try_get("updated_at")
+            .map_err(|_| "invalid auth flow updated_at".to_string())?,
+    })
 }
 
 #[derive(Clone)]
@@ -1540,6 +2181,80 @@ fn parse_user_status(value: String) -> UserStatus {
     }
 }
 
+fn parse_account_status(value: String) -> AccountStatus {
+    match value.as_str() {
+        "active" => AccountStatus::Active,
+        "pending_verification" => AccountStatus::PendingVerification,
+        "locked" => AccountStatus::Locked,
+        _ => AccountStatus::Locked,
+    }
+}
+
+fn account_status_to_user_status(status: AccountStatus) -> UserStatus {
+    match status {
+        AccountStatus::Active => UserStatus::Active,
+        AccountStatus::PendingVerification => UserStatus::PendingVerification,
+        AccountStatus::Locked => UserStatus::Locked,
+    }
+}
+
+fn parse_opaque_credential_state(value: String) -> OpaqueCredentialState {
+    match value.as_str() {
+        "active" => OpaqueCredentialState::Active,
+        "superseded" => OpaqueCredentialState::Superseded,
+        "revoked" => OpaqueCredentialState::Revoked,
+        _ => OpaqueCredentialState::Revoked,
+    }
+}
+
+fn opaque_credential_state_to_db(state: &OpaqueCredentialState) -> &'static str {
+    match state {
+        OpaqueCredentialState::Active => "active",
+        OpaqueCredentialState::Superseded => "superseded",
+        OpaqueCredentialState::Revoked => "revoked",
+    }
+}
+
+fn parse_auth_flow_kind(value: String) -> AuthFlowKind {
+    match value.as_str() {
+        "methods_discovery" => AuthFlowKind::MethodsDiscovery,
+        "password_login" => AuthFlowKind::PasswordLogin,
+        "password_upgrade" => AuthFlowKind::PasswordUpgrade,
+        "passkey_login" => AuthFlowKind::PasskeyLogin,
+        "passkey_register" => AuthFlowKind::PasskeyRegister,
+        _ => AuthFlowKind::MethodsDiscovery,
+    }
+}
+
+fn auth_flow_kind_to_db(kind: &AuthFlowKind) -> &'static str {
+    match kind {
+        AuthFlowKind::MethodsDiscovery => "methods_discovery",
+        AuthFlowKind::PasswordLogin => "password_login",
+        AuthFlowKind::PasswordUpgrade => "password_upgrade",
+        AuthFlowKind::PasskeyLogin => "passkey_login",
+        AuthFlowKind::PasskeyRegister => "passkey_register",
+    }
+}
+
+fn parse_auth_flow_status(value: String) -> AuthFlowStatus {
+    match value.as_str() {
+        "pending" => AuthFlowStatus::Pending,
+        "consumed" => AuthFlowStatus::Consumed,
+        "expired" => AuthFlowStatus::Expired,
+        "cancelled" => AuthFlowStatus::Cancelled,
+        _ => AuthFlowStatus::Expired,
+    }
+}
+
+fn auth_flow_status_to_db(status: &AuthFlowStatus) -> &'static str {
+    match status {
+        AuthFlowStatus::Pending => "pending",
+        AuthFlowStatus::Consumed => "consumed",
+        AuthFlowStatus::Expired => "expired",
+        AuthFlowStatus::Cancelled => "cancelled",
+    }
+}
+
 fn parse_session_status(value: String) -> SessionStatus {
     match value.as_str() {
         "active" => SessionStatus::Active,
@@ -1567,8 +2282,31 @@ mod tests {
         ports::{RefreshRotationState, RefreshTokenRepository},
     };
 
-    use super::{PostgresPasskeyChallengeRepository, PostgresRefreshTokenRepository};
-    use crate::modules::auth::ports::PasskeyChallengeRepository;
+    use super::{
+        PostgresAccountRepository, PostgresPasskeyChallengeRepository,
+        PostgresRefreshTokenRepository, PostgresUserRepository,
+    };
+    use crate::modules::auth::ports::{
+        AccountRepository, PasskeyChallengeRepository, UserRepository,
+    };
+
+    #[tokio::test]
+    async fn postgres_account_lookup_is_decoupled_from_legacy_credentials() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+
+        let account_repo = PostgresAccountRepository { pool: pool.clone() };
+        let user_repo = PostgresUserRepository { pool: pool.clone() };
+        let user_id = create_user(&pool).await;
+
+        let account = account_repo
+            .find_by_id(&user_id.to_string())
+            .await
+            .expect("account should be readable without credentials row");
+        assert_eq!(account.id, user_id.to_string());
+        assert!(user_repo.find_by_id(&user_id.to_string()).await.is_none());
+    }
 
     #[tokio::test]
     async fn postgres_refresh_rotate_strong_returns_not_found_when_current_missing() {

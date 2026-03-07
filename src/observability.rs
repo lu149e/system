@@ -14,6 +14,11 @@ struct MetricsRegistry {
     registry: Registry,
     login_risk_decisions_total: IntCounterVec,
     login_risk_penalty_total: IntCounterVec,
+    auth_v2_methods_requests_total: IntCounterVec,
+    auth_v2_password_start_requests_total: IntCounterVec,
+    auth_v2_password_finish_requests_total: IntCounterVec,
+    auth_v2_password_upgrade_requests_total: IntCounterVec,
+    auth_v2_password_rejected_total: IntCounterVec,
     passkey_requests_total: IntCounterVec,
     passkey_login_rejected_total: IntCounterVec,
     passkey_register_rejected_total: IntCounterVec,
@@ -26,6 +31,13 @@ struct MetricsRegistry {
     passkey_challenge_prune_last_failure_unixtime: IntGauge,
     passkey_challenge_pruned_total: IntCounter,
     passkey_challenge_prune_errors_total: IntCounter,
+    auth_v2_auth_flow_janitor_enabled: IntGauge,
+    auth_v2_auth_flow_prune_interval_seconds: IntGauge,
+    auth_v2_auth_flow_prune_runs_total: IntCounterVec,
+    auth_v2_auth_flow_prune_last_success_unixtime: IntGauge,
+    auth_v2_auth_flow_prune_last_failure_unixtime: IntGauge,
+    auth_v2_auth_flow_pruned_total: IntCounter,
+    auth_v2_auth_flow_prune_errors_total: IntCounter,
     refresh_requests_total: IntCounterVec,
     refresh_rejected_total: IntCounterVec,
     refresh_duration_seconds: HistogramVec,
@@ -73,6 +85,51 @@ impl MetricsRegistry {
             &["profile", "reason"],
         )
         .expect("login risk penalty metric should initialize");
+
+        let auth_v2_methods_requests_total = IntCounterVec::new(
+            Opts::new(
+                "auth_v2_methods_requests_total",
+                "Total auth v2 method discovery requests partitioned by outcome and channel",
+            ),
+            &["outcome", "channel"],
+        )
+        .expect("auth v2 methods requests metric should initialize");
+
+        let auth_v2_password_start_requests_total = IntCounterVec::new(
+            Opts::new(
+                "auth_v2_password_start_requests_total",
+                "Total auth v2 password login start requests partitioned by outcome and channel",
+            ),
+            &["outcome", "channel"],
+        )
+        .expect("auth v2 password start requests metric should initialize");
+
+        let auth_v2_password_finish_requests_total = IntCounterVec::new(
+            Opts::new(
+                "auth_v2_password_finish_requests_total",
+                "Total auth v2 password login finish requests partitioned by outcome and channel",
+            ),
+            &["outcome", "channel"],
+        )
+        .expect("auth v2 password finish requests metric should initialize");
+
+        let auth_v2_password_upgrade_requests_total = IntCounterVec::new(
+            Opts::new(
+                "auth_v2_password_upgrade_requests_total",
+                "Total auth v2 password upgrade requests partitioned by operation and outcome",
+            ),
+            &["operation", "outcome"],
+        )
+        .expect("auth v2 password upgrade requests metric should initialize");
+
+        let auth_v2_password_rejected_total = IntCounterVec::new(
+            Opts::new(
+                "auth_v2_password_rejected_total",
+                "Total auth v2 password rejections partitioned by reason",
+            ),
+            &["reason"],
+        )
+        .expect("auth v2 password rejected metric should initialize");
 
         let passkey_requests_total = IntCounterVec::new(
             Opts::new(
@@ -163,6 +220,51 @@ impl MetricsRegistry {
             "Total passkey challenge janitor prune failures",
         )
         .expect("passkey challenge prune errors metric should initialize");
+
+        let auth_v2_auth_flow_janitor_enabled = IntGauge::new(
+            "auth_v2_auth_flow_janitor_enabled",
+            "Whether auth v2 auth flow janitor is enabled (1=true, 0=false)",
+        )
+        .expect("auth flow janitor enabled metric should initialize");
+
+        let auth_v2_auth_flow_prune_interval_seconds = IntGauge::new(
+            "auth_v2_auth_flow_prune_interval_seconds",
+            "Configured auth v2 auth flow janitor prune interval in seconds",
+        )
+        .expect("auth flow prune interval metric should initialize");
+
+        let auth_v2_auth_flow_prune_runs_total = IntCounterVec::new(
+            Opts::new(
+                "auth_v2_auth_flow_prune_runs_total",
+                "Total auth v2 auth flow janitor prune runs partitioned by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("auth flow prune runs metric should initialize");
+
+        let auth_v2_auth_flow_prune_last_success_unixtime = IntGauge::new(
+            "auth_v2_auth_flow_prune_last_success_unixtime",
+            "Unix timestamp (seconds) of the last successful auth v2 auth flow prune run",
+        )
+        .expect("auth flow prune last success metric should initialize");
+
+        let auth_v2_auth_flow_prune_last_failure_unixtime = IntGauge::new(
+            "auth_v2_auth_flow_prune_last_failure_unixtime",
+            "Unix timestamp (seconds) of the last failed auth v2 auth flow prune run",
+        )
+        .expect("auth flow prune last failure metric should initialize");
+
+        let auth_v2_auth_flow_pruned_total = IntCounter::new(
+            "auth_v2_auth_flow_pruned_total",
+            "Total expired auth v2 auth flows pruned by background janitor",
+        )
+        .expect("auth flow pruned metric should initialize");
+
+        let auth_v2_auth_flow_prune_errors_total = IntCounter::new(
+            "auth_v2_auth_flow_prune_errors_total",
+            "Total auth v2 auth flow janitor prune failures",
+        )
+        .expect("auth flow prune errors metric should initialize");
 
         let refresh_rejected_total = IntCounterVec::new(
             Opts::new(
@@ -283,6 +385,21 @@ impl MetricsRegistry {
             .register(Box::new(login_risk_penalty_total.clone()))
             .expect("login risk penalty metric should register");
         registry
+            .register(Box::new(auth_v2_methods_requests_total.clone()))
+            .expect("auth v2 methods requests metric should register");
+        registry
+            .register(Box::new(auth_v2_password_start_requests_total.clone()))
+            .expect("auth v2 password start requests metric should register");
+        registry
+            .register(Box::new(auth_v2_password_finish_requests_total.clone()))
+            .expect("auth v2 password finish requests metric should register");
+        registry
+            .register(Box::new(auth_v2_password_upgrade_requests_total.clone()))
+            .expect("auth v2 password upgrade requests metric should register");
+        registry
+            .register(Box::new(auth_v2_password_rejected_total.clone()))
+            .expect("auth v2 password rejected metric should register");
+        registry
             .register(Box::new(passkey_requests_total.clone()))
             .expect("passkey requests metric should register");
         registry
@@ -322,6 +439,31 @@ impl MetricsRegistry {
         registry
             .register(Box::new(passkey_challenge_prune_errors_total.clone()))
             .expect("passkey challenge prune errors metric should register");
+        registry
+            .register(Box::new(auth_v2_auth_flow_janitor_enabled.clone()))
+            .expect("auth flow janitor enabled metric should register");
+        registry
+            .register(Box::new(auth_v2_auth_flow_prune_interval_seconds.clone()))
+            .expect("auth flow prune interval metric should register");
+        registry
+            .register(Box::new(auth_v2_auth_flow_prune_runs_total.clone()))
+            .expect("auth flow prune runs metric should register");
+        registry
+            .register(Box::new(
+                auth_v2_auth_flow_prune_last_success_unixtime.clone(),
+            ))
+            .expect("auth flow prune last success metric should register");
+        registry
+            .register(Box::new(
+                auth_v2_auth_flow_prune_last_failure_unixtime.clone(),
+            ))
+            .expect("auth flow prune last failure metric should register");
+        registry
+            .register(Box::new(auth_v2_auth_flow_pruned_total.clone()))
+            .expect("auth flow pruned metric should register");
+        registry
+            .register(Box::new(auth_v2_auth_flow_prune_errors_total.clone()))
+            .expect("auth flow prune errors metric should register");
         registry
             .register(Box::new(refresh_requests_total.clone()))
             .expect("refresh requests metric should register");
@@ -372,6 +514,11 @@ impl MetricsRegistry {
             registry,
             login_risk_decisions_total,
             login_risk_penalty_total,
+            auth_v2_methods_requests_total,
+            auth_v2_password_start_requests_total,
+            auth_v2_password_finish_requests_total,
+            auth_v2_password_upgrade_requests_total,
+            auth_v2_password_rejected_total,
             passkey_requests_total,
             passkey_login_rejected_total,
             passkey_register_rejected_total,
@@ -384,6 +531,13 @@ impl MetricsRegistry {
             passkey_challenge_prune_last_failure_unixtime,
             passkey_challenge_pruned_total,
             passkey_challenge_prune_errors_total,
+            auth_v2_auth_flow_janitor_enabled,
+            auth_v2_auth_flow_prune_interval_seconds,
+            auth_v2_auth_flow_prune_runs_total,
+            auth_v2_auth_flow_prune_last_success_unixtime,
+            auth_v2_auth_flow_prune_last_failure_unixtime,
+            auth_v2_auth_flow_pruned_total,
+            auth_v2_auth_flow_prune_errors_total,
             refresh_requests_total,
             refresh_rejected_total,
             refresh_duration_seconds,
@@ -439,6 +593,43 @@ pub fn record_login_risk_penalty(profile: &str, reason: &str, units: u64) {
         .login_risk_penalty_total
         .with_label_values(&[profile, reason])
         .inc_by(units);
+}
+
+pub fn record_auth_v2_methods_request(channel: &str, outcome: &str) {
+    metrics()
+        .auth_v2_methods_requests_total
+        .with_label_values(&[outcome, channel])
+        .inc();
+}
+
+pub fn record_auth_v2_password_request(operation: &str, outcome: &str) {
+    let metrics = metrics();
+    match operation {
+        "login_start" => metrics
+            .auth_v2_password_start_requests_total
+            .with_label_values(&[outcome, "direct"])
+            .inc(),
+        "login_finish" => metrics
+            .auth_v2_password_finish_requests_total
+            .with_label_values(&[outcome, "direct"])
+            .inc(),
+        "upgrade_start" => metrics
+            .auth_v2_password_upgrade_requests_total
+            .with_label_values(&["start", outcome])
+            .inc(),
+        "upgrade_finish" => metrics
+            .auth_v2_password_upgrade_requests_total
+            .with_label_values(&["finish", outcome])
+            .inc(),
+        _ => {}
+    }
+}
+
+pub fn record_auth_v2_password_rejected(reason: &str) {
+    metrics()
+        .auth_v2_password_rejected_total
+        .with_label_values(&[reason])
+        .inc();
 }
 
 pub fn record_passkey_request(operation: &str, outcome: &str) {
@@ -517,6 +708,49 @@ pub fn record_passkey_challenge_pruned(pruned: u64) {
 
 pub fn record_passkey_challenge_prune_error() {
     metrics().passkey_challenge_prune_errors_total.inc();
+}
+
+pub fn set_auth_v2_auth_flow_janitor_enabled(enabled: bool) {
+    metrics()
+        .auth_v2_auth_flow_janitor_enabled
+        .set(if enabled { 1 } else { 0 });
+}
+
+pub fn set_auth_v2_auth_flow_prune_interval_seconds(interval_seconds: u64) {
+    metrics()
+        .auth_v2_auth_flow_prune_interval_seconds
+        .set(interval_seconds as i64);
+}
+
+pub fn record_auth_v2_auth_flow_prune_run(outcome: &str) {
+    metrics()
+        .auth_v2_auth_flow_prune_runs_total
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+pub fn set_auth_v2_auth_flow_prune_last_success_unixtime(unix_time_seconds: i64) {
+    metrics()
+        .auth_v2_auth_flow_prune_last_success_unixtime
+        .set(unix_time_seconds);
+}
+
+pub fn set_auth_v2_auth_flow_prune_last_failure_unixtime(unix_time_seconds: i64) {
+    metrics()
+        .auth_v2_auth_flow_prune_last_failure_unixtime
+        .set(unix_time_seconds);
+}
+
+pub fn record_auth_v2_auth_flow_pruned(pruned: u64) {
+    if pruned == 0 {
+        return;
+    }
+
+    metrics().auth_v2_auth_flow_pruned_total.inc_by(pruned);
+}
+
+pub fn record_auth_v2_auth_flow_prune_error() {
+    metrics().auth_v2_auth_flow_prune_errors_total.inc();
 }
 
 pub fn record_refresh_error(error: &AuthError, duration: Duration) {
@@ -702,14 +936,19 @@ fn normalize_password_reset_rejection_reason(reason: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_email_metrics, record_email_delivery, record_email_outbox_claim_failure,
+        configure_email_metrics, record_auth_v2_auth_flow_prune_error,
+        record_auth_v2_auth_flow_prune_run, record_auth_v2_auth_flow_pruned,
+        record_auth_v2_password_request, record_email_delivery, record_email_outbox_claim_failure,
         record_email_outbox_claim_poll, record_email_outbox_dispatch, record_email_retry_intensity,
         record_login_risk_decision, record_login_risk_penalty,
         record_passkey_challenge_prune_error, record_passkey_challenge_prune_run,
         record_passkey_challenge_pruned, record_passkey_login_rejected,
         record_passkey_register_rejected, record_passkey_request, record_password_forgot_accepted,
         record_password_reset_rejected, record_problem_response, record_refresh_error,
-        record_refresh_success, render_prometheus, set_email_outbox_oldest_due_age_seconds,
+        record_refresh_success, render_prometheus, set_auth_v2_auth_flow_janitor_enabled,
+        set_auth_v2_auth_flow_prune_interval_seconds,
+        set_auth_v2_auth_flow_prune_last_failure_unixtime,
+        set_auth_v2_auth_flow_prune_last_success_unixtime, set_email_outbox_oldest_due_age_seconds,
         set_email_outbox_oldest_pending_age_seconds, set_email_outbox_queue_depth,
         set_passkey_challenge_janitor_enabled, set_passkey_challenge_prune_interval_seconds,
         set_passkey_challenge_prune_last_failure_unixtime,
@@ -727,6 +966,10 @@ mod tests {
         );
         record_login_risk_decision("block", "blocked_source_ip");
         record_login_risk_penalty("aggressive", "blocked_source_ip", 5);
+        record_auth_v2_password_request("login_start", "success");
+        record_auth_v2_password_request("login_finish", "error");
+        record_auth_v2_password_request("upgrade_start", "success");
+        record_auth_v2_password_request("upgrade_finish", "error");
         record_passkey_request("login_finish", "success");
         record_passkey_login_rejected("invalid_passkey_response");
         record_passkey_login_rejected("unexpected_future_reason");
@@ -745,6 +988,14 @@ mod tests {
         record_passkey_challenge_prune_run("error");
         set_passkey_challenge_prune_last_failure_unixtime(1_700_000_030);
         record_passkey_challenge_prune_error();
+        set_auth_v2_auth_flow_janitor_enabled(true);
+        set_auth_v2_auth_flow_prune_interval_seconds(45);
+        record_auth_v2_auth_flow_prune_run("success");
+        set_auth_v2_auth_flow_prune_last_success_unixtime(1_700_000_060);
+        record_auth_v2_auth_flow_pruned(3);
+        record_auth_v2_auth_flow_prune_run("error");
+        set_auth_v2_auth_flow_prune_last_failure_unixtime(1_700_000_090);
+        record_auth_v2_auth_flow_prune_error();
         record_problem_response(429, "https://example.com/problems/login-locked");
         record_email_delivery(
             "sendgrid",
@@ -777,6 +1028,17 @@ mod tests {
         assert!(payload.contains("auth_passkey_challenge_prune_last_failure_unixtime"));
         assert!(payload.contains("auth_passkey_challenge_pruned_total"));
         assert!(payload.contains("auth_passkey_challenge_prune_errors_total"));
+        assert!(payload.contains("auth_v2_auth_flow_janitor_enabled"));
+        assert!(payload.contains("auth_v2_password_start_requests_total"));
+        assert!(payload.contains("auth_v2_password_finish_requests_total"));
+        assert!(payload.contains("auth_v2_password_upgrade_requests_total"));
+        assert!(!payload.contains("auth_v2_password_requests_total"));
+        assert!(payload.contains("auth_v2_auth_flow_prune_interval_seconds"));
+        assert!(payload.contains("auth_v2_auth_flow_prune_runs_total"));
+        assert!(payload.contains("auth_v2_auth_flow_prune_last_success_unixtime"));
+        assert!(payload.contains("auth_v2_auth_flow_prune_last_failure_unixtime"));
+        assert!(payload.contains("auth_v2_auth_flow_pruned_total"));
+        assert!(payload.contains("auth_v2_auth_flow_prune_errors_total"));
         assert!(payload.contains("auth_refresh_rejected_total"));
         assert!(payload.contains("auth_refresh_duration_seconds"));
         assert!(payload.contains("auth_problem_responses_total"));
@@ -802,5 +1064,6 @@ mod tests {
         assert!(payload.contains("reason=\"challenge_user_mismatch\""));
         assert!(payload.contains("reason=\"account_not_active\""));
         assert!(payload.contains("outcome=\"existing_not_active\""));
+        assert!(payload.contains("channel=\"direct\""));
     }
 }

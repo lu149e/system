@@ -11,6 +11,7 @@ pub struct ProblemDetails {
     pub trace_id: String,
 }
 
+#[derive(Debug)]
 pub struct ApiProblem {
     pub status: StatusCode,
     pub body: ProblemDetails,
@@ -24,6 +25,14 @@ impl IntoResponse for ApiProblem {
         response.headers_mut().insert(
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("application/problem+json"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store, max-age=0"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::PRAGMA,
+            axum::http::HeaderValue::from_static("no-cache"),
         );
 
         if let Some(retry_after_seconds) = self.retry_after_seconds {
@@ -45,6 +54,13 @@ pub fn from_auth_error(
     use crate::modules::auth::application::AuthError;
 
     let (status, title, detail, type_url, retry_after_seconds) = match err {
+        AuthError::InvalidRequest => (
+            StatusCode::BAD_REQUEST,
+            "Invalid request".to_string(),
+            "Request payload is invalid for this authentication flow".to_string(),
+            "https://example.com/problems/invalid-request".to_string(),
+            None,
+        ),
         AuthError::WeakPassword => (
             StatusCode::BAD_REQUEST,
             "Weak password".to_string(),
@@ -183,6 +199,27 @@ pub fn from_auth_error(
             "https://example.com/problems/refresh-reuse".to_string(),
             None,
         ),
+        AuthError::OpaqueCredentialAlreadyActive => (
+            StatusCode::CONFLICT,
+            "Opaque credential already active".to_string(),
+            "This account already has an active OPAQUE credential".to_string(),
+            "https://example.com/problems/opaque-credential-already-active".to_string(),
+            None,
+        ),
+        AuthError::InvalidOpaqueRegistration => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Invalid opaque registration".to_string(),
+            "Provided OPAQUE registration payload is invalid".to_string(),
+            "https://example.com/problems/invalid-opaque-registration".to_string(),
+            None,
+        ),
+        AuthError::PakeUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "PAKE unavailable".to_string(),
+            "Password PAKE dependency is unavailable".to_string(),
+            "https://example.com/problems/pake-unavailable".to_string(),
+            None,
+        ),
         AuthError::Internal => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Internal error".to_string(),
@@ -268,6 +305,35 @@ mod tests {
         assert_eq!(
             response.headers().get(header::RETRY_AFTER),
             Some(&axum::http::HeaderValue::from_static("90"))
+        );
+    }
+
+    #[test]
+    fn invalid_request_maps_to_expected_problem_contract() {
+        let problem = from_auth_error(
+            AuthError::InvalidRequest,
+            "trace-invalid-request".to_string(),
+        );
+
+        assert_eq!(problem.status, StatusCode::BAD_REQUEST);
+        assert_eq!(problem.body.status, 400);
+        assert_eq!(problem.body.title, "Invalid request");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/invalid-request"
+        );
+    }
+
+    #[test]
+    fn pake_unavailable_maps_to_expected_problem_contract() {
+        let problem = from_auth_error(AuthError::PakeUnavailable, "trace-pake".to_string());
+
+        assert_eq!(problem.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(problem.body.status, 503);
+        assert_eq!(problem.body.title, "PAKE unavailable");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/pake-unavailable"
         );
     }
 

@@ -16,6 +16,7 @@ use adapters::{
     email::{NoopTransactionalEmailSender, SendGridTransactionalEmailSender},
     inmemory::{InMemoryAdapters, JwtEdDsaService, RefreshCryptoHmacService},
     outbox::{OutboxDispatcher, OutboxTransactionalEmailSender, OutboxWorkerConfig},
+    pake::build_password_pake_service,
     postgres::PostgresAdapters,
     redis::RedisLoginAbuseProtector,
     risk::{AllowAllLoginRiskAnalyzer, ConfigurableLoginRiskAnalyzer},
@@ -28,7 +29,7 @@ use axum::{
 };
 use config::{AppConfig, AuthRuntime, EmailDeliveryMode, EmailProviderConfig, LoginRiskMode};
 use ipnet::IpNet;
-use modules::auth::application::AuthService;
+use modules::auth::application::{AuthService, AuthV2Dependencies};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tower_http::{request_id::MakeRequestUuid, trace::TraceLayer};
@@ -115,6 +116,138 @@ async fn run_migration_mode() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) fn build_api_router(auth_v2_config: &config::AuthV2Config) -> Router<AppState> {
+    let mut app = Router::new()
+        .route("/healthz", get(api::handlers::healthz))
+        .route("/readyz", get(api::handlers::readyz))
+        .route("/.well-known/jwks.json", get(api::handlers::jwks))
+        .route("/v1/auth/register", post(api::handlers::register))
+        .route("/v1/auth/verify-email", post(api::handlers::verify_email))
+        .route(
+            "/v1/auth/password/forgot",
+            post(api::handlers::password_forgot),
+        )
+        .route(
+            "/v1/auth/password/reset",
+            post(api::handlers::password_reset),
+        )
+        .route(
+            "/v1/auth/password/change",
+            post(api::handlers::password_change),
+        )
+        .route("/v1/auth/login", post(api::handlers::login))
+        .route("/v1/auth/mfa/enroll", post(api::handlers::mfa_enroll))
+        .route("/v1/auth/mfa/activate", post(api::handlers::mfa_activate))
+        .route("/v1/auth/mfa/verify", post(api::handlers::mfa_verify))
+        .route("/v1/auth/mfa/disable", post(api::handlers::mfa_disable))
+        .route(
+            "/v1/auth/passkey/register/start",
+            post(api::handlers::passkey_register_start),
+        )
+        .route(
+            "/v1/auth/passkey/register/finish",
+            post(api::handlers::passkey_register_finish),
+        )
+        .route(
+            "/v1/auth/passkey/login/start",
+            post(api::handlers::passkey_login_start),
+        )
+        .route(
+            "/v1/auth/passkey/login/finish",
+            post(api::handlers::passkey_login_finish),
+        )
+        .route("/v1/auth/token/refresh", post(api::handlers::refresh))
+        .route("/v1/auth/logout", post(api::handlers::logout))
+        .route("/v1/auth/logout-all", post(api::handlers::logout_all))
+        .route("/v1/auth/sessions", get(api::handlers::sessions))
+        .route(
+            "/v1/auth/sessions/{session_id}",
+            delete(api::handlers::revoke_session),
+        )
+        .route("/v1/auth/me", get(api::handlers::me))
+        .route("/metrics", get(api::handlers::metrics));
+
+    if auth_v2_config.enabled
+        && !auth_v2_config.shadow_audit_only
+        && auth_v2_config.auth_flows_enabled
+        && auth_v2_config.methods_enabled
+    {
+        app = app.route("/v2/auth/methods", post(api::handlers::auth_methods_v2));
+    }
+
+    if auth_v2_config.enabled
+        && !auth_v2_config.shadow_audit_only
+        && auth_v2_config.auth_flows_enabled
+        && auth_v2_config.password_pake_enabled
+    {
+        app = app
+            .route(
+                "/v2/auth/password/login/start",
+                post(api::handlers::password_login_start_v2),
+            )
+            .route(
+                "/v2/auth/password/login/finish",
+                post(api::handlers::password_login_finish_v2),
+            );
+    }
+
+    if auth_v2_config.enabled
+        && !auth_v2_config.shadow_audit_only
+        && auth_v2_config.auth_flows_enabled
+        && auth_v2_config.password_upgrade_enabled
+    {
+        app = app
+            .route(
+                "/v2/auth/password/upgrade/start",
+                post(api::handlers::password_upgrade_start_v2),
+            )
+            .route(
+                "/v2/auth/password/upgrade/finish",
+                post(api::handlers::password_upgrade_finish_v2),
+            );
+    }
+
+    if auth_v2_config.enabled
+        && !auth_v2_config.shadow_audit_only
+        && auth_v2_config.passkey_namespace_enabled
+    {
+        app = app
+            .route(
+                "/v2/auth/passkeys/login/start",
+                post(api::handlers::passkey_login_start_v2),
+            )
+            .route(
+                "/v2/auth/passkeys/login/finish",
+                post(api::handlers::passkey_login_finish_v2),
+            )
+            .route(
+                "/v2/auth/passkeys/enroll/start",
+                post(api::handlers::passkey_register_start_v2),
+            )
+            .route(
+                "/v2/auth/passkeys/enroll/finish",
+                post(api::handlers::passkey_register_finish_v2),
+            );
+    }
+
+    app
+}
+
+pub(crate) fn build_app_router(state: AppState, auth_v2_config: &config::AuthV2Config) -> Router {
+    let secure_transport_state = state.clone();
+
+    build_api_router(auth_v2_config)
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            secure_transport_state,
+            api::security::enforce_secure_transport,
+        ))
+        .layer(TraceLayer::new_for_http())
+        .layer(tower_http::request_id::SetRequestIdLayer::x_request_id(
+            MakeRequestUuid,
+        ))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -136,6 +269,13 @@ async fn main() -> anyhow::Result<()> {
     observability::set_passkey_challenge_janitor_enabled(cfg.passkey_enabled);
     observability::set_passkey_challenge_prune_interval_seconds(
         cfg.passkey_challenge_prune_interval_seconds,
+    );
+    let auth_flow_janitor_enabled = cfg.auth_v2.enabled
+        && cfg.auth_v2.auth_flows_enabled
+        && cfg.auth_runtime == AuthRuntime::PostgresRedis;
+    observability::set_auth_v2_auth_flow_janitor_enabled(auth_flow_janitor_enabled);
+    observability::set_auth_v2_auth_flow_prune_interval_seconds(
+        cfg.auth_v2_auth_flow_prune_interval_seconds,
     );
     let jwks_inputs = cfg
         .jwt_keys
@@ -173,6 +313,14 @@ async fn main() -> anyhow::Result<()> {
             .checked_mul(3)
             .unwrap_or(passkey_challenge_janitor_interval),
     ));
+    let auth_flow_janitor_interval =
+        Duration::from_secs(cfg.auth_v2_auth_flow_prune_interval_seconds);
+    let auth_flow_janitor_health = Arc::new(health::AuthFlowJanitorHealth::new(
+        auth_flow_janitor_enabled,
+        auth_flow_janitor_interval
+            .checked_mul(3)
+            .unwrap_or(auth_flow_janitor_interval),
+    ));
 
     let (
         users,
@@ -190,9 +338,11 @@ async fn main() -> anyhow::Result<()> {
         outbox_repository,
         dispatcher,
         readiness_checker,
+        auth_v2_dependencies,
     ) = match cfg.auth_runtime {
         AuthRuntime::PostgresRedis => {
             let pg = PostgresAdapters::bootstrap(&cfg).await?;
+            let pake_service = build_password_pake_service(&cfg)?;
             let redis = RedisLoginAbuseProtector::new(
                 &cfg.redis_url,
                 cfg.login_max_attempts,
@@ -210,6 +360,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(redis.health_client()),
                 std::time::Duration::from_secs(2),
                 Arc::clone(&passkey_challenge_janitor_health),
+                Arc::clone(&auth_flow_janitor_health),
             );
             let outbox_repository = Arc::new(pg.email_outbox.clone())
                 as Arc<dyn modules::auth::ports::EmailOutboxRepository>;
@@ -257,13 +408,26 @@ async fn main() -> anyhow::Result<()> {
                 Some(outbox_repository),
                 dispatcher,
                 readiness_checker,
+                Some(AuthV2Dependencies {
+                    config: cfg.auth_v2.clone(),
+                    accounts: Arc::new(pg.accounts)
+                        as Arc<dyn modules::auth::ports::AccountRepository>,
+                    legacy_passwords: Arc::new(pg.legacy_passwords)
+                        as Arc<dyn modules::auth::ports::LegacyPasswordRepository>,
+                    opaque_credentials: Arc::new(pg.opaque_credentials)
+                        as Arc<dyn modules::auth::ports::OpaqueCredentialRepository>,
+                    auth_flows: Arc::new(pg.auth_flows)
+                        as Arc<dyn modules::auth::ports::AuthFlowRepository>,
+                    pake_service,
+                }),
             )
         }
         AuthRuntime::InMemory => {
             let adapters = InMemoryAdapters::bootstrap(&cfg)?;
-            let readiness_checker = health::RuntimeReadinessChecker::inmemory(Arc::clone(
-                &passkey_challenge_janitor_health,
-            ));
+            let readiness_checker = health::RuntimeReadinessChecker::inmemory(
+                Arc::clone(&passkey_challenge_janitor_health),
+                Arc::clone(&auth_flow_janitor_health),
+            );
             (
                 Arc::new(adapters.users) as Arc<dyn modules::auth::ports::UserRepository>,
                 Arc::new(adapters.login_abuse)
@@ -289,6 +453,7 @@ async fn main() -> anyhow::Result<()> {
                 None,
                 None,
                 readiness_checker,
+                None,
             )
         }
     };
@@ -322,8 +487,22 @@ async fn main() -> anyhow::Result<()> {
     let passkey_webauthn = build_passkey_webauthn(&cfg)?;
     let passkey_challenge_janitor_repository = Arc::clone(&passkey_challenges);
     let passkey_challenge_janitor_health_for_worker = Arc::clone(&passkey_challenge_janitor_health);
+    let auth_flow_janitor_repository = if auth_flow_janitor_enabled {
+        auth_v2_dependencies
+            .as_ref()
+            .map(|deps| Arc::clone(&deps.auth_flows))
+    } else {
+        None
+    };
+    let auth_flow_janitor_health_for_worker = Arc::clone(&auth_flow_janitor_health);
+    let auth_v2_config = cfg.auth_v2.clone();
+    let mfa_totp_issuer = cfg.mfa_totp_issuer.clone();
+    let mfa_encryption_key = cfg.mfa_encryption_key.clone();
+    let jwt_issuer = cfg.jwt_issuer.clone();
+    let jwt_audience = cfg.jwt_audience.clone();
+    let bind_addr = cfg.bind_addr.clone();
 
-    let auth_service = Arc::new(AuthService::new(
+    let mut auth_service = AuthService::new(
         users,
         login_abuse,
         login_risk_analyzer,
@@ -346,12 +525,16 @@ async fn main() -> anyhow::Result<()> {
         cfg.password_reset_ttl_seconds,
         cfg.mfa_challenge_ttl_seconds,
         cfg.mfa_challenge_max_attempts,
-        cfg.mfa_totp_issuer,
-        cfg.mfa_encryption_key,
+        mfa_totp_issuer,
+        mfa_encryption_key,
         passkey_webauthn,
-        cfg.jwt_issuer,
-        cfg.jwt_audience,
-    )?);
+        jwt_issuer,
+        jwt_audience,
+    )?;
+    if let Some(auth_v2) = auth_v2_dependencies {
+        auth_service = auth_service.with_v2(auth_v2);
+    }
+    let auth_service = Arc::new(auth_service);
 
     let state = AppState {
         auth_service,
@@ -415,68 +598,48 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let secure_transport_state = state.clone();
+    if let Some(auth_flow_janitor_repository) = auth_flow_janitor_repository {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(auth_flow_janitor_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let app = Router::new()
-        .route("/healthz", get(api::handlers::healthz))
-        .route("/readyz", get(api::handlers::readyz))
-        .route("/.well-known/jwks.json", get(api::handlers::jwks))
-        .route("/v1/auth/register", post(api::handlers::register))
-        .route("/v1/auth/verify-email", post(api::handlers::verify_email))
-        .route(
-            "/v1/auth/password/forgot",
-            post(api::handlers::password_forgot),
-        )
-        .route(
-            "/v1/auth/password/reset",
-            post(api::handlers::password_reset),
-        )
-        .route(
-            "/v1/auth/password/change",
-            post(api::handlers::password_change),
-        )
-        .route("/v1/auth/login", post(api::handlers::login))
-        .route("/v1/auth/mfa/enroll", post(api::handlers::mfa_enroll))
-        .route("/v1/auth/mfa/activate", post(api::handlers::mfa_activate))
-        .route("/v1/auth/mfa/verify", post(api::handlers::mfa_verify))
-        .route("/v1/auth/mfa/disable", post(api::handlers::mfa_disable))
-        .route(
-            "/v1/auth/passkey/register/start",
-            post(api::handlers::passkey_register_start),
-        )
-        .route(
-            "/v1/auth/passkey/register/finish",
-            post(api::handlers::passkey_register_finish),
-        )
-        .route(
-            "/v1/auth/passkey/login/start",
-            post(api::handlers::passkey_login_start),
-        )
-        .route(
-            "/v1/auth/passkey/login/finish",
-            post(api::handlers::passkey_login_finish),
-        )
-        .route("/v1/auth/token/refresh", post(api::handlers::refresh))
-        .route("/v1/auth/logout", post(api::handlers::logout))
-        .route("/v1/auth/logout-all", post(api::handlers::logout_all))
-        .route("/v1/auth/sessions", get(api::handlers::sessions))
-        .route(
-            "/v1/auth/sessions/{session_id}",
-            delete(api::handlers::revoke_session),
-        )
-        .route("/v1/auth/me", get(api::handlers::me))
-        .route("/metrics", get(api::handlers::metrics))
-        .with_state(state)
-        .layer(middleware::from_fn_with_state(
-            secure_transport_state,
-            api::security::enforce_secure_transport,
-        ))
-        .layer(TraceLayer::new_for_http())
-        .layer(tower_http::request_id::SetRequestIdLayer::x_request_id(
-            MakeRequestUuid,
-        ));
+            loop {
+                ticker.tick().await;
 
-    let addr: SocketAddr = cfg.bind_addr.parse().context("invalid APP_ADDR")?;
+                let now = chrono::Utc::now();
+                match auth_flow_janitor_repository.prune_expired(now).await {
+                    Ok(pruned) => {
+                        observability::record_auth_v2_auth_flow_prune_run("success");
+                        observability::set_auth_v2_auth_flow_prune_last_success_unixtime(
+                            now.timestamp(),
+                        );
+                        auth_flow_janitor_health_for_worker.record_success(now);
+                        if pruned > 0 {
+                            observability::record_auth_v2_auth_flow_pruned(pruned);
+                            tracing::info!(pruned, "pruned expired auth v2 auth flows");
+                        }
+                    }
+                    Err(error) => {
+                        observability::record_auth_v2_auth_flow_prune_run("error");
+                        observability::set_auth_v2_auth_flow_prune_last_failure_unixtime(
+                            now.timestamp(),
+                        );
+                        auth_flow_janitor_health_for_worker.record_failure(now, error.clone());
+                        observability::record_auth_v2_auth_flow_prune_error();
+                        tracing::warn!(error = %error, "failed to prune expired auth v2 auth flows");
+                    }
+                }
+            }
+        });
+        tracing::info!(
+            interval_seconds = auth_flow_janitor_interval.as_secs(),
+            "auth v2 auth flow janitor started"
+        );
+    }
+
+    let app = build_app_router(state, &auth_v2_config);
+
+    let addr: SocketAddr = bind_addr.parse().context("invalid APP_ADDR")?;
     let listener = TcpListener::bind(addr).await?;
     info!(address = %addr, "auth api listening");
     axum::serve(

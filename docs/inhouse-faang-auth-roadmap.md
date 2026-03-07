@@ -5,6 +5,11 @@
 Build and operate a fully in-house identity platform with strong phishing resistance,
 high abuse resistance, fast incident response, and provable security controls.
 
+Reference docs for the password modernization track:
+
+- `docs/pake-passkey-prd.md`
+- `docs/pake-passkey-migration-plan.md`
+
 ## Non-Negotiable Principles
 
 1. Transport security first: no auth traffic without TLS.
