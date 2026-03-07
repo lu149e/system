@@ -19,6 +19,7 @@ struct MetricsRegistry {
     auth_v2_password_finish_requests_total: IntCounterVec,
     auth_v2_password_upgrade_requests_total: IntCounterVec,
     auth_v2_password_rejected_total: IntCounterVec,
+    auth_v2_legacy_fallback_total: IntCounterVec,
     passkey_requests_total: IntCounterVec,
     passkey_login_rejected_total: IntCounterVec,
     passkey_register_rejected_total: IntCounterVec,
@@ -130,6 +131,15 @@ impl MetricsRegistry {
             &["reason"],
         )
         .expect("auth v2 password rejected metric should initialize");
+
+        let auth_v2_legacy_fallback_total = IntCounterVec::new(
+            Opts::new(
+                "auth_v2_legacy_fallback_total",
+                "Total auth v2 legacy fallback policy evaluations partitioned by reason and channel",
+            ),
+            &["reason", "channel"],
+        )
+        .expect("auth v2 legacy fallback metric should initialize");
 
         let passkey_requests_total = IntCounterVec::new(
             Opts::new(
@@ -400,6 +410,9 @@ impl MetricsRegistry {
             .register(Box::new(auth_v2_password_rejected_total.clone()))
             .expect("auth v2 password rejected metric should register");
         registry
+            .register(Box::new(auth_v2_legacy_fallback_total.clone()))
+            .expect("auth v2 legacy fallback metric should register");
+        registry
             .register(Box::new(passkey_requests_total.clone()))
             .expect("passkey requests metric should register");
         registry
@@ -519,6 +532,7 @@ impl MetricsRegistry {
             auth_v2_password_finish_requests_total,
             auth_v2_password_upgrade_requests_total,
             auth_v2_password_rejected_total,
+            auth_v2_legacy_fallback_total,
             passkey_requests_total,
             passkey_login_rejected_total,
             passkey_register_rejected_total,
@@ -602,16 +616,17 @@ pub fn record_auth_v2_methods_request(channel: &str, outcome: &str) {
         .inc();
 }
 
-pub fn record_auth_v2_password_request(operation: &str, outcome: &str) {
+pub fn record_auth_v2_password_request(operation: &str, outcome: &str, channel: &str) {
     let metrics = metrics();
+    let channel = normalize_auth_v2_rollout_channel(channel);
     match operation {
         "login_start" => metrics
             .auth_v2_password_start_requests_total
-            .with_label_values(&[outcome, "direct"])
+            .with_label_values(&[outcome, channel])
             .inc(),
         "login_finish" => metrics
             .auth_v2_password_finish_requests_total
-            .with_label_values(&[outcome, "direct"])
+            .with_label_values(&[outcome, channel])
             .inc(),
         "upgrade_start" => metrics
             .auth_v2_password_upgrade_requests_total
@@ -623,6 +638,16 @@ pub fn record_auth_v2_password_request(operation: &str, outcome: &str) {
             .inc(),
         _ => {}
     }
+}
+
+pub fn record_auth_v2_legacy_fallback(reason: &str, channel: &str) {
+    metrics()
+        .auth_v2_legacy_fallback_total
+        .with_label_values(&[
+            normalize_auth_v2_fallback_reason(reason),
+            normalize_auth_v2_rollout_channel(channel),
+        ])
+        .inc();
 }
 
 pub fn record_auth_v2_password_rejected(reason: &str) {
@@ -933,20 +958,43 @@ fn normalize_password_reset_rejection_reason(reason: &str) -> &'static str {
     }
 }
 
+fn normalize_auth_v2_rollout_channel(channel: &str) -> &str {
+    match channel {
+        "unknown" => "unknown",
+        "shadow" => "shadow",
+        "web" => "web",
+        "ios" => "ios",
+        "android" => "android",
+        _ => "other",
+    }
+}
+
+fn normalize_auth_v2_fallback_reason(reason: &str) -> &'static str {
+    match reason {
+        "allowlisted" => "allowlisted",
+        "broad" => "broad",
+        "client_not_allowlisted" => "client_not_allowlisted",
+        "no_legacy_password" => "no_legacy_password",
+        "legacy_login_disabled" => "legacy_login_disabled",
+        "policy_disabled" => "policy_disabled",
+        _ => "other",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         configure_email_metrics, record_auth_v2_auth_flow_prune_error,
         record_auth_v2_auth_flow_prune_run, record_auth_v2_auth_flow_pruned,
-        record_auth_v2_password_request, record_email_delivery, record_email_outbox_claim_failure,
-        record_email_outbox_claim_poll, record_email_outbox_dispatch, record_email_retry_intensity,
-        record_login_risk_decision, record_login_risk_penalty,
-        record_passkey_challenge_prune_error, record_passkey_challenge_prune_run,
-        record_passkey_challenge_pruned, record_passkey_login_rejected,
-        record_passkey_register_rejected, record_passkey_request, record_password_forgot_accepted,
-        record_password_reset_rejected, record_problem_response, record_refresh_error,
-        record_refresh_success, render_prometheus, set_auth_v2_auth_flow_janitor_enabled,
-        set_auth_v2_auth_flow_prune_interval_seconds,
+        record_auth_v2_legacy_fallback, record_auth_v2_password_request, record_email_delivery,
+        record_email_outbox_claim_failure, record_email_outbox_claim_poll,
+        record_email_outbox_dispatch, record_email_retry_intensity, record_login_risk_decision,
+        record_login_risk_penalty, record_passkey_challenge_prune_error,
+        record_passkey_challenge_prune_run, record_passkey_challenge_pruned,
+        record_passkey_login_rejected, record_passkey_register_rejected, record_passkey_request,
+        record_password_forgot_accepted, record_password_reset_rejected, record_problem_response,
+        record_refresh_error, record_refresh_success, render_prometheus,
+        set_auth_v2_auth_flow_janitor_enabled, set_auth_v2_auth_flow_prune_interval_seconds,
         set_auth_v2_auth_flow_prune_last_failure_unixtime,
         set_auth_v2_auth_flow_prune_last_success_unixtime, set_email_outbox_oldest_due_age_seconds,
         set_email_outbox_oldest_pending_age_seconds, set_email_outbox_queue_depth,
@@ -966,10 +1014,12 @@ mod tests {
         );
         record_login_risk_decision("block", "blocked_source_ip");
         record_login_risk_penalty("aggressive", "blocked_source_ip", 5);
-        record_auth_v2_password_request("login_start", "success");
-        record_auth_v2_password_request("login_finish", "error");
-        record_auth_v2_password_request("upgrade_start", "success");
-        record_auth_v2_password_request("upgrade_finish", "error");
+        record_auth_v2_password_request("login_start", "success", "web");
+        record_auth_v2_password_request("login_finish", "error", "android");
+        record_auth_v2_password_request("upgrade_start", "success", "ios");
+        record_auth_v2_password_request("upgrade_finish", "error", "ios");
+        record_auth_v2_legacy_fallback("allowlisted", "web");
+        record_auth_v2_legacy_fallback("client_not_allowlisted", "android");
         record_passkey_request("login_finish", "success");
         record_passkey_login_rejected("invalid_passkey_response");
         record_passkey_login_rejected("unexpected_future_reason");
@@ -1033,6 +1083,7 @@ mod tests {
         assert!(payload.contains("auth_v2_password_finish_requests_total"));
         assert!(payload.contains("auth_v2_password_upgrade_requests_total"));
         assert!(!payload.contains("auth_v2_password_requests_total"));
+        assert!(payload.contains("auth_v2_legacy_fallback_total"));
         assert!(payload.contains("auth_v2_auth_flow_prune_interval_seconds"));
         assert!(payload.contains("auth_v2_auth_flow_prune_runs_total"));
         assert!(payload.contains("auth_v2_auth_flow_prune_last_success_unixtime"));
@@ -1064,6 +1115,9 @@ mod tests {
         assert!(payload.contains("reason=\"challenge_user_mismatch\""));
         assert!(payload.contains("reason=\"account_not_active\""));
         assert!(payload.contains("outcome=\"existing_not_active\""));
-        assert!(payload.contains("channel=\"direct\""));
+        assert!(payload.contains("channel=\"web\""));
+        assert!(payload.contains("channel=\"android\""));
+        assert!(payload.contains("reason=\"allowlisted\""));
+        assert!(payload.contains("reason=\"client_not_allowlisted\""));
     }
 }

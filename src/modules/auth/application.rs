@@ -101,7 +101,34 @@ pub struct RequestContext {
     pub trace_id: String,
     pub ip: Option<String>,
     pub user_agent: Option<String>,
+    pub client_id: Option<String>,
     pub auth_api_surface: AuthApiSurface,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthV2FallbackPolicy {
+    Disabled,
+    Eligible,
+}
+
+impl AuthV2FallbackPolicy {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Eligible => "eligible",
+        }
+    }
+
+    fn legacy_password_allowed(self) -> bool {
+        matches!(self, Self::Eligible)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthV2RolloutDecision {
+    pub(crate) rollout_channel: String,
+    pub(crate) client_allowed: bool,
+    pub(crate) fallback_policy: AuthV2FallbackPolicy,
 }
 
 #[derive(Debug, Error)]
@@ -152,6 +179,8 @@ pub enum AuthError {
     InvalidOpaqueRegistration,
     #[error("pake dependency unavailable")]
     PakeUnavailable,
+    #[error("auth v2 rollout denied")]
+    AuthV2RolloutDenied,
     #[error("internal error")]
     Internal,
 }
@@ -1393,6 +1422,11 @@ impl AuthService {
             return Err(AuthError::InvalidToken);
         }
 
+        let rollout = auth_v2_rollout_from_flow(&v2.config, &flow, None);
+        if !auth_v2_allows_external_access(&v2.config, &rollout) {
+            return Err(AuthError::AuthV2RolloutDenied);
+        }
+
         self.passkey_login_start(identifier, ctx).await
     }
 
@@ -1658,6 +1692,16 @@ impl AuthService {
         let now = Utc::now();
         let subject_identifier_hash = self.refresh_crypto.hash_refresh_token(&identifier).await;
         let account = v2.accounts.find_by_email(&identifier).await;
+        let legacy = if let Some(account) = account.as_ref() {
+            v2.legacy_passwords
+                .find_by_user_id(&account.id)
+                .await
+                .map_err(|_| AuthError::Internal)?
+        } else {
+            None
+        };
+        let rollout =
+            evaluate_auth_v2_rollout(&v2.config, cmd.client_id.as_deref(), legacy.as_ref());
         let has_passkey = if let Some(account) = account.as_ref() {
             !self.load_passkeys_for_user(&account.id).await?.is_empty()
         } else {
@@ -1690,8 +1734,8 @@ impl AuthService {
                     "client_id": cmd.client_id,
                 }),
                 status: crate::modules::auth::domain::AuthFlowStatus::Pending,
-                rollout_channel: Some(auth_v2_rollout_channel(&v2.config, &ctx)),
-                fallback_policy: None,
+                rollout_channel: Some(rollout.rollout_channel.clone()),
+                fallback_policy: Some(rollout.fallback_policy.as_str().to_string()),
                 trace_id: Some(ctx.trace_id.clone()),
                 issued_ip: ctx.ip.clone(),
                 issued_user_agent: ctx.user_agent.clone(),
@@ -1712,6 +1756,8 @@ impl AuthService {
                 metadata: json!({
                     "methods": methods.iter().map(|method| auth_method_kind_label(&method.kind)).collect::<Vec<_>>(),
                     "recommended_method": recommended_method_label.clone(),
+                    "rollout_channel": rollout.rollout_channel,
+                    "fallback_policy": rollout.fallback_policy.as_str(),
                     "ip": ctx.ip,
                     "user_agent": ctx.user_agent,
                 }),
@@ -1742,139 +1788,154 @@ impl AuthService {
         if !v2.config.enabled || !v2.config.password_pake_enabled {
             return Err(AuthError::Internal);
         }
-
-        let identifier = cmd.identifier.to_ascii_lowercase();
-        let now = Utc::now();
-        match self
-            .login_abuse
-            .check(&identifier, ctx.ip.as_deref(), now)
-            .await
-        {
-            LoginGateDecision::Allowed => {}
-            LoginGateDecision::Locked { until } => {
-                let retry_after_seconds = (until - now).num_seconds().max(1);
-                return Err(AuthError::LoginLocked {
-                    retry_after_seconds,
-                });
-            }
-        }
-
-        let discovery = v2
-            .auth_flows
-            .consume(&cmd.discovery_token, now)
-            .await
-            .map_err(|_| AuthError::Internal)?;
-        let discovery_flow = match discovery {
-            crate::modules::auth::ports::AuthFlowConsumeState::Active(flow)
-                if matches!(
-                    flow.flow_kind,
-                    crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery
-                ) =>
+        let mut metrics_channel = auth_v2_rollout_channel_hint(ctx.client_id.as_deref());
+        let result = async {
+            let identifier = cmd.identifier.to_ascii_lowercase();
+            let now = Utc::now();
+            match self
+                .login_abuse
+                .check(&identifier, ctx.ip.as_deref(), now)
+                .await
             {
-                *flow
-            }
-            _ => return Err(AuthError::InvalidToken),
-        };
-
-        let account = v2.accounts.find_by_email(&identifier).await;
-        let opaque = if let Some(account) = account.as_ref() {
-            v2.opaque_credentials
-                .find_by_user_id(&account.id)
-                .await
-                .map_err(|_| AuthError::Internal)?
-        } else {
-            None
-        };
-        let legacy = if let Some(account) = account.as_ref() {
-            v2.legacy_passwords
-                .find_by_user_id(&account.id)
-                .await
-                .map_err(|_| AuthError::Internal)?
-        } else {
-            None
-        };
-        let rollout_channel = discovery_flow.rollout_channel.clone();
-
-        let flow_id = Uuid::new_v4().to_string();
-        let result = v2
-            .pake_service
-            .start_login(
-                crate::modules::auth::ports::PakeLoginCredentialView {
-                    user_id: account.as_ref().map(|record| record.id.clone()),
-                    opaque_credential: opaque
-                        .as_ref()
-                        .filter(|record| {
-                            record.state
-                                == crate::modules::auth::domain::OpaqueCredentialState::Active
-                        })
-                        .map(|record| record.credential_blob.clone()),
-                    legacy_password_allowed: allow_legacy_fallback(&v2.config, legacy.as_ref()),
-                },
-                crate::modules::auth::ports::PakeStartRequest {
-                    flow_id: flow_id.clone(),
-                    request: cmd.request,
-                },
-            )
-            .await
-            .map_err(|err| {
-                if err.contains("unavailable") {
-                    AuthError::PakeUnavailable
-                } else {
-                    AuthError::InvalidRequest
+                LoginGateDecision::Allowed => {}
+                LoginGateDecision::Locked { until } => {
+                    let retry_after_seconds = (until - now).num_seconds().max(1);
+                    return Err(AuthError::LoginLocked {
+                        retry_after_seconds,
+                    });
                 }
-            })?;
+            }
 
-        v2.auth_flows
-            .issue(AuthFlowRecord {
-                flow_id: flow_id.clone(),
-                subject_user_id: account.as_ref().map(|record| record.id.clone()),
-                subject_identifier_hash: discovery_flow.subject_identifier_hash,
-                flow_kind: crate::modules::auth::domain::AuthFlowKind::PasswordLogin,
+            let discovery = v2
+                .auth_flows
+                .consume(&cmd.discovery_token, now)
+                .await
+                .map_err(|_| AuthError::Internal)?;
+            let discovery_flow = match discovery {
+                crate::modules::auth::ports::AuthFlowConsumeState::Active(flow)
+                    if matches!(
+                        flow.flow_kind,
+                        crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery
+                    ) =>
+                {
+                    *flow
+                }
+                _ => return Err(AuthError::InvalidToken),
+            };
+
+            let account = v2.accounts.find_by_email(&identifier).await;
+            let opaque = if let Some(account) = account.as_ref() {
+                v2.opaque_credentials
+                    .find_by_user_id(&account.id)
+                    .await
+                    .map_err(|_| AuthError::Internal)?
+            } else {
+                None
+            };
+            let legacy = if let Some(account) = account.as_ref() {
+                v2.legacy_passwords
+                    .find_by_user_id(&account.id)
+                    .await
+                    .map_err(|_| AuthError::Internal)?
+            } else {
+                None
+            };
+            let rollout = auth_v2_rollout_from_flow(&v2.config, &discovery_flow, legacy.as_ref());
+            metrics_channel = rollout.rollout_channel.clone();
+            crate::observability::record_auth_v2_legacy_fallback(
+                auth_v2_fallback_reason(&v2.config, legacy.as_ref(), &rollout),
+                &rollout.rollout_channel,
+            );
+            if !auth_v2_allows_external_access(&v2.config, &rollout) {
+                return Err(AuthError::AuthV2RolloutDenied);
+            }
+
+            let flow_id = Uuid::new_v4().to_string();
+            let result = v2
+                .pake_service
+                .start_login(
+                    crate::modules::auth::ports::PakeLoginCredentialView {
+                        user_id: account.as_ref().map(|record| record.id.clone()),
+                        opaque_credential: opaque
+                            .as_ref()
+                            .filter(|record| {
+                                record.state
+                                    == crate::modules::auth::domain::OpaqueCredentialState::Active
+                            })
+                            .map(|record| record.credential_blob.clone()),
+                        legacy_password_allowed: rollout.fallback_policy.legacy_password_allowed(),
+                    },
+                    crate::modules::auth::ports::PakeStartRequest {
+                        flow_id: flow_id.clone(),
+                        request: cmd.request,
+                    },
+                )
+                .await
+                .map_err(|err| {
+                    if err.contains("unavailable") {
+                        AuthError::PakeUnavailable
+                    } else {
+                        AuthError::InvalidRequest
+                    }
+                })?;
+
+            v2.auth_flows
+                .issue(AuthFlowRecord {
+                    flow_id: flow_id.clone(),
+                    subject_user_id: account.as_ref().map(|record| record.id.clone()),
+                    subject_identifier_hash: discovery_flow.subject_identifier_hash,
+                    flow_kind: crate::modules::auth::domain::AuthFlowKind::PasswordLogin,
+                    protocol: "opaque_v1".to_string(),
+                    state: json!({
+                        "identifier": identifier,
+                        "server_state": result.server_state,
+                        "legacy_fallback_allowed": rollout.fallback_policy.legacy_password_allowed(),
+                    }),
+                    status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                    rollout_channel: Some(rollout.rollout_channel.clone()),
+                    fallback_policy: Some(rollout.fallback_policy.as_str().to_string()),
+                    trace_id: Some(ctx.trace_id.clone()),
+                    issued_ip: ctx.ip.clone(),
+                    issued_user_agent: ctx.user_agent.clone(),
+                    attempt_count: 0,
+                    expires_at: now + Duration::seconds(self.mfa_challenge_ttl_seconds),
+                    consumed_at: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .map_err(|_| AuthError::Internal)?;
+
+            self.audit
+                .append(AuditEvent {
+                    event_type: "auth.v2.password.login.challenge.issued".to_string(),
+                    actor_user_id: account.as_ref().map(|record| record.id.clone()),
+                    trace_id: ctx.trace_id.clone(),
+                    metadata: json!({
+                        "flow_id": flow_id.clone(),
+                        "rollout_channel": rollout.rollout_channel,
+                        "fallback_policy": rollout.fallback_policy.as_str(),
+                        "ip": ctx.ip,
+                        "user_agent": ctx.user_agent,
+                    }),
+                    created_at: now,
+                })
+                .await;
+
+            Ok(PakeLoginStartResponse {
+                flow_id,
                 protocol: "opaque_v1".to_string(),
-                state: json!({
-                    "identifier": identifier,
-                    "server_state": result.server_state,
-                    "legacy_fallback_allowed": allow_legacy_fallback(&v2.config, legacy.as_ref()),
-                }),
-                status: crate::modules::auth::domain::AuthFlowStatus::Pending,
-                rollout_channel: rollout_channel.clone(),
-                fallback_policy: Some(
-                    auth_v2_fallback_policy(&v2.config, legacy.as_ref()).to_string(),
-                ),
-                trace_id: Some(ctx.trace_id.clone()),
-                issued_ip: ctx.ip.clone(),
-                issued_user_agent: ctx.user_agent.clone(),
-                attempt_count: 0,
-                expires_at: now + Duration::seconds(self.mfa_challenge_ttl_seconds),
-                consumed_at: None,
-                created_at: now,
-                updated_at: now,
+                server_message: result.response,
+                expires_in: self.mfa_challenge_ttl_seconds,
             })
-            .await
-            .map_err(|_| AuthError::Internal)?;
-
-        self.audit
-            .append(AuditEvent {
-                event_type: "auth.v2.password.login.challenge.issued".to_string(),
-                actor_user_id: account.as_ref().map(|record| record.id.clone()),
-                trace_id: ctx.trace_id.clone(),
-                metadata: json!({
-                    "flow_id": flow_id.clone(),
-                    "rollout_channel": rollout_channel,
-                    "fallback_policy": auth_v2_fallback_policy(&v2.config, legacy.as_ref()),
-                    "ip": ctx.ip,
-                    "user_agent": ctx.user_agent,
-                }),
-                created_at: now,
-            })
-            .await;
-
-        Ok(PakeLoginStartResponse {
-            flow_id,
-            protocol: "opaque_v1".to_string(),
-            server_message: result.response,
-            expires_in: self.mfa_challenge_ttl_seconds,
-        })
+        }
+        .await;
+        crate::observability::record_auth_v2_password_request(
+            "login_start",
+            auth_v2_request_outcome(&result),
+            &metrics_channel,
+        );
+        result
     }
 
     pub async fn finish_password_login_v2(
@@ -1886,104 +1947,121 @@ impl AuthService {
         if !v2.config.enabled || !v2.config.password_pake_enabled {
             return Err(AuthError::Internal);
         }
-
-        let now = Utc::now();
-        let flow_state = v2
-            .auth_flows
-            .consume(&cmd.flow_id, now)
-            .await
-            .map_err(|_| AuthError::Internal)?;
-        let flow = match flow_state {
-            crate::modules::auth::ports::AuthFlowConsumeState::Active(flow)
-                if matches!(
-                    flow.flow_kind,
-                    crate::modules::auth::domain::AuthFlowKind::PasswordLogin
-                ) =>
-            {
-                *flow
-            }
-            _ => return Err(AuthError::InvalidCredentials),
-        };
-
-        let server_state = flow
-            .state
-            .get("server_state")
-            .cloned()
-            .ok_or(AuthError::InvalidCredentials)?;
-        let finish = v2
-            .pake_service
-            .finish_login(server_state, cmd.client_message)
-            .await
-            .map_err(|err| {
-                if err.contains("unavailable") {
-                    AuthError::PakeUnavailable
-                } else {
-                    AuthError::InvalidCredentials
+        let mut metrics_channel = "unknown".to_string();
+        let result = async {
+            let now = Utc::now();
+            let flow_state = v2
+                .auth_flows
+                .consume(&cmd.flow_id, now)
+                .await
+                .map_err(|_| AuthError::Internal)?;
+            let flow = match flow_state {
+                crate::modules::auth::ports::AuthFlowConsumeState::Active(flow)
+                    if matches!(
+                        flow.flow_kind,
+                        crate::modules::auth::domain::AuthFlowKind::PasswordLogin
+                    ) =>
+                {
+                    *flow
                 }
-            })?;
-
-        let account = v2
-            .accounts
-            .find_by_id(&finish.session_user_id)
-            .await
-            .ok_or(AuthError::InvalidCredentials)?;
-        if account.status != crate::modules::auth::domain::AccountStatus::Active {
-            return Err(AuthError::InvalidCredentials);
-        }
-
-        let _ = v2.opaque_credentials.mark_verified(&account.id, now).await;
-        let mfa_enabled = self
-            .mfa_factors
-            .find_by_user_id(&account.id)
-            .await
-            .map(|factor| factor.enabled_at.is_some())
-            .unwrap_or(false);
-        let forced_step_up_reason = self
-            .evaluate_login_risk_policy(&account.email, &account.id, mfa_enabled, &ctx, now)
-            .await?;
-
-        self.login_abuse
-            .register_success(&account.email, ctx.ip.as_deref())
-            .await;
-
-        if mfa_enabled {
-            let message = if forced_step_up_reason.is_some() {
-                "Additional verification required"
-            } else {
-                "Multi-factor authentication required"
+                _ => return Err(AuthError::InvalidCredentials),
             };
-            return self
-                .issue_mfa_challenge(
+            let rollout = auth_v2_rollout_from_flow(&v2.config, &flow, None);
+            metrics_channel = rollout.rollout_channel.clone();
+
+            let server_state = flow
+                .state
+                .get("server_state")
+                .cloned()
+                .ok_or(AuthError::InvalidCredentials)?;
+            let finish = v2
+                .pake_service
+                .finish_login(server_state, cmd.client_message)
+                .await
+                .map_err(|err| {
+                    if err.contains("unavailable") {
+                        AuthError::PakeUnavailable
+                    } else {
+                        AuthError::InvalidCredentials
+                    }
+                })?;
+
+            let account = v2
+                .accounts
+                .find_by_id(&finish.session_user_id)
+                .await
+                .ok_or(AuthError::InvalidCredentials)?;
+            if account.status != crate::modules::auth::domain::AccountStatus::Active {
+                return Err(AuthError::InvalidCredentials);
+            }
+
+            let _ = v2.opaque_credentials.mark_verified(&account.id, now).await;
+            let mfa_enabled = self
+                .mfa_factors
+                .find_by_user_id(&account.id)
+                .await
+                .map(|factor| factor.enabled_at.is_some())
+                .unwrap_or(false);
+            let forced_step_up_reason = self
+                .evaluate_login_risk_policy(&account.email, &account.id, mfa_enabled, &ctx, now)
+                .await?;
+
+            self.login_abuse
+                .register_success(&account.email, ctx.ip.as_deref())
+                .await;
+
+            if mfa_enabled {
+                let message = if forced_step_up_reason.is_some() {
+                    "Additional verification required"
+                } else {
+                    "Multi-factor authentication required"
+                };
+                return self
+                    .issue_mfa_challenge(
+                        &account.id,
+                        cmd.device_info,
+                        &ctx,
+                        now,
+                        message,
+                        forced_step_up_reason.as_deref(),
+                    )
+                    .await;
+            }
+
+            let (tokens, principal) = self
+                .issue_session_tokens(
                     &account.id,
-                    cmd.device_info,
+                    finish.session_device_info.or(cmd.device_info),
                     &ctx,
                     now,
-                    message,
-                    forced_step_up_reason.as_deref(),
                 )
+                .await?;
+
+            self.audit
+                .append(AuditEvent {
+                    event_type: "auth.v2.password.login.success".to_string(),
+                    actor_user_id: Some(account.id),
+                    trace_id: ctx.trace_id,
+                    metadata: json!({
+                        "session_id": principal.session_id,
+                        "rollout_channel": rollout.rollout_channel,
+                        "fallback_policy": rollout.fallback_policy.as_str(),
+                        "ip": ctx.ip,
+                        "user_agent": ctx.user_agent,
+                    }),
+                    created_at: now,
+                })
                 .await;
+
+            Ok(LoginResult::Authenticated { tokens, principal })
         }
-
-        let (tokens, principal) = self
-            .issue_session_tokens(
-                &account.id,
-                finish.session_device_info.or(cmd.device_info),
-                &ctx,
-                now,
-            )
-            .await?;
-
-        self.audit
-            .append(AuditEvent {
-                event_type: "auth.v2.password.login.success".to_string(),
-                actor_user_id: Some(account.id),
-                trace_id: ctx.trace_id,
-                metadata: json!({"session_id": principal.session_id, "ip": ctx.ip, "user_agent": ctx.user_agent}),
-                created_at: now,
-            })
-            .await;
-
-        Ok(LoginResult::Authenticated { tokens, principal })
+        .await;
+        crate::observability::record_auth_v2_password_request(
+            "login_finish",
+            auth_v2_request_outcome(&result),
+            &metrics_channel,
+        );
+        result
     }
 
     pub async fn start_password_upgrade_v2(
@@ -1999,96 +2077,115 @@ impl AuthService {
             return Err(AuthError::Internal);
         }
 
-        let now = Utc::now();
-        let account = v2
-            .accounts
-            .find_by_id(&cmd.user_id)
-            .await
-            .ok_or(AuthError::InvalidToken)?;
-        if account.status != crate::modules::auth::domain::AccountStatus::Active {
-            return Err(AuthError::AccountNotActive);
-        }
+        let mut metrics_channel = auth_v2_rollout_channel_hint(ctx.client_id.as_deref());
+        let result = async {
+            let now = Utc::now();
+            let account = v2
+                .accounts
+                .find_by_id(&cmd.user_id)
+                .await
+                .ok_or(AuthError::InvalidToken)?;
+            if account.status != crate::modules::auth::domain::AccountStatus::Active {
+                return Err(AuthError::AccountNotActive);
+            }
 
-        let legacy = v2
-            .legacy_passwords
-            .find_by_user_id(&account.id)
-            .await
-            .map_err(|_| AuthError::Internal)?
-            .ok_or(AuthError::InvalidRequest)?;
-        let existing_opaque = v2
-            .opaque_credentials
-            .find_by_user_id(&account.id)
-            .await
-            .map_err(|_| AuthError::Internal)?;
-        if existing_opaque.as_ref().is_some_and(|record| {
-            record.state == crate::modules::auth::domain::OpaqueCredentialState::Active
-        }) {
-            return Err(AuthError::OpaqueCredentialAlreadyActive);
-        }
+            let legacy = v2
+                .legacy_passwords
+                .find_by_user_id(&account.id)
+                .await
+                .map_err(|_| AuthError::Internal)?
+                .ok_or(AuthError::InvalidRequest)?;
+            let existing_opaque = v2
+                .opaque_credentials
+                .find_by_user_id(&account.id)
+                .await
+                .map_err(|_| AuthError::Internal)?;
+            if existing_opaque.as_ref().is_some_and(|record| {
+                record.state == crate::modules::auth::domain::OpaqueCredentialState::Active
+            }) {
+                return Err(AuthError::OpaqueCredentialAlreadyActive);
+            }
+            let rollout =
+                evaluate_auth_v2_rollout(&v2.config, ctx.client_id.as_deref(), Some(&legacy));
+            metrics_channel = rollout.rollout_channel.clone();
+            if !auth_v2_allows_external_access(&v2.config, &rollout) {
+                return Err(AuthError::AuthV2RolloutDenied);
+            }
 
-        let flow_id = Uuid::new_v4().to_string();
-        let result = v2
-            .pake_service
-            .start_registration(crate::modules::auth::ports::PakeRegistrationStartRequest {
-                flow_id: flow_id.clone(),
-                user_id: account.id.clone(),
-                request: cmd.request,
-            })
-            .await
-            .map_err(|err| {
-                if err.contains("unavailable") {
-                    AuthError::PakeUnavailable
-                } else {
-                    AuthError::InvalidRequest
-                }
-            })?;
+            let flow_id = Uuid::new_v4().to_string();
+            let result = v2
+                .pake_service
+                .start_registration(crate::modules::auth::ports::PakeRegistrationStartRequest {
+                    flow_id: flow_id.clone(),
+                    user_id: account.id.clone(),
+                    request: cmd.request,
+                })
+                .await
+                .map_err(|err| {
+                    if err.contains("unavailable") {
+                        AuthError::PakeUnavailable
+                    } else {
+                        AuthError::InvalidRequest
+                    }
+                })?;
 
-        v2.auth_flows
-            .issue(AuthFlowRecord {
-                flow_id: flow_id.clone(),
-                subject_user_id: Some(account.id.clone()),
-                subject_identifier_hash: Some(
-                    self.refresh_crypto.hash_refresh_token(&account.email).await,
-                ),
-                flow_kind: crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade,
+            v2.auth_flows
+                .issue(AuthFlowRecord {
+                    flow_id: flow_id.clone(),
+                    subject_user_id: Some(account.id.clone()),
+                    subject_identifier_hash: Some(
+                        self.refresh_crypto.hash_refresh_token(&account.email).await,
+                    ),
+                    flow_kind: crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade,
+                    protocol: "opaque_v1".to_string(),
+                    state: json!({
+                        "server_state": result.server_state,
+                        "legacy_login_allowed": legacy.legacy_login_allowed,
+                    }),
+                    status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                    rollout_channel: Some(rollout.rollout_channel.clone()),
+                    fallback_policy: Some(rollout.fallback_policy.as_str().to_string()),
+                    trace_id: Some(ctx.trace_id.clone()),
+                    issued_ip: ctx.ip.clone(),
+                    issued_user_agent: ctx.user_agent.clone(),
+                    attempt_count: 0,
+                    expires_at: now + Duration::seconds(self.mfa_challenge_ttl_seconds),
+                    consumed_at: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .map_err(|_| AuthError::Internal)?;
+
+            self.audit
+                .append(AuditEvent {
+                    event_type: "auth.v2.password.upgrade.started".to_string(),
+                    actor_user_id: Some(account.id),
+                    trace_id: ctx.trace_id,
+                    metadata: json!({
+                        "rollout_channel": rollout.rollout_channel,
+                        "fallback_policy": rollout.fallback_policy.as_str(),
+                        "ip": ctx.ip,
+                        "user_agent": ctx.user_agent,
+                    }),
+                    created_at: now,
+                })
+                .await;
+
+            Ok(PasswordUpgradeStartResponse {
+                flow_id,
                 protocol: "opaque_v1".to_string(),
-                state: json!({
-                    "server_state": result.server_state,
-                    "legacy_login_allowed": legacy.legacy_login_allowed,
-                }),
-                status: crate::modules::auth::domain::AuthFlowStatus::Pending,
-                rollout_channel: Some(auth_v2_rollout_channel(&v2.config, &ctx)),
-                fallback_policy: Some(
-                    auth_v2_fallback_policy(&v2.config, Some(&legacy)).to_string(),
-                ),
-                trace_id: Some(ctx.trace_id.clone()),
-                issued_ip: ctx.ip.clone(),
-                issued_user_agent: ctx.user_agent.clone(),
-                attempt_count: 0,
-                expires_at: now + Duration::seconds(self.mfa_challenge_ttl_seconds),
-                consumed_at: None,
-                created_at: now,
-                updated_at: now,
+                server_message: result.response,
+                expires_in: self.mfa_challenge_ttl_seconds,
             })
-            .await
-            .map_err(|_| AuthError::Internal)?;
-
-        self.audit
-            .append(AuditEvent {
-                event_type: "auth.v2.password.upgrade.started".to_string(),
-                actor_user_id: Some(account.id),
-                trace_id: ctx.trace_id,
-                metadata: json!({"ip": ctx.ip, "user_agent": ctx.user_agent}),
-                created_at: now,
-            })
-            .await;
-
-        Ok(PasswordUpgradeStartResponse {
-            flow_id,
-            protocol: "opaque_v1".to_string(),
-            server_message: result.response,
-            expires_in: self.mfa_challenge_ttl_seconds,
-        })
+        }
+        .await;
+        crate::observability::record_auth_v2_password_request(
+            "upgrade_start",
+            auth_v2_request_outcome(&result),
+            &metrics_channel,
+        );
+        result
     }
 
     pub async fn finish_password_upgrade_v2(
@@ -2104,94 +2201,111 @@ impl AuthService {
             return Err(AuthError::Internal);
         }
 
-        let now = Utc::now();
-        let flow_state = v2
-            .auth_flows
-            .consume(&cmd.flow_id, now)
-            .await
-            .map_err(|_| AuthError::Internal)?;
-        let flow = match flow_state {
-            crate::modules::auth::ports::AuthFlowConsumeState::Active(flow)
-                if matches!(
-                    flow.flow_kind,
-                    crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade
-                ) =>
-            {
-                *flow
-            }
-            _ => return Err(AuthError::InvalidToken),
-        };
-
-        let user_id = flow.subject_user_id.ok_or(AuthError::InvalidToken)?;
-        let legacy = v2
-            .legacy_passwords
-            .find_by_user_id(&user_id)
-            .await
-            .map_err(|_| AuthError::Internal)?
-            .ok_or(AuthError::InvalidToken)?;
-        let server_state = flow
-            .state
-            .get("server_state")
-            .cloned()
-            .ok_or(AuthError::InvalidToken)?;
-        let registration = v2
-            .pake_service
-            .finish_registration(server_state, cmd.client_message)
-            .await
-            .map_err(|err| {
-                if err.contains("unavailable") {
-                    AuthError::PakeUnavailable
-                } else {
-                    AuthError::InvalidOpaqueRegistration
+        let mut metrics_channel = "unknown".to_string();
+        let result = async {
+            let now = Utc::now();
+            let flow_state = v2
+                .auth_flows
+                .consume(&cmd.flow_id, now)
+                .await
+                .map_err(|_| AuthError::Internal)?;
+            let flow = match flow_state {
+                crate::modules::auth::ports::AuthFlowConsumeState::Active(flow)
+                    if matches!(
+                        flow.flow_kind,
+                        crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade
+                    ) =>
+                {
+                    *flow
                 }
-            })?;
-        let existing_opaque = v2
-            .opaque_credentials
-            .find_by_user_id(&user_id)
-            .await
-            .map_err(|_| AuthError::Internal)?;
+                _ => return Err(AuthError::InvalidToken),
+            };
+            let rollout = auth_v2_rollout_from_flow(&v2.config, &flow, None);
+            metrics_channel = rollout.rollout_channel.clone();
 
-        v2.opaque_credentials
-            .upsert_for_user(OpaqueCredentialRecord {
-                user_id: user_id.clone(),
-                protocol: "opaque_v1".to_string(),
-                credential_blob: registration.credential_blob,
-                server_key_ref: registration.server_key_ref,
-                envelope_kms_key_id: registration.envelope_kms_key_id,
-                state: crate::modules::auth::domain::OpaqueCredentialState::Active,
-                migrated_from_legacy_at: Some(now),
-                last_verified_at: Some(now),
-                created_at: existing_opaque
-                    .map(|record| record.created_at)
-                    .unwrap_or(now),
-                updated_at: now,
-            })
-            .await
-            .map_err(|_| AuthError::Internal)?;
-        let _ = v2.legacy_passwords.mark_verified(&user_id, now).await;
+            let user_id = flow.subject_user_id.ok_or(AuthError::InvalidToken)?;
+            let legacy = v2
+                .legacy_passwords
+                .find_by_user_id(&user_id)
+                .await
+                .map_err(|_| AuthError::Internal)?
+                .ok_or(AuthError::InvalidToken)?;
+            let server_state = flow
+                .state
+                .get("server_state")
+                .cloned()
+                .ok_or(AuthError::InvalidToken)?;
+            let registration = v2
+                .pake_service
+                .finish_registration(server_state, cmd.client_message)
+                .await
+                .map_err(|err| {
+                    if err.contains("unavailable") {
+                        AuthError::PakeUnavailable
+                    } else {
+                        AuthError::InvalidOpaqueRegistration
+                    }
+                })?;
+            let existing_opaque = v2
+                .opaque_credentials
+                .find_by_user_id(&user_id)
+                .await
+                .map_err(|_| AuthError::Internal)?;
 
-        self.audit
-            .append(AuditEvent {
-                event_type: "auth.v2.password.upgrade.completed".to_string(),
-                actor_user_id: Some(user_id),
-                trace_id: ctx.trace_id,
-                metadata: json!({"ip": ctx.ip, "user_agent": ctx.user_agent}),
-                created_at: now,
-            })
-            .await;
+            v2.opaque_credentials
+                .upsert_for_user(OpaqueCredentialRecord {
+                    user_id: user_id.clone(),
+                    protocol: "opaque_v1".to_string(),
+                    credential_blob: registration.credential_blob,
+                    server_key_ref: registration.server_key_ref,
+                    envelope_kms_key_id: registration.envelope_kms_key_id,
+                    state: crate::modules::auth::domain::OpaqueCredentialState::Active,
+                    migrated_from_legacy_at: Some(now),
+                    last_verified_at: Some(now),
+                    created_at: existing_opaque
+                        .map(|record| record.created_at)
+                        .unwrap_or(now),
+                    updated_at: now,
+                })
+                .await
+                .map_err(|_| AuthError::Internal)?;
+            let _ = v2.legacy_passwords.mark_verified(&user_id, now).await;
 
-        Ok(PasswordUpgradeFinishResponse {
-            upgraded: true,
-            opaque_version: "opaque_v1".to_string(),
-            legacy_password: LegacyPasswordUpgradeStatus {
-                login_allowed: legacy.legacy_login_allowed,
-                deprecation_window: if legacy.legacy_login_allowed {
-                    "temporary".to_string()
-                } else {
-                    "disabled".to_string()
+            self.audit
+                .append(AuditEvent {
+                    event_type: "auth.v2.password.upgrade.completed".to_string(),
+                    actor_user_id: Some(user_id),
+                    trace_id: ctx.trace_id,
+                    metadata: json!({
+                        "rollout_channel": rollout.rollout_channel,
+                        "fallback_policy": rollout.fallback_policy.as_str(),
+                        "ip": ctx.ip,
+                        "user_agent": ctx.user_agent,
+                    }),
+                    created_at: now,
+                })
+                .await;
+
+            Ok(PasswordUpgradeFinishResponse {
+                upgraded: true,
+                opaque_version: "opaque_v1".to_string(),
+                legacy_password: LegacyPasswordUpgradeStatus {
+                    login_allowed: legacy.legacy_login_allowed,
+                    deprecation_window: if legacy.legacy_login_allowed {
+                        "temporary".to_string()
+                    } else {
+                        "disabled".to_string()
+                    },
                 },
-            },
-        })
+            })
+        }
+        .await;
+        crate::observability::record_auth_v2_password_request(
+            "upgrade_finish",
+            auth_v2_request_outcome(&result),
+            &metrics_channel,
+        );
+        result
     }
 
     async fn issue_mfa_challenge(
@@ -3423,38 +3537,98 @@ fn auth_method_kind_label(kind: &crate::modules::auth::ports::AuthMethodKind) ->
     }
 }
 
-fn allow_legacy_fallback(config: &AuthV2Config, legacy: Option<&LegacyPasswordRecord>) -> bool {
-    let Some(legacy) = legacy else {
-        return false;
+pub(crate) fn evaluate_auth_v2_rollout(
+    config: &AuthV2Config,
+    client_id: Option<&str>,
+    legacy: Option<&LegacyPasswordRecord>,
+) -> AuthV2RolloutDecision {
+    let normalized_client_id = AuthV2Config::normalized_client_id(client_id);
+    let client_allowed = config.client_is_allowlisted(client_id);
+    let rollout_channel = if config.shadow_audit_only {
+        "shadow".to_string()
+    } else {
+        normalized_client_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
     };
-    if !legacy.legacy_login_allowed {
-        return false;
-    }
-    match config.legacy_fallback_mode {
-        AuthV2LegacyFallbackMode::Disabled => false,
-        AuthV2LegacyFallbackMode::Allowlisted | AuthV2LegacyFallbackMode::Broad => true,
+
+    let fallback_policy = match (config.legacy_fallback_mode, legacy) {
+        (_, None) => AuthV2FallbackPolicy::Disabled,
+        (_, Some(legacy)) if !legacy.legacy_login_allowed => AuthV2FallbackPolicy::Disabled,
+        (AuthV2LegacyFallbackMode::Disabled, _) => AuthV2FallbackPolicy::Disabled,
+        (AuthV2LegacyFallbackMode::Broad, Some(_)) => AuthV2FallbackPolicy::Eligible,
+        (AuthV2LegacyFallbackMode::Allowlisted, Some(_)) if client_allowed => {
+            AuthV2FallbackPolicy::Eligible
+        }
+        (AuthV2LegacyFallbackMode::Allowlisted, Some(_)) => AuthV2FallbackPolicy::Disabled,
+    };
+
+    AuthV2RolloutDecision {
+        rollout_channel,
+        client_allowed,
+        fallback_policy,
     }
 }
 
-fn auth_v2_fallback_policy(
+pub(crate) fn auth_v2_allows_external_access(
+    config: &AuthV2Config,
+    rollout: &AuthV2RolloutDecision,
+) -> bool {
+    !config.shadow_audit_only && rollout.client_allowed
+}
+
+fn auth_v2_request_outcome<T>(result: &Result<T, AuthError>) -> &'static str {
+    if result.is_ok() {
+        "success"
+    } else {
+        "error"
+    }
+}
+
+fn auth_v2_rollout_channel_hint(client_id: Option<&str>) -> String {
+    AuthV2Config::normalized_client_id(client_id).unwrap_or_else(|| "unknown".to_string())
+}
+
+fn auth_v2_fallback_reason(
     config: &AuthV2Config,
     legacy: Option<&LegacyPasswordRecord>,
+    rollout: &AuthV2RolloutDecision,
 ) -> &'static str {
-    if allow_legacy_fallback(config, legacy) {
-        "eligible"
-    } else {
-        "disabled"
+    match legacy {
+        None => "no_legacy_password",
+        Some(legacy) if !legacy.legacy_login_allowed => "legacy_login_disabled",
+        Some(_) => match config.legacy_fallback_mode {
+            AuthV2LegacyFallbackMode::Disabled => "policy_disabled",
+            AuthV2LegacyFallbackMode::Broad => "broad",
+            AuthV2LegacyFallbackMode::Allowlisted if rollout.client_allowed => "allowlisted",
+            AuthV2LegacyFallbackMode::Allowlisted => "client_not_allowlisted",
+        },
     }
 }
 
-fn auth_v2_rollout_channel(config: &AuthV2Config, ctx: &RequestContext) -> String {
-    if config.shadow_audit_only {
-        return "shadow".to_string();
+fn auth_v2_rollout_from_flow(
+    config: &AuthV2Config,
+    flow: &AuthFlowRecord,
+    legacy: Option<&LegacyPasswordRecord>,
+) -> AuthV2RolloutDecision {
+    let fallback_policy = match flow.fallback_policy.as_deref() {
+        Some("eligible") => AuthV2FallbackPolicy::Eligible,
+        Some("disabled") => AuthV2FallbackPolicy::Disabled,
+        _ => {
+            evaluate_auth_v2_rollout(config, flow.rollout_channel.as_deref(), legacy)
+                .fallback_policy
+        }
+    };
+    let rollout_channel = flow
+        .rollout_channel
+        .clone()
+        .unwrap_or_else(|| evaluate_auth_v2_rollout(config, None, legacy).rollout_channel);
+
+    AuthV2RolloutDecision {
+        client_allowed: config.client_is_allowlisted(Some(&rollout_channel)),
+        rollout_channel,
+        fallback_policy,
     }
-    if ctx.user_agent.as_deref().unwrap_or_default().is_empty() {
-        return "direct".to_string();
-    }
-    "interactive".to_string()
 }
 
 #[cfg(test)]
@@ -3463,7 +3637,7 @@ mod tests {
 
     use async_trait::async_trait;
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, Duration, Utc};
     use rand::{rngs::OsRng, RngCore};
     use serde_json::json;
     use uuid::Uuid;
@@ -3498,11 +3672,12 @@ mod tests {
     };
 
     use super::{
-        AuthApiSurface, AuthError, AuthMethodsCommand, AuthService, AuthV2Dependencies,
-        LoginCommand, LoginResult, MfaActivateCommand, MfaVerifyCommand, PakeLoginFinishCommand,
-        PakeLoginStartCommand, Passkey, PasswordChangeCommand, PasswordForgotCommand,
-        PasswordResetCommand, PasswordUpgradeFinishCommand, PasswordUpgradeStartCommand,
-        PublicKeyCredential, RefreshCommand, RegisterPublicKeyCredential, RequestContext,
+        evaluate_auth_v2_rollout, AuthApiSurface, AuthError, AuthMethodsCommand, AuthService,
+        AuthV2Dependencies, LoginCommand, LoginResult, MfaActivateCommand, MfaVerifyCommand,
+        PakeLoginFinishCommand, PakeLoginStartCommand, Passkey, PasswordChangeCommand,
+        PasswordForgotCommand, PasswordResetCommand, PasswordUpgradeFinishCommand,
+        PasswordUpgradeStartCommand, PublicKeyCredential, RefreshCommand,
+        RegisterPublicKeyCredential, RequestContext,
     };
 
     const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIMn3Wcxxd4JzzjbshVFXz8jSGuF9ErqngPTzYhbfm6hd\n-----END PRIVATE KEY-----\n";
@@ -3766,6 +3941,10 @@ mod tests {
             Self {
                 flows: Mutex::new(std::collections::HashMap::new()),
             }
+        }
+
+        fn peek(&self, flow_id: &str) -> Option<AuthFlowRecord> {
+            self.flows.lock().ok()?.get(flow_id).cloned()
         }
     }
 
@@ -4822,6 +5001,7 @@ mod tests {
                     trace_id: "login-risk-challenge-no-mfa".to_string(),
                     ip: Some("198.51.100.10".to_string()),
                     user_agent: Some("unit-test".to_string()),
+                    client_id: None,
                     auth_api_surface: AuthApiSurface::V1,
                 },
             )
@@ -4869,6 +5049,7 @@ mod tests {
                     trace_id: "login-risk-challenge-mfa".to_string(),
                     ip: Some("198.51.100.10".to_string()),
                     user_agent: Some("unit-test".to_string()),
+                    client_id: None,
                     auth_api_surface: AuthApiSurface::V1,
                 },
             )
@@ -5976,6 +6157,218 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discover_auth_methods_v2_persists_normalized_allowlisted_channel() {
+        let harness = build_harness();
+        let auth_flows = Arc::new(StaticAuthFlowRepository::new());
+        let service = harness.service.clone().with_v2(AuthV2Dependencies {
+            config: AuthV2Config {
+                enabled: true,
+                methods_enabled: true,
+                password_pake_enabled: true,
+                password_upgrade_enabled: false,
+                pake_provider: crate::config::AuthV2PakeProvider::Unavailable,
+                opaque_server_setup: None,
+                opaque_server_key_ref: None,
+                passkey_namespace_enabled: true,
+                auth_flows_enabled: true,
+                legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
+                client_allowlist: vec!["web".to_string()],
+                shadow_audit_only: false,
+            },
+            accounts: Arc::new(StaticAccountRepository::new(vec![AccountRecord {
+                id: "account-1".to_string(),
+                email: harness.bootstrap_email.clone(),
+                status: AccountStatus::Active,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }])),
+            legacy_passwords: Arc::new(StaticLegacyPasswordRepository::new(vec![])),
+            opaque_credentials: Arc::new(StaticOpaqueCredentialRepository::new(vec![])),
+            auth_flows: auth_flows.clone(),
+            pake_service: Arc::new(DeterministicPakeService),
+        });
+
+        let response = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some(" Web ".to_string()),
+                    supports_passkeys: true,
+                    supports_pake: true,
+                },
+                test_context("v2-methods-allowlisted"),
+            )
+            .await
+            .expect("v2 methods should succeed");
+
+        let stored_flow = auth_flows
+            .peek(&response.discovery_token)
+            .expect("discovery flow should be stored");
+
+        assert_eq!(stored_flow.rollout_channel.as_deref(), Some("web"));
+        assert_eq!(stored_flow.fallback_policy.as_deref(), Some("disabled"));
+    }
+
+    #[tokio::test]
+    async fn discover_auth_methods_v2_audit_includes_rollout_metadata() {
+        let harness = build_harness();
+        let service = harness
+            .service
+            .clone()
+            .with_v2(build_v2_dependencies(&harness).await);
+
+        service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: true,
+                    supports_pake: true,
+                },
+                test_context("v2-methods-audit"),
+            )
+            .await
+            .expect("v2 methods should succeed");
+
+        let audit_events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit storage should be available");
+        let event = audit_events
+            .iter()
+            .find(|event| event.event_type == "auth.v2.methods.requested")
+            .expect("methods audit should be recorded");
+
+        assert_eq!(
+            event
+                .metadata
+                .get("rollout_channel")
+                .and_then(|value| value.as_str()),
+            Some("web")
+        );
+        assert_eq!(
+            event
+                .metadata
+                .get("fallback_policy")
+                .and_then(|value| value.as_str()),
+            Some("eligible")
+        );
+    }
+
+    fn rollout_test_config(legacy_fallback_mode: AuthV2LegacyFallbackMode) -> AuthV2Config {
+        AuthV2Config {
+            enabled: true,
+            methods_enabled: true,
+            password_pake_enabled: true,
+            password_upgrade_enabled: true,
+            pake_provider: crate::config::AuthV2PakeProvider::Unavailable,
+            opaque_server_setup: None,
+            opaque_server_key_ref: None,
+            passkey_namespace_enabled: true,
+            auth_flows_enabled: true,
+            legacy_fallback_mode,
+            client_allowlist: vec!["web".to_string()],
+            shadow_audit_only: false,
+        }
+    }
+
+    fn eligible_legacy_password() -> LegacyPasswordRecord {
+        LegacyPasswordRecord {
+            user_id: "account-1".to_string(),
+            password_hash: "legacy-hash".to_string(),
+            legacy_login_allowed: true,
+            migrated_to_opaque_at: None,
+            last_legacy_verified_at: None,
+            legacy_deprecation_at: None,
+        }
+    }
+
+    #[test]
+    fn evaluate_auth_v2_rollout_matches_legacy_fallback_matrix_for_eligible_passwords() {
+        let legacy = eligible_legacy_password();
+        let cases = [
+            (
+                rollout_test_config(AuthV2LegacyFallbackMode::Disabled),
+                Some("web"),
+                "web",
+                true,
+                "disabled",
+            ),
+            (
+                rollout_test_config(AuthV2LegacyFallbackMode::Allowlisted),
+                Some("web"),
+                "web",
+                true,
+                "eligible",
+            ),
+            (
+                rollout_test_config(AuthV2LegacyFallbackMode::Allowlisted),
+                Some("android"),
+                "android",
+                false,
+                "disabled",
+            ),
+            (
+                rollout_test_config(AuthV2LegacyFallbackMode::Broad),
+                Some("android"),
+                "android",
+                false,
+                "eligible",
+            ),
+        ];
+
+        for (config, client_id, expected_channel, expected_client_allowed, expected_policy) in cases
+        {
+            let decision = evaluate_auth_v2_rollout(&config, client_id, Some(&legacy));
+
+            assert_eq!(decision.rollout_channel, expected_channel);
+            assert_eq!(decision.client_allowed, expected_client_allowed);
+            assert_eq!(decision.fallback_policy.as_str(), expected_policy);
+        }
+    }
+
+    #[test]
+    fn evaluate_auth_v2_rollout_disables_fallback_without_legacy_credentials() {
+        let decision = evaluate_auth_v2_rollout(
+            &rollout_test_config(AuthV2LegacyFallbackMode::Broad),
+            Some("web"),
+            None,
+        );
+
+        assert_eq!(decision.rollout_channel, "web");
+        assert!(decision.client_allowed);
+        assert_eq!(decision.fallback_policy.as_str(), "disabled");
+    }
+
+    #[test]
+    fn evaluate_auth_v2_rollout_disables_fallback_when_legacy_login_is_blocked() {
+        let mut legacy = eligible_legacy_password();
+        legacy.legacy_login_allowed = false;
+
+        let decision = evaluate_auth_v2_rollout(
+            &rollout_test_config(AuthV2LegacyFallbackMode::Broad),
+            Some("web"),
+            Some(&legacy),
+        );
+
+        assert_eq!(decision.rollout_channel, "web");
+        assert!(decision.client_allowed);
+        assert_eq!(decision.fallback_policy.as_str(), "disabled");
+    }
+
+    #[test]
+    fn evaluate_auth_v2_rollout_is_fail_closed_for_non_allowlisted_clients() {
+        let config = rollout_test_config(AuthV2LegacyFallbackMode::Allowlisted);
+
+        let decision = evaluate_auth_v2_rollout(&config, Some("android"), None);
+
+        assert_eq!(decision.rollout_channel, "android");
+        assert!(!decision.client_allowed);
+        assert_eq!(decision.fallback_policy.as_str(), "disabled");
+    }
+
+    #[tokio::test]
     async fn start_and_finish_password_login_v2_reuses_session_issuance() {
         let harness = build_harness();
         let service = harness
@@ -6022,6 +6415,31 @@ mod tests {
         let (tokens, _principal) = assert_authenticated(result);
         assert!(!tokens.access_token.is_empty());
         assert!(!tokens.refresh_token.is_empty());
+
+        let audit_events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit storage should be available");
+        let event = audit_events
+            .iter()
+            .find(|event| event.event_type == "auth.v2.password.login.success")
+            .expect("password login success audit should be recorded");
+
+        assert_eq!(
+            event
+                .metadata
+                .get("rollout_channel")
+                .and_then(|value| value.as_str()),
+            Some("web")
+        );
+        assert_eq!(
+            event
+                .metadata
+                .get("fallback_policy")
+                .and_then(|value| value.as_str()),
+            Some("eligible")
+        );
     }
 
     #[tokio::test]
@@ -6036,7 +6454,7 @@ mod tests {
             .discover_auth_methods_v2(
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
-                    client_id: None,
+                    client_id: Some("web".to_string()),
                     supports_passkeys: false,
                     supports_pake: true,
                 },
@@ -6101,7 +6519,10 @@ mod tests {
                     user_id: user.id.clone(),
                     request: json!({"platform": "web", "supports_pake": true}),
                 },
-                test_context("v2-upgrade-start"),
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-upgrade-start")
+                },
             )
             .await
             .expect("upgrade start should succeed");
@@ -6122,6 +6543,49 @@ mod tests {
         assert!(finish.upgraded);
         assert_eq!(finish.opaque_version, "opaque_v1");
         assert!(finish.legacy_password.login_allowed);
+
+        let audit_events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit storage should be available");
+        let started = audit_events
+            .iter()
+            .find(|event| event.event_type == "auth.v2.password.upgrade.started")
+            .expect("password upgrade start audit should be recorded");
+        let completed = audit_events
+            .iter()
+            .find(|event| event.event_type == "auth.v2.password.upgrade.completed")
+            .expect("password upgrade completion audit should be recorded");
+
+        assert_eq!(
+            started
+                .metadata
+                .get("rollout_channel")
+                .and_then(|value| value.as_str()),
+            Some("web")
+        );
+        assert_eq!(
+            started
+                .metadata
+                .get("fallback_policy")
+                .and_then(|value| value.as_str()),
+            Some("eligible")
+        );
+        assert_eq!(
+            completed
+                .metadata
+                .get("rollout_channel")
+                .and_then(|value| value.as_str()),
+            Some("web")
+        );
+        assert_eq!(
+            completed
+                .metadata
+                .get("fallback_policy")
+                .and_then(|value| value.as_str()),
+            Some("eligible")
+        );
     }
 
     #[tokio::test]
@@ -6143,7 +6607,10 @@ mod tests {
                     user_id: user.id,
                     request: json!({"platform": "web", "supports_pake": true}),
                 },
-                test_context("v2-upgrade-conflict"),
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-upgrade-conflict")
+                },
             )
             .await;
 
@@ -6151,6 +6618,188 @@ mod tests {
             result,
             Err(AuthError::OpaqueCredentialAlreadyActive)
         ));
+    }
+
+    #[tokio::test]
+    async fn start_password_login_v2_inherits_rollout_decision_from_discovery_flow() {
+        let harness = build_harness();
+        let auth_flows = Arc::new(StaticAuthFlowRepository::new());
+        let now = Utc::now();
+        let service = harness.service.clone().with_v2(AuthV2Dependencies {
+            config: AuthV2Config {
+                enabled: true,
+                methods_enabled: true,
+                password_pake_enabled: true,
+                password_upgrade_enabled: false,
+                pake_provider: crate::config::AuthV2PakeProvider::Unavailable,
+                opaque_server_setup: None,
+                opaque_server_key_ref: None,
+                passkey_namespace_enabled: true,
+                auth_flows_enabled: true,
+                legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
+                client_allowlist: vec!["web".to_string()],
+                shadow_audit_only: false,
+            },
+            accounts: Arc::new(StaticAccountRepository::new(vec![AccountRecord {
+                id: "account-1".to_string(),
+                email: harness.bootstrap_email.clone(),
+                status: AccountStatus::Active,
+                created_at: now,
+                updated_at: now,
+            }])),
+            legacy_passwords: Arc::new(StaticLegacyPasswordRepository::new(vec![
+                LegacyPasswordRecord {
+                    user_id: "account-1".to_string(),
+                    password_hash: "legacy-hash".to_string(),
+                    legacy_login_allowed: true,
+                    migrated_to_opaque_at: None,
+                    last_legacy_verified_at: None,
+                    legacy_deprecation_at: None,
+                },
+            ])),
+            opaque_credentials: Arc::new(StaticOpaqueCredentialRepository::new(vec![])),
+            auth_flows: auth_flows.clone(),
+            pake_service: Arc::new(DeterministicPakeService),
+        });
+
+        auth_flows
+            .issue(AuthFlowRecord {
+                flow_id: "discovery-rollout".to_string(),
+                subject_user_id: Some("account-1".to_string()),
+                subject_identifier_hash: Some("identifier-hash".to_string()),
+                flow_kind: crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery,
+                protocol: "auth_v2_methods_v1".to_string(),
+                state: json!({
+                    "identifier": harness.bootstrap_email.to_ascii_lowercase(),
+                    "client_id": "android",
+                    "supports_pake": true,
+                    "supports_passkeys": false,
+                }),
+                status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                rollout_channel: Some("web".to_string()),
+                fallback_policy: Some("eligible".to_string()),
+                trace_id: Some("trace-discovery-rollout".to_string()),
+                issued_ip: Some("127.0.0.1".to_string()),
+                issued_user_agent: Some("unit-test".to_string()),
+                attempt_count: 0,
+                expires_at: now + Duration::seconds(300),
+                consumed_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("manual discovery flow should be stored");
+
+        let start = service
+            .start_password_login_v2(
+                PakeLoginStartCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    discovery_token: "discovery-rollout".to_string(),
+                    request: json!({"opaque_message": "client-hello"}),
+                },
+                test_context("v2-start-inherit-rollout"),
+            )
+            .await
+            .expect("password login start should inherit stored rollout decision");
+
+        let flow = auth_flows
+            .peek(&start.flow_id)
+            .expect("password login flow should be stored");
+        assert_eq!(flow.rollout_channel.as_deref(), Some("web"));
+        assert_eq!(flow.fallback_policy.as_deref(), Some("eligible"));
+        assert_eq!(
+            flow.state.get("legacy_fallback_allowed"),
+            Some(&json!(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn password_login_v2_preserves_rollout_metadata_across_resumed_flow() {
+        let harness = build_harness();
+        let auth_flows = Arc::new(StaticAuthFlowRepository::new());
+        let mut dependencies = build_v2_dependencies(&harness).await;
+        dependencies.auth_flows = auth_flows.clone();
+        let service = harness.service.clone().with_v2(dependencies);
+
+        let discovery = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: false,
+                    supports_pake: true,
+                },
+                test_context("v2-resume-discovery"),
+            )
+            .await
+            .expect("v2 discovery should succeed");
+
+        let discovery_flow = auth_flows
+            .peek(&discovery.discovery_token)
+            .expect("discovery flow should be stored");
+        assert_eq!(discovery_flow.rollout_channel.as_deref(), Some("web"));
+        assert_eq!(discovery_flow.fallback_policy.as_deref(), Some("eligible"));
+
+        let start = service
+            .start_password_login_v2(
+                PakeLoginStartCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    discovery_token: discovery.discovery_token,
+                    request: json!({"opaque_message": "client-hello"}),
+                },
+                test_context("v2-resume-start"),
+            )
+            .await
+            .expect("v2 password login start should succeed");
+
+        let password_flow = auth_flows
+            .peek(&start.flow_id)
+            .expect("password login flow should be stored");
+        assert_eq!(password_flow.rollout_channel.as_deref(), Some("web"));
+        assert_eq!(password_flow.fallback_policy.as_deref(), Some("eligible"));
+        assert_eq!(
+            password_flow.state.get("legacy_fallback_allowed"),
+            Some(&json!(true))
+        );
+
+        let result = service
+            .finish_password_login_v2(
+                PakeLoginFinishCommand {
+                    flow_id: start.flow_id.clone(),
+                    client_message: json!({"opaque_message": format!("ok:{}", start.flow_id)}),
+                    device_info: Some("Firefox on Linux".to_string()),
+                },
+                test_context("v2-resume-finish"),
+            )
+            .await
+            .expect("v2 password login finish should succeed");
+
+        let (_tokens, _principal) = assert_authenticated(result);
+
+        let audit_events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit storage should be available");
+        let event = audit_events
+            .iter()
+            .find(|event| event.event_type == "auth.v2.password.login.success")
+            .expect("password login success audit should be recorded");
+
+        assert_eq!(
+            event
+                .metadata
+                .get("rollout_channel")
+                .and_then(|value| value.as_str()),
+            Some("web")
+        );
+        assert_eq!(
+            event
+                .metadata
+                .get("fallback_policy")
+                .and_then(|value| value.as_str()),
+            Some("eligible")
+        );
     }
 
     fn build_harness() -> TestHarness {
@@ -6215,7 +6864,7 @@ mod tests {
                 passkey_namespace_enabled: true,
                 auth_flows_enabled: true,
                 legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
-                client_allowlist: Vec::new(),
+                client_allowlist: vec!["web".to_string()],
                 shadow_audit_only: false,
             },
             accounts: Arc::new(StaticAccountRepository::new(vec![account])),
@@ -6348,6 +6997,7 @@ mod tests {
             trace_id: trace_id.to_string(),
             ip: Some("127.0.0.1".to_string()),
             user_agent: Some("unit-test".to_string()),
+            client_id: None,
             auth_api_surface: AuthApiSurface::V1,
         }
     }

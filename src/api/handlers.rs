@@ -16,13 +16,13 @@ use crate::{
     api::problem::{from_auth_error, ApiProblem, ProblemDetails},
     health::ComponentState,
     modules::auth::application::{
-        AuthError, AuthMethodsCommand, AuthMethodsResponse, LoginCommand, LoginResult,
-        LogoutCommand, MfaActivateCommand, MfaDisableCommand, MfaVerifyCommand,
-        PakeLoginFinishCommand, PakeLoginStartCommand, PakeLoginStartResponse, PasskeyChallenge,
-        PasswordChangeCommand, PasswordForgotCommand, PasswordResetCommand,
-        PasswordUpgradeFinishCommand, PasswordUpgradeFinishResponse, PasswordUpgradeStartCommand,
-        PasswordUpgradeStartResponse, Principal, RefreshCommand, RegisterCommand, RequestContext,
-        VerifyEmailCommand,
+        auth_v2_allows_external_access, evaluate_auth_v2_rollout, AuthError, AuthMethodsCommand,
+        AuthMethodsResponse, LoginCommand, LoginResult, LogoutCommand, MfaActivateCommand,
+        MfaDisableCommand, MfaVerifyCommand, PakeLoginFinishCommand, PakeLoginStartCommand,
+        PakeLoginStartResponse, PasskeyChallenge, PasswordChangeCommand, PasswordForgotCommand,
+        PasswordResetCommand, PasswordUpgradeFinishCommand, PasswordUpgradeFinishResponse,
+        PasswordUpgradeStartCommand, PasswordUpgradeStartResponse, Principal, RefreshCommand,
+        RegisterCommand, RequestContext, VerifyEmailCommand,
     },
     observability, AppState,
 };
@@ -881,11 +881,12 @@ pub async fn auth_methods_v2(
     Json(payload): Json<AuthMethodsRequest>,
 ) -> Result<NoStoreJson<AuthMethodsContractResponse>, ApiProblem> {
     let trace_id = trace_id(&headers);
-    let channel = payload
+    let client_id = payload
         .channel
         .clone()
-        .or_else(|| payload.client.platform.clone())
-        .unwrap_or_else(|| "unknown".to_string());
+        .or_else(|| payload.client.platform.clone());
+    let channel = client_id.clone().unwrap_or_else(|| "unknown".to_string());
+    enforce_auth_v2_rollout_access(&state, client_id.as_deref(), &trace_id)?;
     let ctx = request_context(
         &headers,
         trace_id.clone(),
@@ -900,7 +901,7 @@ pub async fn auth_methods_v2(
         .discover_auth_methods_v2(
             AuthMethodsCommand {
                 identifier: payload.identifier,
-                client_id: payload.channel.or(payload.client.platform),
+                client_id,
                 supports_passkeys: payload.client.supports_passkeys,
                 supports_pake: payload.client.supports_pake,
             },
@@ -927,7 +928,7 @@ pub async fn password_login_start_v2(
 ) -> Result<NoStoreJson<PasswordLoginStartContractResponse>, ApiProblem> {
     let trace_id = trace_id(&headers);
     if !payload.client.supports_pake {
-        observability::record_auth_v2_password_request("login_start", "error");
+        observability::record_auth_v2_password_request("login_start", "error", "unknown");
         observability::record_auth_v2_password_rejected("invalid-request");
         return Err(from_auth_error(AuthError::InvalidRequest, trace_id));
     }
@@ -959,13 +960,10 @@ pub async fn password_login_start_v2(
         )
         .await
         .map_err(|err| {
-            observability::record_auth_v2_password_request("login_start", "error");
             let problem = from_auth_error(err, trace_id.clone());
             observability::record_auth_v2_password_rejected(&problem.body.type_url);
             problem
         })?;
-
-    observability::record_auth_v2_password_request("login_start", "success");
 
     Ok(NoStoreJson(password_login_start_contract_response(
         response,
@@ -1000,13 +998,10 @@ pub async fn password_login_finish_v2(
         )
         .await
         .map_err(|err| {
-            observability::record_auth_v2_password_request("login_finish", "error");
             let problem = from_auth_error(err, trace_id.clone());
             observability::record_auth_v2_password_rejected(&problem.body.type_url);
             problem
         })?;
-
-    observability::record_auth_v2_password_request("login_finish", "success");
 
     Ok(NoStoreJson(password_login_finish_response(result)))
 }
@@ -1019,13 +1014,19 @@ pub async fn password_upgrade_start_v2(
 ) -> Result<NoStoreJson<PasswordUpgradeStartContractResponse>, ApiProblem> {
     let trace_id = trace_id(&headers);
     if payload.upgrade_context != "session" || !payload.client.supports_pake {
-        observability::record_auth_v2_password_request("upgrade_start", "error");
+        observability::record_auth_v2_password_request(
+            "upgrade_start",
+            "error",
+            payload.client.platform.as_deref().unwrap_or("unknown"),
+        );
         observability::record_auth_v2_password_rejected("invalid-request");
         return Err(from_auth_error(AuthError::InvalidRequest, trace_id));
     }
 
     let principal = extract_principal(&state, &headers, trace_id.clone()).await?;
-    let ctx = request_context(
+    let client_id = payload.client.platform.clone();
+    enforce_auth_v2_rollout_access(&state, client_id.as_deref(), &trace_id)?;
+    let mut ctx = request_context(
         &headers,
         trace_id.clone(),
         state.trust_x_forwarded_for,
@@ -1033,6 +1034,7 @@ pub async fn password_upgrade_start_v2(
         &state.trusted_proxy_cidrs,
         Some(connect_addr),
     );
+    ctx.client_id = client_id;
 
     let response = state
         .auth_service
@@ -1052,13 +1054,10 @@ pub async fn password_upgrade_start_v2(
         )
         .await
         .map_err(|err| {
-            observability::record_auth_v2_password_request("upgrade_start", "error");
             let problem = from_auth_error(err, trace_id.clone());
             observability::record_auth_v2_password_rejected(&problem.body.type_url);
             problem
         })?;
-
-    observability::record_auth_v2_password_request("upgrade_start", "success");
 
     Ok(NoStoreJson(password_upgrade_start_contract_response(
         response,
@@ -1092,13 +1091,10 @@ pub async fn password_upgrade_finish_v2(
         )
         .await
         .map_err(|err| {
-            observability::record_auth_v2_password_request("upgrade_finish", "error");
             let problem = from_auth_error(err, trace_id.clone());
             observability::record_auth_v2_password_rejected(&problem.body.type_url);
             problem
         })?;
-
-    observability::record_auth_v2_password_request("upgrade_finish", "success");
 
     Ok(NoStoreJson(password_upgrade_finish_contract_response(
         response,
@@ -1793,7 +1789,27 @@ fn request_context(
             .get(axum::http::header::USER_AGENT)
             .and_then(|v| v.to_str().ok())
             .map(|v| v.to_string()),
+        client_id: None,
         auth_api_surface: crate::modules::auth::application::AuthApiSurface::V1,
+    }
+}
+
+fn enforce_auth_v2_rollout_access(
+    state: &AppState,
+    client_id: Option<&str>,
+    trace_id: &str,
+) -> Result<(), ApiProblem> {
+    let Some(config) = state.auth_service.auth_v2_config() else {
+        return Err(from_auth_error(AuthError::Internal, trace_id.to_string()));
+    };
+    let rollout = evaluate_auth_v2_rollout(&config, client_id, None);
+    if auth_v2_allows_external_access(&config, &rollout) {
+        Ok(())
+    } else {
+        Err(from_auth_error(
+            AuthError::AuthV2RolloutDenied,
+            trace_id.to_string(),
+        ))
     }
 }
 
@@ -3433,6 +3449,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_methods_v2_handler_rejects_non_allowlisted_channel() {
+        let harness = build_v2_harness_with_client_allowlist(&["web"]).await;
+
+        let problem = super::auth_methods_v2(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-methods-denied"),
+            Json(AuthMethodsRequest {
+                identifier: harness.bootstrap_email.clone(),
+                channel: Some("android".to_string()),
+                client: super::AuthClientCapabilitiesRequest {
+                    supports_pake: true,
+                    supports_passkeys: true,
+                    supports_conditional_mediation: Some(true),
+                    platform: Some("android".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect_err("non-allowlisted clients should be denied");
+
+        assert_eq!(problem.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/auth-v2-rollout-denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_methods_v2_handler_rejects_requests_in_shadow_audit_mode() {
+        let harness = build_v2_harness_in_shadow_audit_mode().await;
+
+        let problem = super::auth_methods_v2(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-methods-shadow"),
+            Json(AuthMethodsRequest {
+                identifier: harness.bootstrap_email.clone(),
+                channel: Some("web".to_string()),
+                client: super::AuthClientCapabilitiesRequest {
+                    supports_pake: true,
+                    supports_passkeys: true,
+                    supports_conditional_mediation: Some(true),
+                    platform: Some("web".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect_err("shadow audit mode should deny external v2 requests");
+
+        assert_eq!(problem.status, StatusCode::FORBIDDEN);
+        assert_eq!(problem.body.title, "Auth v2 rollout denied");
+        assert_eq!(
+            problem.body.detail,
+            "Auth v2 is not available for this client cohort"
+        );
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/auth-v2-rollout-denied"
+        );
+    }
+
+    #[tokio::test]
     async fn password_login_v2_handlers_complete_authenticated_flow() {
         let harness = build_v2_harness().await;
 
@@ -3629,6 +3708,39 @@ mod tests {
         assert!(finish.upgraded);
         assert_eq!(finish.opaque_version, "opaque_v1");
         assert!(finish.legacy_password.login_allowed);
+    }
+
+    #[tokio::test]
+    async fn password_upgrade_start_v2_handler_rejects_non_allowlisted_client() {
+        let harness =
+            build_v2_harness_with_options_and_allowlist(true, true, false, false, false, &["web"])
+                .await;
+        let login = login_success(&harness, "handler-v2-password-upgrade-denied-login").await;
+        let access_token = login
+            .access_token
+            .expect("login should issue access token for authenticated endpoints");
+
+        let problem = super::password_upgrade_start_v2(
+            State(harness.state.clone()),
+            connect_info(),
+            auth_headers("handler-v2-password-upgrade-denied", &access_token),
+            Json(super::PasswordUpgradeStartRequest {
+                upgrade_context: "session".to_string(),
+                client_message: None,
+                client: super::PasswordUpgradeStartClientRequest {
+                    supports_pake: true,
+                    platform: Some("ios".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect_err("non-allowlisted upgrade clients should be denied");
+
+        assert_eq!(problem.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/auth-v2-rollout-denied"
+        );
     }
 
     #[tokio::test]
@@ -3875,12 +3987,84 @@ mod tests {
         assert!(body.is_empty());
     }
 
+    #[tokio::test]
+    async fn shadow_audit_only_router_hides_v2_methods_but_keeps_v1_login_route() {
+        use axum::{
+            body::Body,
+            http::{Method, Request},
+        };
+        use tower::ServiceExt;
+
+        let harness = build_v2_harness_in_shadow_audit_mode().await;
+        let auth_v2_config = harness
+            .state
+            .auth_service
+            .auth_v2_config()
+            .expect("v2 config should be available for router tests");
+        let app = crate::build_api_router(&auth_v2_config).with_state(harness.state.clone());
+
+        let v2_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v2/auth/methods")
+                    .body(Body::from("{}"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(v2_response.status(), StatusCode::NOT_FOUND);
+
+        let v1_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/auth/login")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(v1_response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let allow = v1_response
+            .headers()
+            .get(header::ALLOW)
+            .expect("405 response should advertise allowed methods");
+        assert_eq!(allow, "POST");
+    }
+
     async fn build_v2_harness() -> HandlerHarness {
         build_v2_harness_with_options(false, true, true).await
     }
 
+    async fn build_v2_harness_in_shadow_audit_mode() -> HandlerHarness {
+        build_v2_harness_with_options_and_allowlist(false, true, true, false, true, &["web"]).await
+    }
+
+    async fn build_v2_harness_with_client_allowlist(client_allowlist: &[&str]) -> HandlerHarness {
+        build_v2_harness_with_options_and_allowlist(
+            false,
+            true,
+            true,
+            false,
+            false,
+            client_allowlist,
+        )
+        .await
+    }
+
     async fn build_v2_harness_with_successful_finish_passkey_service() -> HandlerHarness {
-        build_v2_harness_with_options_and_passkey_service(false, true, true, true).await
+        build_v2_harness_with_options_and_passkey_service(
+            false,
+            true,
+            true,
+            true,
+            false,
+            &["web", "firefox-linux"],
+        )
+        .await
     }
 
     async fn build_v2_harness_with_options(
@@ -3888,11 +4072,32 @@ mod tests {
         auth_flows_enabled: bool,
         include_active_opaque_credential: bool,
     ) -> HandlerHarness {
-        build_v2_harness_with_options_and_passkey_service(
+        build_v2_harness_with_options_and_allowlist(
             password_upgrade_enabled,
             auth_flows_enabled,
             include_active_opaque_credential,
             false,
+            false,
+            &["web", "firefox-linux"],
+        )
+        .await
+    }
+
+    async fn build_v2_harness_with_options_and_allowlist(
+        password_upgrade_enabled: bool,
+        auth_flows_enabled: bool,
+        include_active_opaque_credential: bool,
+        stub_successful_finish: bool,
+        shadow_audit_only: bool,
+        client_allowlist: &[&str],
+    ) -> HandlerHarness {
+        build_v2_harness_with_options_and_passkey_service(
+            password_upgrade_enabled,
+            auth_flows_enabled,
+            include_active_opaque_credential,
+            stub_successful_finish,
+            shadow_audit_only,
+            client_allowlist,
         )
         .await
     }
@@ -3902,6 +4107,8 @@ mod tests {
         auth_flows_enabled: bool,
         include_active_opaque_credential: bool,
         stub_successful_finish: bool,
+        shadow_audit_only: bool,
+        client_allowlist: &[&str],
     ) -> HandlerHarness {
         let mut cfg = test_config();
         cfg.passkey_enabled = true;
@@ -3978,6 +4185,8 @@ mod tests {
                 password_upgrade_enabled,
                 auth_flows_enabled,
                 include_active_opaque_credential,
+                shadow_audit_only,
+                client_allowlist,
             )),
         );
 
@@ -4022,6 +4231,8 @@ mod tests {
         password_upgrade_enabled: bool,
         auth_flows_enabled: bool,
         include_active_opaque_credential: bool,
+        shadow_audit_only: bool,
+        client_allowlist: &[&str],
     ) -> crate::modules::auth::application::AuthV2Dependencies {
         let now = Utc::now();
 
@@ -4037,8 +4248,11 @@ mod tests {
                 passkey_namespace_enabled: true,
                 auth_flows_enabled,
                 legacy_fallback_mode: crate::config::AuthV2LegacyFallbackMode::Allowlisted,
-                client_allowlist: Vec::new(),
-                shadow_audit_only: false,
+                client_allowlist: client_allowlist
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect(),
+                shadow_audit_only,
             },
             accounts: Arc::new(StaticAccountRepository::new(vec![
                 crate::modules::auth::domain::AccountRecord {
@@ -4734,6 +4948,7 @@ mod tests {
             trace_id: trace_id.to_string(),
             ip: Some("127.0.0.1".to_string()),
             user_agent: Some("handler-tests".to_string()),
+            client_id: None,
             auth_api_surface: crate::modules::auth::application::AuthApiSurface::V1,
         }
     }
