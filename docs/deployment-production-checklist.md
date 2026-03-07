@@ -188,17 +188,18 @@ STRICT_DEPLOY_VALIDATION=true ./scripts/validate-deploy-readiness.sh
 # - login_risk_challenge_cidrs (optional CSV)
 # - login_risk_challenge_user_agent_substrings (optional CSV)
 # - login_risk_challenge_email_domains (optional CSV)
-# Auth v2 rollout inputs:
-# - auth_v2_enabled (default false)
-# - auth_v2_methods_enabled (default false)
-# - auth_v2_password_pake_enabled (default false)
-# - auth_v2_password_upgrade_enabled (default false)
-# - auth_v2_passkey_namespace_enabled (default false)
-# - auth_v2_auth_flows_enabled (default false)
-# - auth_v2_legacy_fallback_mode (disabled|allowlisted|broad; default disabled)
-# - auth_v2_client_allowlist (optional CSV)
-# - auth_v2_shadow_audit_only (default true)
-# - auth_v2_auth_flow_prune_interval_seconds (default 300)
+# Auth v2 rollout input:
+# - auth_v2_rollout_env (multiline KEY=VALUE block for AUTH_V2_* knobs)
+#   AUTH_V2_ENABLED=false
+#   AUTH_V2_METHODS_ENABLED=false
+#   AUTH_V2_PASSWORD_PAKE_ENABLED=false
+#   AUTH_V2_PASSWORD_UPGRADE_ENABLED=false
+#   AUTH_V2_PASSKEY_NAMESPACE_ENABLED=false
+#   AUTH_V2_AUTH_FLOWS_ENABLED=false
+#   AUTH_V2_LEGACY_FALLBACK_MODE=disabled
+#   AUTH_V2_CLIENT_ALLOWLIST=
+#   AUTH_V2_SHADOW_AUDIT_ONLY=false
+#   AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS=60
 # - apply_changes=false (default)
 ```
 
@@ -242,16 +243,7 @@ JWT_PUBLIC_KEY_PEM="$(cat /path/to/v2-public.pem)" \
 # - login_risk_mode=baseline (default)
 # - login_risk_blocked_cidrs / login_risk_blocked_user_agent_substrings / login_risk_blocked_email_domains (optional CSV)
 # - login_risk_challenge_cidrs / login_risk_challenge_user_agent_substrings / login_risk_challenge_email_domains (optional CSV)
-# - auth_v2_enabled=false (default)
-# - auth_v2_methods_enabled=false (default)
-# - auth_v2_password_pake_enabled=false (default)
-# - auth_v2_password_upgrade_enabled=false (default)
-# - auth_v2_passkey_namespace_enabled=false (default)
-# - auth_v2_auth_flows_enabled=false (default)
-# - auth_v2_legacy_fallback_mode=disabled (default)
-# - auth_v2_client_allowlist (optional CSV)
-# - auth_v2_shadow_audit_only=true (default)
-# - auth_v2_auth_flow_prune_interval_seconds=300 (default)
+# - auth_v2_rollout_env (multiline KEY=VALUE block for AUTH_V2_* knobs; default block keeps all auth v2 flags fail-closed)
 # - apply_changes=false (default; non-destructive dry-run mode)
 # - allow_client_dry_run_fallback=false (default; only for simulation when API server is unreachable)
 # - namespace=auth
