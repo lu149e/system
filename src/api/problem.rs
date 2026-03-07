@@ -220,6 +220,13 @@ pub fn from_auth_error(
             "https://example.com/problems/pake-unavailable".to_string(),
             None,
         ),
+        AuthError::AuthV2RolloutDenied => (
+            StatusCode::FORBIDDEN,
+            "Auth v2 rollout denied".to_string(),
+            "Auth v2 is not available for this client cohort".to_string(),
+            "https://example.com/problems/auth-v2-rollout-denied".to_string(),
+            None,
+        ),
         AuthError::Internal => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Internal error".to_string(),
@@ -334,6 +341,22 @@ mod tests {
         assert_eq!(
             problem.body.type_url,
             "https://example.com/problems/pake-unavailable"
+        );
+    }
+
+    #[test]
+    fn auth_v2_rollout_denied_maps_to_expected_problem_contract() {
+        let problem = from_auth_error(
+            AuthError::AuthV2RolloutDenied,
+            "trace-rollout-denied".to_string(),
+        );
+
+        assert_eq!(problem.status, StatusCode::FORBIDDEN);
+        assert_eq!(problem.body.status, 403);
+        assert_eq!(problem.body.title, "Auth v2 rollout denied");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/auth-v2-rollout-denied"
         );
     }
 

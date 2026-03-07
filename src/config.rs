@@ -87,6 +87,25 @@ pub enum AuthV2LegacyFallbackMode {
     Broad,
 }
 
+impl AuthV2Config {
+    pub fn normalized_client_id(client_id: Option<&str>) -> Option<String> {
+        client_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase())
+    }
+
+    pub fn client_is_allowlisted(&self, client_id: Option<&str>) -> bool {
+        let Some(client_id) = Self::normalized_client_id(client_id) else {
+            return false;
+        };
+
+        self.client_allowlist
+            .iter()
+            .any(|value| value == &client_id)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct JwtKeyConfig {
     pub kid: String,
@@ -218,7 +237,7 @@ impl AppConfig {
                 std::env::var("AUTH_V2_LEGACY_FALLBACK_MODE")
                     .unwrap_or_else(|_| "disabled".to_string()),
             )?,
-            client_allowlist: parse_csv_non_empty_values(
+            client_allowlist: parse_auth_v2_client_allowlist(
                 std::env::var("AUTH_V2_CLIENT_ALLOWLIST").unwrap_or_default(),
             ),
             shadow_audit_only: std::env::var("AUTH_V2_SHADOW_AUDIT_ONLY")
@@ -818,6 +837,16 @@ fn parse_auth_v2_legacy_fallback_mode(value: String) -> Result<AuthV2LegacyFallb
     }
 }
 
+fn parse_auth_v2_client_allowlist(value: String) -> Vec<String> {
+    let mut seen = HashSet::new();
+
+    parse_csv_non_empty_values(value)
+        .into_iter()
+        .filter_map(|entry| AuthV2Config::normalized_client_id(Some(&entry)))
+        .filter(|entry| seen.insert(entry.clone()))
+        .collect()
+}
+
 fn parse_auth_v2_pake_provider(value: String) -> Result<AuthV2PakeProvider> {
     match value.trim().to_ascii_lowercase().as_str() {
         "unavailable" => Ok(AuthV2PakeProvider::Unavailable),
@@ -1212,14 +1241,14 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        database_url_uses_secure_transport, parse_auth_v2_legacy_fallback_mode,
-        parse_auth_v2_pake_provider, parse_email_delivery_mode, parse_email_provider_config,
-        parse_login_risk_blocked_cidrs, parse_login_risk_challenge_cidrs, parse_login_risk_mode,
-        parse_metrics_allowed_cidrs, parse_positive_u64_with_default,
-        redis_url_uses_secure_transport, resolve_jwt_key_configuration,
-        resolve_optional_secret_from_env, validate_backend_transport_security, AuthRuntime,
-        AuthV2LegacyFallbackMode, AuthV2PakeProvider, EmailDeliveryMode, EmailProviderConfig,
-        LoginRiskMode,
+        database_url_uses_secure_transport, parse_auth_v2_client_allowlist,
+        parse_auth_v2_legacy_fallback_mode, parse_auth_v2_pake_provider, parse_email_delivery_mode,
+        parse_email_provider_config, parse_login_risk_blocked_cidrs,
+        parse_login_risk_challenge_cidrs, parse_login_risk_mode, parse_metrics_allowed_cidrs,
+        parse_positive_u64_with_default, redis_url_uses_secure_transport,
+        resolve_jwt_key_configuration, resolve_optional_secret_from_env,
+        validate_backend_transport_security, AuthRuntime, AuthV2LegacyFallbackMode,
+        AuthV2PakeProvider, EmailDeliveryMode, EmailProviderConfig, LoginRiskMode,
     };
 
     #[test]
@@ -1290,6 +1319,36 @@ mod tests {
         assert!(error
             .to_string()
             .contains("AUTH_V2_LEGACY_FALLBACK_MODE must be one of: disabled, allowlisted, broad"));
+    }
+
+    #[test]
+    fn parse_auth_v2_client_allowlist_normalizes_and_deduplicates_values() {
+        let allowlist =
+            parse_auth_v2_client_allowlist(" Web ,ios,web,, ANDROID , ios ".to_string());
+
+        assert_eq!(allowlist, vec!["web", "ios", "android"]);
+    }
+
+    #[test]
+    fn auth_v2_config_client_allowlist_is_fail_closed_for_unknown_clients() {
+        let config = super::AuthV2Config {
+            enabled: true,
+            methods_enabled: true,
+            password_pake_enabled: true,
+            password_upgrade_enabled: true,
+            pake_provider: AuthV2PakeProvider::Unavailable,
+            opaque_server_setup: None,
+            opaque_server_key_ref: None,
+            passkey_namespace_enabled: true,
+            auth_flows_enabled: true,
+            legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
+            client_allowlist: parse_auth_v2_client_allowlist("web, ios".to_string()),
+            shadow_audit_only: false,
+        };
+
+        assert!(config.client_is_allowlisted(Some("WEB")));
+        assert!(!config.client_is_allowlisted(Some("android")));
+        assert!(!config.client_is_allowlisted(None));
     }
 
     #[test]

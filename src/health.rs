@@ -409,6 +409,11 @@ impl ReadinessChecker for RuntimeReadinessChecker {
         components.passkey_challenge_janitor =
             self.passkey_challenge_janitor_health.as_component_state();
         components.auth_flow_janitor = self.auth_flow_janitor_health.as_component_state();
+        if component_state_blocks_readiness(&components.passkey_challenge_janitor)
+            || component_state_blocks_readiness(&components.auth_flow_janitor)
+        {
+            is_ready = false;
+        }
 
         let payload = ReadinessPayload {
             status: if is_ready {
@@ -425,6 +430,10 @@ impl ReadinessChecker for RuntimeReadinessChecker {
 
         ReadinessReport { is_ready, payload }
     }
+}
+
+fn component_state_blocks_readiness(state: &ComponentState) -> bool {
+    matches!(state.status.as_str(), "error" | "degraded")
 }
 
 #[cfg(test)]
@@ -484,6 +493,31 @@ mod tests {
         assert_eq!(
             report.payload.components.auth_flow_janitor.status,
             "not_configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_not_ready_when_auth_flow_janitor_is_degraded() {
+        let auth_flow_health =
+            Arc::new(AuthFlowJanitorHealth::new(true, StdDuration::from_secs(60)));
+        let now = Utc::now();
+        auth_flow_health.record_success(now - Duration::seconds(120));
+
+        let checker = RuntimeReadinessChecker::inmemory(
+            Arc::new(PasskeyChallengeJanitorHealth::new(
+                false,
+                StdDuration::from_secs(60),
+            )),
+            auth_flow_health,
+        );
+
+        let report = checker.check().await;
+
+        assert!(!report.is_ready);
+        assert_eq!(report.payload.status, "error");
+        assert_eq!(
+            report.payload.components.auth_flow_janitor.status,
+            "degraded"
         );
     }
 
