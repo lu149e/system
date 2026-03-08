@@ -614,6 +614,13 @@ impl InMemoryPasskeyChallengeRepository {
             authentication_by_flow: Mutex::new(HashMap::new()),
         }
     }
+
+    pub fn has_authentication_challenge(&self, flow_id: &str) -> bool {
+        self.authentication_by_flow
+            .lock()
+            .map(|guard| guard.contains_key(flow_id))
+            .unwrap_or(false)
+    }
 }
 
 #[async_trait]
@@ -1314,6 +1321,43 @@ mod tests {
             .await
             .expect("lockout should be generated after reset");
         assert_eq!(seconds_between(second_now, second_until), 10);
+    }
+
+    #[tokio::test]
+    async fn batched_auth_flow_penalties_follow_existing_lockout_progression() {
+        let protector =
+            InMemoryLoginAbuseProtector::new(5, 300, 10, 40, LoginAbuseBucketMode::IpOnly)
+                .expect("in-memory abuse protector should initialize");
+        let email = "user@example.com";
+        let ip = Some("10.0.0.8");
+
+        let first_now = Utc::now();
+        for attempt in 0..4 {
+            let result = protector.register_failure(email, ip, first_now).await;
+            assert!(
+                result.is_none(),
+                "attempt {attempt} should not lock before the threshold"
+            );
+        }
+        let first_until = protector
+            .register_failure(email, ip, first_now)
+            .await
+            .expect("fifth penalty unit should lock like a normal failure threshold");
+        assert_eq!(seconds_between(first_now, first_until), 10);
+
+        let second_now = first_until + chrono::Duration::seconds(1);
+        for attempt in 0..4 {
+            let result = protector.register_failure(email, ip, second_now).await;
+            assert!(
+                result.is_none(),
+                "repeat attempt {attempt} should rebuild the threshold after the prior lock expires"
+            );
+        }
+        let second_until = protector
+            .register_failure(email, ip, second_now)
+            .await
+            .expect("next penalty batch should advance the strike backoff");
+        assert_eq!(seconds_between(second_now, second_until), 20);
     }
 
     fn refresh_record(

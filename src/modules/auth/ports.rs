@@ -104,6 +104,7 @@ pub enum AuthFlowConsumeState {
 #[async_trait]
 pub trait AuthFlowRepository: Send + Sync {
     async fn issue(&self, flow: AuthFlowRecord) -> Result<(), String>;
+    async fn lookup(&self, flow_id: &str) -> Result<Option<AuthFlowRecord>, String>;
     async fn consume(
         &self,
         flow_id: &str,

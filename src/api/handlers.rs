@@ -2015,7 +2015,8 @@ mod tests {
                     RequestContext,
                 },
                 ports::{
-                    AuthFlowRepository, PasskeyCredentialRepository, PasskeyService, UserRepository,
+                    AuthFlowRepository, LoginRiskAnalyzer, LoginRiskDecision,
+                    PasskeyCredentialRepository, PasskeyService, UserRepository,
                 },
             },
             tokens::{domain::AccessTokenClaims, ports::JwtService},
@@ -2129,6 +2130,28 @@ mod tests {
             self.inner
                 .finish_passkey_authentication(credential, state)
                 .map_err(|err| err.to_string())
+        }
+    }
+
+    struct IpChallengeLoginRiskAnalyzer;
+
+    #[async_trait]
+    impl LoginRiskAnalyzer for IpChallengeLoginRiskAnalyzer {
+        async fn evaluate_login(
+            &self,
+            _email: &str,
+            _user_id: &str,
+            source_ip: Option<&str>,
+            _user_agent: Option<&str>,
+            _now: chrono::DateTime<Utc>,
+        ) -> LoginRiskDecision {
+            if source_ip == Some("198.51.100.10") {
+                return LoginRiskDecision::Challenge {
+                    reason: "challenge_without_mfa".to_string(),
+                };
+            }
+
+            LoginRiskDecision::Allow
         }
     }
 
@@ -3464,6 +3487,40 @@ mod tests {
         response.0
     }
 
+    async fn metrics_payload(harness: &HandlerHarness, trace_id: &str) -> String {
+        let response = super::metrics(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace(trace_id),
+        )
+        .await
+        .expect("metrics should succeed")
+        .into_response();
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("metrics body should be readable");
+
+        String::from_utf8(body.to_vec()).expect("metrics payload should be utf-8")
+    }
+
+    async fn force_login_lockout(harness: &HandlerHarness, trace_prefix: &str, attempts: usize) {
+        for attempt in 0..attempts {
+            let result = harness
+                .state
+                .auth_service
+                .login(
+                    LoginCommand {
+                        email: harness.bootstrap_email.clone(),
+                        password: "definitely-wrong-password".to_string(),
+                        device_info: Some(format!("{trace_prefix}-device-{attempt}")),
+                    },
+                    test_context(&format!("{trace_prefix}-{attempt}")),
+                )
+                .await;
+            assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+        }
+    }
+
     async fn enable_mfa(harness: &HandlerHarness) {
         let login = harness
             .state
@@ -3673,6 +3730,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_methods_v2_handler_returns_login_locked_problem_contract() {
+        let harness = build_v2_harness().await;
+        force_login_lockout(&harness, "handler-v2-methods-lockout", 5).await;
+
+        let problem = super::auth_methods_v2(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-methods-locked"),
+            Json(AuthMethodsRequest {
+                identifier: harness.bootstrap_email.clone(),
+                channel: Some("web".to_string()),
+                client: super::AuthClientCapabilitiesRequest {
+                    supports_pake: true,
+                    supports_passkeys: true,
+                    supports_conditional_mediation: Some(true),
+                    platform: Some("canary_web".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect_err("locked identifiers should be rejected");
+
+        assert_eq!(problem.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(problem.body.status, 429);
+        assert_eq!(problem.body.title, "Login temporarily locked");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/login-locked"
+        );
+        assert!(problem.retry_after_seconds.is_some());
+
+        let response = problem.into_response();
+        assert!(response.headers().get(header::RETRY_AFTER).is_some());
+
+        let metrics_payload = metrics_payload(&harness, "handler-v2-methods-locked-metrics").await;
+        assert!(metrics_payload.contains("auth_v2_methods_rejected_total"));
+        assert!(metrics_payload.contains("reason=\"login_locked\""));
+    }
+
+    #[tokio::test]
     async fn password_login_v2_handlers_complete_authenticated_flow() {
         let harness = build_v2_harness().await;
 
@@ -3784,6 +3881,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn password_login_start_v2_handler_returns_login_locked_problem_contract() {
+        let harness = build_v2_harness().await;
+
+        let discovery = super::auth_methods_v2(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-password-login-locked-discovery"),
+            Json(AuthMethodsRequest {
+                identifier: harness.bootstrap_email.clone(),
+                channel: Some("web".to_string()),
+                client: super::AuthClientCapabilitiesRequest {
+                    supports_pake: true,
+                    supports_passkeys: false,
+                    supports_conditional_mediation: Some(false),
+                    platform: Some("canary_web".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("v2 auth methods should succeed")
+        .0;
+
+        force_login_lockout(&harness, "handler-v2-password-login-locked", 5).await;
+
+        let problem = super::password_login_start_v2(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-password-login-locked-start"),
+            Json(PasswordLoginStartRequest {
+                identifier: harness.bootstrap_email.clone(),
+                discovery_token: discovery.discovery_token,
+                client_message: Some(serde_json::json!({
+                    "opaque_message": "client-hello",
+                })),
+                client: super::PasswordLoginStartClientRequest {
+                    supports_pake: true,
+                    platform: Some("canary_web".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect_err("locked password login starts should be rejected");
+
+        assert_eq!(problem.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(problem.body.status, 429);
+        assert_eq!(problem.body.title, "Login temporarily locked");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/login-locked"
+        );
+        assert!(problem.retry_after_seconds.is_some());
+
+        let response = problem.into_response();
+        assert!(response.headers().get(header::RETRY_AFTER).is_some());
+
+        let metrics_payload =
+            metrics_payload(&harness, "handler-v2-password-login-locked-metrics").await;
+        assert!(metrics_payload.contains("auth_v2_password_start_requests_total"));
+        assert!(metrics_payload.contains("outcome=\"error\""));
+        assert!(metrics_payload.contains("auth_v2_password_rejected_total"));
+        assert!(metrics_payload.contains("reason=\"login_locked\""));
+    }
+
+    #[tokio::test]
     async fn passkey_login_start_v2_handler_rejects_invalid_discovery_token() {
         let harness = build_v2_harness().await;
 
@@ -3804,6 +3965,82 @@ mod tests {
             problem.body.type_url,
             "https://example.com/problems/invalid-token"
         );
+
+        let metrics_response = super::metrics(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-passkey-start-invalid-metrics"),
+        )
+        .await
+        .expect("metrics should succeed")
+        .into_response();
+        let metrics_body = to_bytes(metrics_response.into_body(), 1024 * 1024)
+            .await
+            .expect("metrics body should be readable");
+        let metrics_payload =
+            String::from_utf8(metrics_body.to_vec()).expect("metrics payload should be utf-8");
+
+        assert!(metrics_payload.contains("auth_passkey_requests_total"));
+        assert!(metrics_payload.contains("operation=\"login_start_v2\",outcome=\"error\""));
+        assert!(metrics_payload.contains("auth_passkey_login_rejected_total"));
+        assert!(metrics_payload.contains("reason=\"invalid_token\""));
+    }
+
+    #[tokio::test]
+    async fn passkey_login_start_v2_handler_returns_login_locked_problem_contract() {
+        let harness = build_v2_harness().await;
+
+        let discovery = super::auth_methods_v2(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-passkey-login-locked-discovery"),
+            Json(super::AuthMethodsRequest {
+                identifier: harness.bootstrap_email.clone(),
+                channel: Some("web".to_string()),
+                client: super::AuthClientCapabilitiesRequest {
+                    supports_pake: true,
+                    supports_passkeys: true,
+                    supports_conditional_mediation: Some(true),
+                    platform: Some("canary_web".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("v2 auth methods should succeed")
+        .0;
+
+        force_login_lockout(&harness, "handler-v2-passkey-login-locked", 5).await;
+
+        let problem = super::passkey_login_start_v2(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-passkey-login-locked-start"),
+            Json(super::PasskeyLoginStartV2Request {
+                identifier: harness.bootstrap_email.clone(),
+                discovery_token: discovery.discovery_token,
+            }),
+        )
+        .await
+        .expect_err("locked passkey login starts should be rejected");
+
+        assert_eq!(problem.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(problem.body.status, 429);
+        assert_eq!(problem.body.title, "Login temporarily locked");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/login-locked"
+        );
+        assert!(problem.retry_after_seconds.is_some());
+
+        let response = problem.into_response();
+        assert!(response.headers().get(header::RETRY_AFTER).is_some());
+
+        let metrics_payload =
+            metrics_payload(&harness, "handler-v2-passkey-login-locked-metrics").await;
+        assert!(metrics_payload.contains("auth_passkey_requests_total"));
+        assert!(metrics_payload.contains("operation=\"login_start_v2\",outcome=\"error\""));
+        assert!(metrics_payload.contains("auth_passkey_login_rejected_total"));
+        assert!(metrics_payload.contains("reason=\"login_locked\""));
     }
 
     #[tokio::test]
@@ -4034,6 +4271,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn password_upgrade_start_v2_handler_rejects_invalid_recovery_bridge() {
+        let harness = build_v2_harness_with_options(true, true, false).await;
+
+        let problem = super::password_upgrade_start_v2(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-password-upgrade-invalid-bridge"),
+            Json(super::PasswordUpgradeStartRequest {
+                upgrade_context: "recovery_bridge".to_string(),
+                client_message: Some(serde_json::json!({
+                    "recovery_flow_id": "missing-recovery-bridge",
+                })),
+                client: super::PasswordUpgradeStartClientRequest {
+                    supports_pake: true,
+                    platform: Some("canary_web".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect_err("missing recovery bridges should be rejected");
+
+        assert_eq!(problem.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(problem.body.status, 401);
+        assert_eq!(problem.body.title, "Invalid recovery bridge");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/invalid-recovery-bridge"
+        );
+
+        let metrics_payload =
+            metrics_payload(&harness, "handler-v2-password-upgrade-invalid-bridge-metrics").await;
+        assert!(metrics_payload.contains("auth_v2_password_rejected_total"));
+        assert!(metrics_payload.contains("reason=\"invalid_recovery_bridge\""));
+    }
+
+    #[tokio::test]
     async fn password_upgrade_start_v2_handler_rejects_non_allowlisted_client() {
         let harness = build_v2_harness_with_options_and_allowlist(
             true,
@@ -4257,6 +4530,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn password_login_finish_v2_handler_returns_recovery_required_problem_contract() {
+        let harness = build_v2_harness_with_login_risk(Arc::new(IpChallengeLoginRiskAnalyzer)).await;
+
+        let discovery = super::auth_methods_v2(
+            State(harness.state.clone()),
+            connect_info_for([198, 51, 100, 10], 41000),
+            headers_with_trace("handler-v2-recovery-required-discovery"),
+            Json(super::AuthMethodsRequest {
+                identifier: harness.bootstrap_email.clone(),
+                channel: Some("web".to_string()),
+                client: super::AuthClientCapabilitiesRequest {
+                    supports_pake: true,
+                    supports_passkeys: false,
+                    supports_conditional_mediation: Some(false),
+                    platform: Some("canary_web".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("v2 methods should succeed")
+        .0;
+
+        let start = super::password_login_start_v2(
+            State(harness.state.clone()),
+            connect_info_for([198, 51, 100, 10], 41001),
+            headers_with_trace("handler-v2-recovery-required-start"),
+            Json(PasswordLoginStartRequest {
+                identifier: harness.bootstrap_email.clone(),
+                discovery_token: discovery.discovery_token,
+                client_message: Some(serde_json::json!({
+                    "opaque_message": "client-hello",
+                })),
+                client: super::PasswordLoginStartClientRequest {
+                    supports_pake: true,
+                    platform: Some("canary_web".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("v2 password start should succeed")
+        .0;
+
+        let problem = super::password_login_finish_v2(
+            State(harness.state.clone()),
+            connect_info_for([198, 51, 100, 10], 41002),
+            headers_with_trace("handler-v2-recovery-required-finish"),
+            Json(PasswordLoginFinishRequest {
+                flow_id: start.flow_id.clone(),
+                client_message: serde_json::json!({
+                    "opaque_message": format!("ok:{}", start.flow_id),
+                }),
+                device_info: Some("Firefox on Linux".to_string()),
+            }),
+        )
+        .await
+        .expect_err("risk step-up without MFA should require recovery");
+
+        assert_eq!(problem.status, StatusCode::FORBIDDEN);
+        assert_eq!(problem.body.status, 403);
+        assert_eq!(problem.body.title, "Recovery required");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/recovery-required"
+        );
+
+        let metrics_payload = metrics_payload(&harness, "handler-v2-recovery-required-metrics").await;
+        assert!(metrics_payload.contains("auth_v2_password_rejected_total"));
+        assert!(metrics_payload.contains("reason=\"recovery_required\""));
+    }
+
+    #[tokio::test]
+    async fn passkey_login_finish_v2_handler_returns_recovery_required_problem_contract() {
+        let harness = build_v2_harness_with_options_and_login_risk(
+            false,
+            true,
+            true,
+            true,
+            false,
+            &["canary_web"],
+            Arc::new(IpChallengeLoginRiskAnalyzer),
+        )
+        .await;
+        let bootstrap_user = harness
+            .state
+            .auth_service
+            .authenticate_access_token(
+                &login_success(&harness, "handler-v2-passkey-recovery-required-bootstrap")
+                    .await
+                    .access_token
+                    .expect("login should return access token"),
+            )
+            .await
+            .expect("bootstrap access token should authenticate");
+        harness
+            .passkeys
+            .upsert_for_user(&bootstrap_user.user_id, dummy_passkey(), Utc::now())
+            .await
+            .expect("dummy passkey should be inserted");
+
+        let discovery = super::auth_methods_v2(
+            State(harness.state.clone()),
+            connect_info_for([198, 51, 100, 10], 41010),
+            headers_with_trace("handler-v2-passkey-recovery-required-discovery"),
+            Json(super::AuthMethodsRequest {
+                identifier: harness.bootstrap_email.clone(),
+                channel: Some("web".to_string()),
+                client: super::AuthClientCapabilitiesRequest {
+                    supports_pake: true,
+                    supports_passkeys: true,
+                    supports_conditional_mediation: Some(true),
+                    platform: Some("canary_web".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("v2 auth methods should succeed")
+        .0;
+
+        let start = super::passkey_login_start_v2(
+            State(harness.state.clone()),
+            connect_info_for([198, 51, 100, 10], 41011),
+            headers_with_trace("handler-v2-passkey-recovery-required-start"),
+            Json(super::PasskeyLoginStartV2Request {
+                identifier: harness.bootstrap_email.clone(),
+                discovery_token: discovery.discovery_token,
+            }),
+        )
+        .await
+        .expect("v2 passkey login start should succeed")
+        .0;
+
+        let problem = super::passkey_login_finish_v2(
+            State(harness.state.clone()),
+            connect_info_for([198, 51, 100, 10], 41012),
+            headers_with_trace("handler-v2-passkey-recovery-required-finish"),
+            Json(super::PasskeyLoginFinishRequest {
+                flow_id: start.flow_id,
+                credential: successful_passkey_login_credential(),
+                device_info: Some("Firefox on Linux".to_string()),
+            }),
+        )
+        .await
+        .expect_err("risk step-up without MFA should require recovery");
+
+        assert_eq!(problem.status, StatusCode::FORBIDDEN);
+        assert_eq!(problem.body.status, 403);
+        assert_eq!(problem.body.title, "Recovery required");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/recovery-required"
+        );
+
+        let metrics_payload =
+            metrics_payload(&harness, "handler-v2-passkey-recovery-required-metrics").await;
+        assert!(metrics_payload.contains("auth_passkey_requests_total"));
+        assert!(metrics_payload.contains("operation=\"login_finish_v2\",outcome=\"error\""));
+        assert!(metrics_payload.contains("auth_passkey_login_rejected_total"));
+        assert!(metrics_payload.contains("reason=\"recovery_required\""));
+    }
+
+    #[tokio::test]
     async fn passkey_register_finish_v2_handler_returns_enrollment_contract() {
         let harness = build_v2_harness_with_successful_finish_passkey_service().await;
         let access_token = login_success(&harness, "handler-v2-passkey-register-success-login")
@@ -4404,14 +4838,30 @@ mod tests {
         .await
     }
 
+    async fn build_v2_harness_with_login_risk(
+        login_risk: Arc<dyn LoginRiskAnalyzer>,
+    ) -> HandlerHarness {
+        build_v2_harness_with_options_and_login_risk(
+            false,
+            true,
+            true,
+            false,
+            false,
+            &["canary_web"],
+            login_risk,
+        )
+        .await
+    }
+
     async fn build_v2_harness_with_successful_finish_passkey_service() -> HandlerHarness {
-        build_v2_harness_with_options_and_passkey_service(
+        build_v2_harness_with_options_and_login_risk(
             false,
             true,
             true,
             true,
             false,
             &["canary_web"],
+            Arc::new(crate::adapters::risk::AllowAllLoginRiskAnalyzer),
         )
         .await
     }
@@ -4440,24 +4890,26 @@ mod tests {
         shadow_audit_only: bool,
         client_allowlist: &[&str],
     ) -> HandlerHarness {
-        build_v2_harness_with_options_and_passkey_service(
+        build_v2_harness_with_options_and_login_risk(
             password_upgrade_enabled,
             auth_flows_enabled,
             include_active_opaque_credential,
             stub_successful_finish,
             shadow_audit_only,
             client_allowlist,
+            Arc::new(crate::adapters::risk::AllowAllLoginRiskAnalyzer),
         )
         .await
     }
 
-    async fn build_v2_harness_with_options_and_passkey_service(
+    async fn build_v2_harness_with_options_and_login_risk(
         password_upgrade_enabled: bool,
         auth_flows_enabled: bool,
         include_active_opaque_credential: bool,
         stub_successful_finish: bool,
         shadow_audit_only: bool,
         client_allowlist: &[&str],
+        login_risk: Arc<dyn LoginRiskAnalyzer>,
     ) -> HandlerHarness {
         let mut cfg = test_config();
         cfg.passkey_enabled = true;
@@ -4501,7 +4953,7 @@ mod tests {
             AuthService::new(
                 Arc::new(adapters.users),
                 Arc::new(adapters.login_abuse),
-                Arc::new(crate::adapters::risk::AllowAllLoginRiskAnalyzer),
+                login_risk,
                 Arc::new(adapters.verification_tokens),
                 Arc::new(adapters.password_reset_tokens),
                 Arc::new(adapters.mfa_factors),
@@ -4603,6 +5055,7 @@ mod tests {
                     opaque_server_key_ref: None,
                     passkey_namespace_enabled: true,
                     auth_flows_enabled,
+                    auth_flow_abuse_penalty_units: 1,
                     legacy_fallback_mode: crate::config::AuthV2LegacyFallbackMode::Allowlisted,
                     client_allowlist: client_allowlist
                         .iter()
@@ -4885,6 +5338,18 @@ mod tests {
                 .map_err(|_| "auth flow storage unavailable".to_string())?
                 .insert(flow.flow_id.clone(), flow);
             Ok(())
+        }
+
+        async fn lookup(
+            &self,
+            flow_id: &str,
+        ) -> Result<Option<crate::modules::auth::domain::AuthFlowRecord>, String> {
+            Ok(self
+                .flows
+                .lock()
+                .map_err(|_| "auth flow storage unavailable".to_string())?
+                .get(flow_id)
+                .cloned())
         }
 
         async fn consume(
@@ -5496,6 +5961,7 @@ mod tests {
                 opaque_server_key_ref: None,
                 passkey_namespace_enabled: false,
                 auth_flows_enabled: false,
+                auth_flow_abuse_penalty_units: 1,
                 legacy_fallback_mode: crate::config::AuthV2LegacyFallbackMode::Disabled,
                 client_allowlist: Vec::new(),
                 shadow_audit_only: false,

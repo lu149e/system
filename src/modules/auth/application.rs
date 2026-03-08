@@ -1474,41 +1474,56 @@ impl AuthService {
             return Err(AuthError::Internal);
         }
 
-        let now = Utc::now();
-        let discovery = v2
-            .auth_flows
-            .consume(discovery_token, now)
-            .await
-            .map_err(|_| AuthError::Internal)?;
-        let flow = match discovery {
-            crate::modules::auth::ports::AuthFlowConsumeState::Active(flow)
-                if matches!(
-                    flow.flow_kind,
-                    crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery
-                ) =>
-            {
-                *flow
-            }
-            _ => return Err(AuthError::InvalidToken),
-        };
-
-        let flow_identifier = flow
-            .state
-            .get("identifier")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(AuthError::InvalidToken)?;
-        if flow_identifier != identifier.to_ascii_lowercase() {
-            return Err(AuthError::InvalidToken);
-        }
-
-        let rollout = auth_v2_rollout_from_flow(&v2.config, &flow, None);
-        if !auth_v2_allows_external_access(&rollout) {
-            return Err(AuthError::AuthV2RolloutDenied);
-        }
-
+        let mut audit_actor_user_id: Option<String> = None;
+        let mut audit_flow_id: Option<String> = None;
         let mut ctx = ctx;
-        ctx.client_id = Some(rollout.cohort_label().to_string());
-        self.passkey_login_start(identifier, ctx).await
+
+        let result = async {
+            let now = Utc::now();
+            let flow = self
+                .consume_auth_flow_with_abuse_penalty(
+                    discovery_token,
+                    crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery,
+                    &ctx,
+                    now,
+                    AuthError::InvalidToken,
+                )
+                .await?;
+
+            let flow_identifier = flow
+                .state
+                .get("identifier")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(AuthError::InvalidToken)?;
+            if flow_identifier != identifier.to_ascii_lowercase() {
+                self.apply_auth_flow_abuse_penalty(&flow, &ctx, now).await;
+                return Err(AuthError::InvalidToken);
+            }
+
+            let rollout = auth_v2_rollout_from_flow(&v2.config, &flow, None);
+            if !auth_v2_allows_external_access(&rollout) {
+                return Err(AuthError::AuthV2RolloutDenied);
+            }
+
+            audit_actor_user_id = flow.subject_user_id.clone();
+            ctx.client_id = Some(rollout.cohort_label().to_string());
+            let challenge = self.passkey_login_start(identifier, ctx.clone()).await?;
+            audit_flow_id = Some(challenge.flow_id.clone());
+            Ok(challenge)
+        }
+        .await;
+
+        if let Some(reason) = result.as_ref().err().map(auth_v2_error_reason) {
+            self.audit_passkey_login_rejected(
+                reason,
+                audit_actor_user_id.as_deref(),
+                audit_flow_id.as_deref(),
+                &ctx,
+            )
+            .await;
+        }
+
+        result
     }
 
     pub async fn passkey_login_finish(
@@ -1611,9 +1626,23 @@ impl AuthService {
             .map(|factor| factor.enabled_at.is_some())
             .unwrap_or(false);
         let now = Utc::now();
-        let forced_step_up_reason = self
+        let forced_step_up_reason = match self
             .evaluate_login_risk_policy(&user.email, &user.id, mfa_enabled, &ctx, now)
-            .await?;
+            .await
+        {
+            Ok(reason) => reason,
+            Err(AuthError::RecoveryRequired) if matches!(ctx.auth_api_surface, AuthApiSurface::V2) => {
+                self.audit_passkey_login_rejected(
+                    "recovery_required",
+                    Some(user.id.as_str()),
+                    Some(flow_id),
+                    &ctx,
+                )
+                .await;
+                return Err(AuthError::RecoveryRequired);
+            }
+            Err(err) => return Err(err),
+        };
 
         self.login_abuse
             .register_success(&user.email, ctx.ip.as_deref())
@@ -1772,98 +1801,136 @@ impl AuthService {
             return Err(AuthError::Internal);
         }
 
-        let identifier = cmd.identifier.to_ascii_lowercase();
-        let now = Utc::now();
-        let subject_identifier_hash = self.refresh_crypto.hash_refresh_token(&identifier).await;
-        let account = v2.accounts.find_by_email(&identifier).await;
-        let legacy = if let Some(account) = account.as_ref() {
-            v2.legacy_passwords
-                .find_by_user_id(&account.id)
+        let mut audit_actor_user_id: Option<String> = None;
+        let mut audit_rollout_channel = auth_v2_rollout_channel_hint(ctx.client_id.as_deref());
+        let mut audit_fallback_policy: Option<String> = None;
+
+        let result = async {
+            let identifier = cmd.identifier.to_ascii_lowercase();
+            let now = Utc::now();
+            match self
+                .login_abuse
+                .check(&identifier, ctx.ip.as_deref(), now)
                 .await
-                .map_err(|_| AuthError::Internal)?
-        } else {
-            None
-        };
-        let rollout =
-            evaluate_auth_v2_rollout(&v2.config, cmd.client_id.as_deref(), legacy.as_ref());
-        let has_passkey = if let Some(account) = account.as_ref() {
-            !self.load_passkeys_for_user(&account.id).await?.is_empty()
-        } else {
-            false
-        };
-        let methods = build_auth_method_descriptors(
-            &v2.config,
-            cmd.supports_pake,
-            cmd.supports_passkeys,
-            has_passkey,
-        );
-        let recommended_method = recommend_auth_method(&methods);
-        let recommended_method_label = recommended_method
-            .as_ref()
-            .map(|method| auth_method_kind_label(method).to_string());
-        let discovery_token = self.refresh_crypto.generate_refresh_token().await;
-        let expires_at = now + Duration::seconds(self.mfa_challenge_ttl_seconds);
+            {
+                LoginGateDecision::Allowed => {}
+                LoginGateDecision::Locked { until } => {
+                    let retry_after_seconds = (until - now).num_seconds().max(1);
+                    return Err(AuthError::LoginLocked {
+                        retry_after_seconds,
+                    });
+                }
+            }
 
-        v2.auth_flows
-            .issue(AuthFlowRecord {
-                flow_id: discovery_token.clone(),
-                subject_user_id: account.as_ref().map(|record| record.id.clone()),
-                subject_identifier_hash: Some(subject_identifier_hash),
-                flow_kind: crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery,
-                protocol: "auth_v2_methods_v1".to_string(),
-                state: json!({
-                    "identifier": identifier,
-                    "supports_pake": cmd.supports_pake,
-                    "supports_passkeys": cmd.supports_passkeys,
-                    "client_id": cmd.client_id,
-                    "rollout_cohort": rollout.cohort.clone(),
-                    "serving_mode": rollout.serving_mode.as_str(),
-                }),
-                status: crate::modules::auth::domain::AuthFlowStatus::Pending,
-                rollout_channel: Some(rollout.cohort_label().to_string()),
-                fallback_policy: Some(rollout.fallback_policy.as_str().to_string()),
-                trace_id: Some(ctx.trace_id.clone()),
-                issued_ip: ctx.ip.clone(),
-                issued_user_agent: ctx.user_agent.clone(),
-                attempt_count: 0,
-                expires_at,
-                consumed_at: None,
-                created_at: now,
-                updated_at: now,
-            })
-            .await
-            .map_err(|_| AuthError::Internal)?;
+            let subject_identifier_hash = self.refresh_crypto.hash_refresh_token(&identifier).await;
+            let account = v2.accounts.find_by_email(&identifier).await;
+            audit_actor_user_id = account.as_ref().map(|record| record.id.clone());
+            let legacy = if let Some(account) = account.as_ref() {
+                v2.legacy_passwords
+                    .find_by_user_id(&account.id)
+                    .await
+                    .map_err(|_| AuthError::Internal)?
+            } else {
+                None
+            };
+            let rollout =
+                evaluate_auth_v2_rollout(&v2.config, cmd.client_id.as_deref(), legacy.as_ref());
+            audit_rollout_channel = rollout.cohort_label().to_string();
+            audit_fallback_policy = Some(rollout.fallback_policy.as_str().to_string());
+            let has_passkey = if let Some(account) = account.as_ref() {
+                !self.load_passkeys_for_user(&account.id).await?.is_empty()
+            } else {
+                false
+            };
+            let methods = build_auth_method_descriptors(
+                &v2.config,
+                cmd.supports_pake,
+                cmd.supports_passkeys,
+                has_passkey,
+            );
+            let recommended_method = recommend_auth_method(&methods);
+            let recommended_method_label = recommended_method
+                .as_ref()
+                .map(|method| auth_method_kind_label(method).to_string());
+            let discovery_token = self.refresh_crypto.generate_refresh_token().await;
+            let expires_at = now + Duration::seconds(self.mfa_challenge_ttl_seconds);
 
-        self.audit
-            .append(AuditEvent {
-                event_type: "auth.v2.methods.requested".to_string(),
-                actor_user_id: account.map(|record| record.id),
-                trace_id: ctx.trace_id.clone(),
-                metadata: json!({
-                    "methods": methods.iter().map(|method| auth_method_kind_label(&method.kind)).collect::<Vec<_>>(),
-                    "recommended_method": recommended_method_label.clone(),
-                    "rollout_channel": rollout.cohort_label(),
-                    "fallback_policy": rollout.fallback_policy.as_str(),
-                    "ip": ctx.ip,
-                    "user_agent": ctx.user_agent,
-                }),
-                created_at: now,
-            })
-            .await;
-
-        Ok(AuthMethodsResponse {
-            discovery_token,
-            methods: methods
-                .into_iter()
-                .map(|method| AuthMethodResponse {
-                    kind: auth_method_kind_label(&method.kind).to_string(),
-                    path: method.path,
+            v2.auth_flows
+                .issue(AuthFlowRecord {
+                    flow_id: discovery_token.clone(),
+                    subject_user_id: account.as_ref().map(|record| record.id.clone()),
+                    subject_identifier_hash: Some(subject_identifier_hash),
+                    flow_kind: crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery,
+                    protocol: "auth_v2_methods_v1".to_string(),
+                    state: json!({
+                        "identifier": identifier,
+                        "supports_pake": cmd.supports_pake,
+                        "supports_passkeys": cmd.supports_passkeys,
+                        "client_id": cmd.client_id,
+                        "rollout_cohort": rollout.cohort.clone(),
+                        "serving_mode": rollout.serving_mode.as_str(),
+                    }),
+                    status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                    rollout_channel: Some(rollout.cohort_label().to_string()),
+                    fallback_policy: Some(rollout.fallback_policy.as_str().to_string()),
+                    trace_id: Some(ctx.trace_id.clone()),
+                    issued_ip: ctx.ip.clone(),
+                    issued_user_agent: ctx.user_agent.clone(),
+                    attempt_count: 0,
+                    expires_at,
+                    consumed_at: None,
+                    created_at: now,
+                    updated_at: now,
                 })
-                .collect(),
-            account_recovery: build_account_recovery_response(),
-            recommended_method: recommended_method_label,
-            expires_in: self.mfa_challenge_ttl_seconds,
-        })
+                .await
+                .map_err(|_| AuthError::Internal)?;
+
+            self.audit
+                .append(AuditEvent {
+                    event_type: "auth.v2.methods.requested".to_string(),
+                    actor_user_id: account.map(|record| record.id),
+                    trace_id: ctx.trace_id.clone(),
+                    metadata: json!({
+                        "methods": methods.iter().map(|method| auth_method_kind_label(&method.kind)).collect::<Vec<_>>(),
+                        "recommended_method": recommended_method_label.clone(),
+                        "rollout_channel": rollout.cohort_label(),
+                        "fallback_policy": rollout.fallback_policy.as_str(),
+                        "ip": ctx.ip,
+                        "user_agent": ctx.user_agent,
+                    }),
+                    created_at: now,
+                })
+                .await;
+
+            Ok(AuthMethodsResponse {
+                discovery_token,
+                methods: methods
+                    .into_iter()
+                    .map(|method| AuthMethodResponse {
+                        kind: auth_method_kind_label(&method.kind).to_string(),
+                        path: method.path,
+                    })
+                    .collect(),
+                account_recovery: build_account_recovery_response(),
+                recommended_method: recommended_method_label,
+                expires_in: self.mfa_challenge_ttl_seconds,
+            })
+        }
+        .await;
+
+        if let Some(reason) = result.as_ref().err().map(auth_v2_error_reason) {
+            self.audit_auth_v2_methods_rejected(
+                reason,
+                audit_actor_user_id.as_deref(),
+                &audit_rollout_channel,
+                audit_fallback_policy.as_deref(),
+                &ctx,
+                Utc::now(),
+            )
+            .await;
+        }
+
+        result
     }
 
     pub async fn start_password_login_v2(
@@ -1897,22 +1964,25 @@ impl AuthService {
                 }
             }
 
-            let discovery = v2
-                .auth_flows
-                .consume(&cmd.discovery_token, now)
-                .await
-                .map_err(|_| AuthError::Internal)?;
-            let discovery_flow = match discovery {
-                crate::modules::auth::ports::AuthFlowConsumeState::Active(flow)
-                    if matches!(
-                        flow.flow_kind,
-                        crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery
-                    ) =>
-                {
-                    *flow
-                }
-                _ => return Err(AuthError::InvalidToken),
-            };
+            let discovery_flow = self
+                .consume_auth_flow_with_abuse_penalty(
+                    &cmd.discovery_token,
+                    crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery,
+                    &ctx,
+                    now,
+                    AuthError::InvalidToken,
+                )
+                .await?;
+            let discovery_identifier = discovery_flow
+                .state
+                .get("identifier")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(AuthError::InvalidToken)?;
+            if discovery_identifier != identifier {
+                self.apply_auth_flow_abuse_penalty(&discovery_flow, &ctx, now)
+                    .await;
+                return Err(AuthError::InvalidToken);
+            }
 
             let account = v2.accounts.find_by_email(&identifier).await;
             let opaque = if let Some(account) = account.as_ref() {
@@ -2243,7 +2313,9 @@ impl AuthService {
                 crate::modules::auth::domain::PasswordUpgradeContext::RecoveryBridge {
                     flow_id,
                 } => {
-                    let bridge = self.consume_recovery_upgrade_bridge(flow_id, now).await?;
+                    let bridge = self
+                        .consume_recovery_upgrade_bridge(flow_id, &ctx, now)
+                        .await?;
                     let account = v2
                         .accounts
                         .find_by_id(&bridge.user_id)
@@ -2673,25 +2745,18 @@ impl AuthService {
     async fn consume_recovery_upgrade_bridge(
         &self,
         flow_id: &str,
+        ctx: &RequestContext,
         now: chrono::DateTime<Utc>,
     ) -> Result<RecoveryUpgradeBridge, AuthError> {
-        let v2 = self.auth_v2.as_ref().ok_or(AuthError::Internal)?;
-        let flow = match v2
-            .auth_flows
-            .consume(flow_id, now)
-            .await
-            .map_err(|_| AuthError::Internal)?
-        {
-            crate::modules::auth::ports::AuthFlowConsumeState::Active(flow)
-                if matches!(
-                    flow.flow_kind,
-                    crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge
-                ) =>
-            {
-                *flow
-            }
-            _ => return Err(AuthError::InvalidRecoveryBridge),
-        };
+        let flow = self
+            .consume_auth_flow_with_abuse_penalty(
+                flow_id,
+                crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge,
+                ctx,
+                now,
+                AuthError::InvalidRecoveryBridge,
+            )
+            .await?;
 
         let user_id = flow
             .subject_user_id
@@ -2709,6 +2774,100 @@ impl AuthService {
             user_id,
             source,
         })
+    }
+
+    async fn consume_auth_flow_with_abuse_penalty(
+        &self,
+        flow_id: &str,
+        expected_kind: crate::modules::auth::domain::AuthFlowKind,
+        ctx: &RequestContext,
+        now: chrono::DateTime<Utc>,
+        invalid_error: AuthError,
+    ) -> Result<AuthFlowRecord, AuthError> {
+        let v2 = self.auth_v2.as_ref().ok_or(AuthError::Internal)?;
+        let flow_state = v2
+            .auth_flows
+            .consume(flow_id, now)
+            .await
+            .map_err(|_| AuthError::Internal)?;
+
+        match flow_state {
+            crate::modules::auth::ports::AuthFlowConsumeState::Active(flow)
+                if flow.flow_kind == expected_kind =>
+            {
+                Ok(*flow)
+            }
+            crate::modules::auth::ports::AuthFlowConsumeState::AlreadyConsumed
+            | crate::modules::auth::ports::AuthFlowConsumeState::Expired
+            | crate::modules::auth::ports::AuthFlowConsumeState::Cancelled => {
+                self.apply_auth_flow_abuse_penalty_by_lookup(flow_id, &expected_kind, ctx, now)
+                    .await;
+                Err(invalid_error)
+            }
+            _ => Err(invalid_error),
+        }
+    }
+
+    async fn apply_auth_flow_abuse_penalty_by_lookup(
+        &self,
+        flow_id: &str,
+        expected_kind: &crate::modules::auth::domain::AuthFlowKind,
+        ctx: &RequestContext,
+        now: chrono::DateTime<Utc>,
+    ) {
+        let Some(v2) = self.auth_v2.as_ref() else {
+            return;
+        };
+        let Ok(Some(flow)) = v2.auth_flows.lookup(flow_id).await else {
+            return;
+        };
+        if &flow.flow_kind != expected_kind {
+            return;
+        }
+
+        self.apply_auth_flow_abuse_penalty(&flow, ctx, now).await;
+    }
+
+    async fn apply_auth_flow_abuse_penalty(
+        &self,
+        flow: &AuthFlowRecord,
+        ctx: &RequestContext,
+        now: chrono::DateTime<Utc>,
+    ) {
+        let Some(v2) = self.auth_v2.as_ref() else {
+            return;
+        };
+        let _ = v2.auth_flows.increment_attempts(&flow.flow_id, now).await;
+
+        match flow.flow_kind {
+            crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery => {
+                let Some(identifier) = flow
+                    .state
+                    .get("identifier")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    return;
+                };
+                self.try_lock_login_for_auth_flow_abuse(identifier, ctx.ip.as_deref(), ctx, now)
+                    .await;
+            }
+            crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge => {
+                let Some(user_id) = flow.subject_user_id.as_deref() else {
+                    return;
+                };
+                let Some(account) = v2.accounts.find_by_id(user_id).await else {
+                    return;
+                };
+                self.try_lock_login_for_auth_flow_abuse(
+                    &account.email,
+                    ctx.ip.as_deref(),
+                    ctx,
+                    now,
+                )
+                .await;
+            }
+            _ => {}
+        }
     }
 
     async fn evaluate_login_risk_policy(
@@ -3551,6 +3710,32 @@ impl AuthService {
             .await;
     }
 
+    async fn audit_auth_v2_methods_rejected(
+        &self,
+        reason: &str,
+        actor_user_id: Option<&str>,
+        rollout_channel: &str,
+        fallback_policy: Option<&str>,
+        ctx: &RequestContext,
+        now: chrono::DateTime<Utc>,
+    ) {
+        self.audit
+            .append(AuditEvent {
+                event_type: "auth.v2.methods.rejected".to_string(),
+                actor_user_id: actor_user_id.map(str::to_string),
+                trace_id: ctx.trace_id.clone(),
+                metadata: json!({
+                    "reason": reason,
+                    "rollout_channel": rollout_channel,
+                    "fallback_policy": fallback_policy,
+                    "ip": ctx.ip,
+                    "user_agent": ctx.user_agent,
+                }),
+                created_at: now,
+            })
+            .await;
+    }
+
     async fn audit_login_rejected(
         &self,
         reason: &str,
@@ -3576,7 +3761,7 @@ impl AuthService {
         ctx: &RequestContext,
         now: chrono::DateTime<Utc>,
     ) {
-        self.apply_login_failure_penalty(email, source_ip, 1, ctx, now)
+        self.apply_login_penalty(email, source_ip, 1, ctx, now)
             .await;
     }
 
@@ -3591,11 +3776,28 @@ impl AuthService {
         let (profile, penalty_units) = login_risk_penalty_profile(reason);
         crate::observability::record_login_risk_penalty(profile, reason, penalty_units as u64);
 
-        self.apply_login_failure_penalty(email, source_ip, penalty_units, ctx, now)
+        self.apply_login_penalty(email, source_ip, penalty_units, ctx, now)
             .await;
     }
 
-    async fn apply_login_failure_penalty(
+    async fn try_lock_login_for_auth_flow_abuse(
+        &self,
+        email: &str,
+        source_ip: Option<&str>,
+        ctx: &RequestContext,
+        now: chrono::DateTime<Utc>,
+    ) {
+        let penalty_units = self
+            .auth_v2
+            .as_ref()
+            .map(|v2| v2.config.auth_flow_abuse_penalty_units)
+            .unwrap_or(1);
+
+        self.apply_login_penalty(email, source_ip, penalty_units, ctx, now)
+            .await;
+    }
+
+    async fn apply_login_penalty(
         &self,
         email: &str,
         source_ip: Option<&str>,
@@ -4110,7 +4312,8 @@ mod tests {
 
     use crate::{
         adapters::inmemory::{
-            InMemoryAdapters, InMemoryAuditRepository, JwtEdDsaService, RefreshCryptoHmacService,
+            InMemoryAdapters, InMemoryAuditRepository, InMemoryPasskeyChallengeRepository,
+            JwtEdDsaService, RefreshCryptoHmacService,
         },
         adapters::passkey::WebauthnPasskeyService,
         config::{
@@ -4121,14 +4324,15 @@ mod tests {
             auth::domain::{
                 AccountRecord, AccountStatus, AuthFlowRecord, AuthFlowStatus, LegacyPasswordRecord,
                 OpaqueCredentialRecord, OpaqueCredentialState, PasswordResetTokenRecord,
+                RecoveryBridgeSource,
             },
             auth::ports::{
                 AccountRepository, AuthFlowConsumeState, AuthFlowRepository,
                 LegacyPasswordRepository, LoginRiskAnalyzer, LoginRiskDecision,
                 OpaqueCredentialRepository, PakeFinishResult, PakeLoginCredentialView,
                 PakeStartRequest, PakeStartResult, PasskeyAuthenticationChallengeRecord,
-                PasskeyRegistrationChallengeRecord, PasskeyService, PasswordPakeService,
-                UserRepository,
+                PasskeyChallengeRepository, PasskeyRegistrationChallengeRecord,
+                PasskeyService, PasswordPakeService, UserRepository,
             },
             tokens::{domain::RefreshTokenRecord, ports::RefreshRotationState},
         },
@@ -4150,7 +4354,7 @@ mod tests {
         service: AuthService,
         users: Arc<dyn UserRepository>,
         passkeys: Arc<dyn crate::modules::auth::ports::PasskeyCredentialRepository>,
-        passkey_challenges: Arc<dyn crate::modules::auth::ports::PasskeyChallengeRepository>,
+        passkey_challenges: Arc<InMemoryPasskeyChallengeRepository>,
         audit: Arc<InMemoryAuditRepository>,
         bootstrap_email: String,
         bootstrap_password: String,
@@ -4436,6 +4640,15 @@ mod tests {
                 .map_err(|_| "flow lock unavailable".to_string())?
                 .insert(flow.flow_id.clone(), flow);
             Ok(())
+        }
+
+        async fn lookup(&self, flow_id: &str) -> Result<Option<AuthFlowRecord>, String> {
+            Ok(self
+                .flows
+                .lock()
+                .map_err(|_| "flow lock unavailable".to_string())?
+                .get(flow_id)
+                .cloned())
         }
 
         async fn consume(
@@ -5773,6 +5986,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discover_auth_methods_v2_locked_request_emits_rejected_audit_reason() {
+        let harness = build_harness();
+        let service = harness
+            .service
+            .clone()
+            .with_v2(build_v2_dependencies(&harness).await);
+
+        for attempt in 0..5 {
+            let result = harness
+                .service
+                .login(
+                    LoginCommand {
+                        email: harness.bootstrap_email.clone(),
+                        password: "definitely-wrong-password".to_string(),
+                        device_info: Some(format!("methods-lockout-{attempt}")),
+                    },
+                    test_context(&format!("methods-lockout-{attempt}")),
+                )
+                .await;
+            assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+        }
+
+        let result = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: true,
+                    supports_pake: true,
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-methods-locked-audit")
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::LoginLocked { .. })));
+
+        let audit_events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit storage should be available");
+        let event = audit_events
+            .iter()
+            .find(|event| {
+                event.event_type == "auth.v2.methods.rejected"
+                    && event.trace_id == "v2-methods-locked-audit"
+            })
+            .expect("v2 methods rejected audit should exist");
+
+        assert_eq!(event.metadata["reason"], "login_locked");
+        assert!(event.metadata["fallback_policy"].is_null());
+        assert!(!event.metadata["rollout_channel"].is_null());
+    }
+
+    #[tokio::test]
+    async fn passkey_login_start_v2_invalid_discovery_token_emits_v2_rejected_audit_reason() {
+        let mut harness = build_harness();
+        enable_passkey_for_harness(&mut harness);
+        let service = harness
+            .service
+            .clone()
+            .with_v2(build_v2_dependencies(&harness).await);
+
+        let result = service
+            .passkey_login_start_v2(
+                &harness.bootstrap_email,
+                "missing-discovery-token",
+                RequestContext {
+                    auth_api_surface: AuthApiSurface::V2,
+                    client_id: Some("web".to_string()),
+                    ..test_context("passkey-login-start-v2-invalid-token")
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::InvalidToken)));
+
+        let events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit lock should be available");
+        let event = events
+            .iter()
+            .find(|event| {
+                event.event_type == "auth.v2.passkey.login.rejected"
+                    && event.trace_id == "passkey-login-start-v2-invalid-token"
+            })
+            .expect("v2 passkey start rejected audit should exist");
+
+        assert_eq!(event.metadata["reason"], "invalid_token");
+        assert!(event.metadata["flow_id"].is_null());
+        assert_eq!(event.metadata["fallback_policy"], "disabled");
+        assert!(!event.metadata["rollout_channel"].is_null());
+    }
+
+    #[tokio::test]
+    async fn passkey_login_start_v2_locked_request_does_not_issue_a_challenge() {
+        let mut harness = build_harness();
+        enable_passkey_for_harness(&mut harness);
+        let service = harness
+            .service
+            .clone()
+            .with_v2(build_v2_dependencies(&harness).await);
+
+        let discovery = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: true,
+                    supports_pake: false,
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-passkey-locked-no-challenge-discovery")
+                },
+            )
+            .await
+            .expect("v2 methods should succeed");
+
+        for attempt in 0..5 {
+            let result = harness
+                .service
+                .login(
+                    LoginCommand {
+                        email: harness.bootstrap_email.clone(),
+                        password: "definitely-wrong-password".to_string(),
+                        device_info: Some(format!("passkey-locked-no-challenge-{attempt}")),
+                    },
+                    test_context(&format!("passkey-locked-no-challenge-{attempt}")),
+                )
+                .await;
+            assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+        }
+
+        let result = service
+            .passkey_login_start_v2(
+                &harness.bootstrap_email,
+                &discovery.discovery_token,
+                RequestContext {
+                    auth_api_surface: AuthApiSurface::V2,
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-passkey-locked-no-challenge-start")
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::LoginLocked { .. })));
+        assert!(!harness
+            .passkey_challenges
+            .has_authentication_challenge(&discovery.discovery_token));
+    }
+
+    #[tokio::test]
     async fn passkey_login_finish_v2_success_emits_v2_success_audit_event() {
         let mut harness = build_harness();
         enable_successful_finish_passkey_for_harness(&mut harness);
@@ -5821,6 +6192,81 @@ mod tests {
         assert!(!event.metadata["challenge_created_at"].is_null());
         assert_eq!(event.metadata["fallback_policy"], "disabled");
         assert!(!event.metadata["rollout_channel"].is_null());
+    }
+
+    #[tokio::test]
+    async fn passkey_login_finish_v2_recovery_required_emits_v2_rejected_audit_reason() {
+        let harness = build_harness_with_login_risk(Arc::new(IpChallengeLoginRiskAnalyzer));
+        let mut passkey_harness = harness;
+        enable_successful_finish_passkey_for_harness(&mut passkey_harness);
+        let service = passkey_harness
+            .service
+            .clone()
+            .with_v2(build_v2_dependencies(&passkey_harness).await);
+        let user = passkey_harness
+            .users
+            .find_by_email(&passkey_harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+        passkey_harness
+            .passkeys
+            .upsert_for_user(&user.id, dummy_passkey(), Utc::now())
+            .await
+            .expect("dummy passkey should be inserted");
+
+        let discovery = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: passkey_harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: true,
+                    supports_pake: false,
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ip: Some("198.51.100.10".to_string()),
+                    ..test_context("v2-passkey-recovery-audit-discovery")
+                },
+            )
+            .await
+            .expect("v2 methods should succeed");
+
+        let start = service
+            .passkey_login_start_v2(
+                &passkey_harness.bootstrap_email,
+                &discovery.discovery_token,
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ip: Some("198.51.100.10".to_string()),
+                    auth_api_surface: AuthApiSurface::V2,
+                    ..test_context("v2-passkey-recovery-audit-start")
+                },
+            )
+            .await
+            .expect("v2 passkey start should succeed");
+
+        let result = service
+            .passkey_login_finish(
+                &start.flow_id,
+                successful_passkey_login_credential(),
+                Some("risk-device".to_string()),
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ip: Some("198.51.100.10".to_string()),
+                    auth_api_surface: AuthApiSurface::V2,
+                    ..test_context("v2-passkey-recovery-audit-finish")
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::RecoveryRequired)));
+        assert_v2_passkey_audit(
+            &passkey_harness,
+            "auth.v2.passkey.login.rejected",
+            "recovery_required",
+            &start.flow_id,
+            "v2-passkey-recovery-audit-finish",
+        );
     }
 
     #[tokio::test]
@@ -6112,6 +6558,570 @@ mod tests {
         assert!(matches!(result, Err(AuthError::RecoveryRequired)));
     }
 
+    #[tokio::test]
+    async fn start_password_login_v2_replayed_discovery_token_applies_abuse_penalty() {
+        let harness = build_harness();
+        let auth_flows = Arc::new(StaticAuthFlowRepository::new());
+        let mut dependencies = build_v2_dependencies(&harness).await;
+        dependencies.auth_flows = auth_flows.clone();
+        dependencies.config.auth_flow_abuse_penalty_units = 5;
+        let service = harness.service.clone().with_v2(dependencies);
+
+        let discovery = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: false,
+                    supports_pake: true,
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-discovery-replay-abuse")
+                },
+            )
+            .await
+            .expect("v2 discovery should succeed");
+
+        service
+            .start_password_login_v2(
+                PakeLoginStartCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    discovery_token: discovery.discovery_token.clone(),
+                    request: json!({"opaque_message": "client-hello"}),
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-start-replay-abuse-first")
+                },
+            )
+            .await
+            .expect("first password start should succeed");
+
+        let replay = service
+            .start_password_login_v2(
+                PakeLoginStartCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    discovery_token: discovery.discovery_token.clone(),
+                    request: json!({"opaque_message": "client-hello"}),
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-start-replay-abuse-second")
+                },
+            )
+            .await;
+
+        assert!(matches!(replay, Err(AuthError::InvalidToken)));
+        let replayed_flow = auth_flows
+            .peek(&discovery.discovery_token)
+            .expect("discovery flow should remain inspectable");
+        assert_eq!(replayed_flow.attempt_count, 1);
+
+        let locked_discovery = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: false,
+                    supports_pake: true,
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-discovery-replay-abuse-follow-up")
+                },
+            )
+            .await;
+
+        assert!(matches!(locked_discovery, Err(AuthError::LoginLocked { .. })));
+    }
+
+    #[tokio::test]
+    async fn start_password_login_v2_identifier_mismatch_applies_abuse_penalty() {
+        let harness = build_harness();
+        let auth_flows = Arc::new(StaticAuthFlowRepository::new());
+        let mut dependencies = build_v2_dependencies(&harness).await;
+        dependencies.auth_flows = auth_flows.clone();
+        dependencies.config.auth_flow_abuse_penalty_units = 5;
+        let service = harness.service.clone().with_v2(dependencies);
+
+        let discovery = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: false,
+                    supports_pake: true,
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-discovery-mismatch-abuse")
+                },
+            )
+            .await
+            .expect("v2 discovery should succeed");
+
+        let mismatch = service
+            .start_password_login_v2(
+                PakeLoginStartCommand {
+                    identifier: "other-user@example.com".to_string(),
+                    discovery_token: discovery.discovery_token.clone(),
+                    request: json!({"opaque_message": "client-hello"}),
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-start-mismatch-abuse")
+                },
+            )
+            .await;
+
+        assert!(matches!(mismatch, Err(AuthError::InvalidToken)));
+        let mismatched_flow = auth_flows
+            .peek(&discovery.discovery_token)
+            .expect("discovery flow should remain inspectable");
+        assert_eq!(mismatched_flow.attempt_count, 1);
+
+        let locked_discovery = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: false,
+                    supports_pake: true,
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-discovery-mismatch-abuse-follow-up")
+                },
+            )
+            .await;
+
+        assert!(matches!(locked_discovery, Err(AuthError::LoginLocked { .. })));
+    }
+
+    #[tokio::test]
+    async fn start_password_upgrade_v2_replayed_recovery_bridge_applies_abuse_penalty() {
+        let harness = build_harness();
+        let auth_flows = Arc::new(StaticAuthFlowRepository::new());
+        let mut dependencies = build_v2_dependencies_with_options(&harness, true, false).await;
+        dependencies.auth_flows = auth_flows.clone();
+        dependencies.config.auth_flow_abuse_penalty_units = 5;
+        let service = harness.service.clone().with_v2(dependencies);
+        let user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+        let now = Utc::now();
+
+        auth_flows
+            .issue(AuthFlowRecord {
+                flow_id: "bridge-replay-abuse".to_string(),
+                subject_user_id: Some(user.id.clone()),
+                subject_identifier_hash: None,
+                flow_kind: crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge,
+                protocol: "recovery_upgrade_bridge_v1".to_string(),
+                state: json!({
+                    "source": RecoveryBridgeSource::PasswordReset,
+                }),
+                status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                rollout_channel: Some("canary_web".to_string()),
+                fallback_policy: Some("disabled".to_string()),
+                trace_id: Some("bridge-replay-abuse".to_string()),
+                issued_ip: Some("127.0.0.1".to_string()),
+                issued_user_agent: Some("unit-test".to_string()),
+                attempt_count: 0,
+                expires_at: now + Duration::seconds(300),
+                consumed_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("recovery bridge should be stored");
+
+        service
+            .start_password_upgrade_v2(
+                PasswordUpgradeStartCommand {
+                    user_id: None,
+                    context: crate::modules::auth::domain::PasswordUpgradeContext::RecoveryBridge {
+                        flow_id: "bridge-replay-abuse".to_string(),
+                    },
+                    request: json!({"platform": "web", "supports_pake": true}),
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("bridge-replay-abuse-first")
+                },
+            )
+            .await
+            .expect("first recovery bridge consumption should succeed");
+
+        let replay = service
+            .start_password_upgrade_v2(
+                PasswordUpgradeStartCommand {
+                    user_id: None,
+                    context: crate::modules::auth::domain::PasswordUpgradeContext::RecoveryBridge {
+                        flow_id: "bridge-replay-abuse".to_string(),
+                    },
+                    request: json!({"platform": "web", "supports_pake": true}),
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("bridge-replay-abuse-second")
+                },
+            )
+            .await;
+
+        assert!(matches!(replay, Err(AuthError::InvalidRecoveryBridge)));
+        let replayed_bridge = auth_flows
+            .peek("bridge-replay-abuse")
+            .expect("recovery bridge should remain inspectable");
+        assert_eq!(replayed_bridge.attempt_count, 1);
+
+        let locked = harness
+            .service
+            .login(
+                LoginCommand {
+                    email: harness.bootstrap_email.clone(),
+                    password: harness.bootstrap_password.clone(),
+                    device_info: Some("risk-abuse-login-check".to_string()),
+                },
+                test_context("bridge-replay-abuse-login-locked"),
+            )
+            .await;
+
+        assert!(matches!(locked, Err(AuthError::LoginLocked { .. })));
+    }
+
+    #[tokio::test]
+    async fn passkey_login_start_v2_replayed_discovery_token_applies_abuse_penalty() {
+        let mut harness = build_harness();
+        enable_passkey_for_harness(&mut harness);
+        let auth_flows = Arc::new(StaticAuthFlowRepository::new());
+        let mut dependencies = build_v2_dependencies(&harness).await;
+        dependencies.auth_flows = auth_flows.clone();
+        dependencies.config.auth_flow_abuse_penalty_units = 5;
+        let service = harness.service.clone().with_v2(dependencies);
+        let user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+        harness
+            .passkeys
+            .upsert_for_user(&user.id, dummy_passkey(), Utc::now())
+            .await
+            .expect("dummy passkey should be inserted");
+
+        let discovery = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: true,
+                    supports_pake: false,
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-passkey-discovery-replay-abuse")
+                },
+            )
+            .await
+            .expect("v2 methods should succeed");
+
+        service
+            .passkey_login_start_v2(
+                &harness.bootstrap_email,
+                &discovery.discovery_token,
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    auth_api_surface: AuthApiSurface::V2,
+                    ..test_context("v2-passkey-start-replay-abuse-first")
+                },
+            )
+            .await
+            .expect("first passkey login start should succeed");
+
+        let replay = service
+            .passkey_login_start_v2(
+                &harness.bootstrap_email,
+                &discovery.discovery_token,
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    auth_api_surface: AuthApiSurface::V2,
+                    ..test_context("v2-passkey-start-replay-abuse-second")
+                },
+            )
+            .await;
+
+        assert!(matches!(replay, Err(AuthError::InvalidToken)));
+        let replayed_flow = auth_flows
+            .peek(&discovery.discovery_token)
+            .expect("discovery flow should remain inspectable");
+        assert_eq!(replayed_flow.attempt_count, 1);
+
+        let locked_discovery = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: true,
+                    supports_pake: false,
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-passkey-discovery-replay-abuse-follow-up")
+                },
+            )
+            .await;
+
+        assert!(matches!(locked_discovery, Err(AuthError::LoginLocked { .. })));
+    }
+
+    #[tokio::test]
+    async fn finish_password_login_v2_success_resets_login_abuse_counter() {
+        let harness = build_harness();
+        let service = harness
+            .service
+            .clone()
+            .with_v2(build_v2_dependencies(&harness).await);
+
+        for attempt in 0..4 {
+            let result = harness
+                .service
+                .login(
+                    LoginCommand {
+                        email: harness.bootstrap_email.clone(),
+                        password: "definitely-wrong-password".to_string(),
+                        device_info: Some(format!("pre-v2-reset-{attempt}")),
+                    },
+                    test_context(&format!("pre-v2-password-reset-{attempt}")),
+                )
+                .await;
+            assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+        }
+
+        let discovery = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: false,
+                    supports_pake: true,
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-password-reset-discovery")
+                },
+            )
+            .await
+            .expect("v2 methods should succeed");
+        let start = service
+            .start_password_login_v2(
+                PakeLoginStartCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    discovery_token: discovery.discovery_token,
+                    request: json!({"opaque_message": "client-hello"}),
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-password-reset-start")
+                },
+            )
+            .await
+            .expect("v2 password login start should succeed");
+        let result = service
+            .finish_password_login_v2(
+                PakeLoginFinishCommand {
+                    flow_id: start.flow_id.clone(),
+                    client_message: json!({"opaque_message": format!("ok:{}", start.flow_id)}),
+                    device_info: Some("reset-check".to_string()),
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-password-reset-finish")
+                },
+            )
+            .await
+            .expect("v2 password login finish should succeed");
+        assert!(matches!(result, LoginResult::Authenticated { .. }));
+
+        for attempt in 0..2 {
+            let result = harness
+                .service
+                .login(
+                    LoginCommand {
+                        email: harness.bootstrap_email.clone(),
+                        password: "definitely-wrong-password".to_string(),
+                        device_info: Some(format!("post-v2-reset-{attempt}")),
+                    },
+                    test_context(&format!("post-v2-password-reset-{attempt}")),
+                )
+                .await;
+            assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+        }
+    }
+
+    #[tokio::test]
+    async fn passkey_login_finish_v2_success_resets_login_abuse_counter() {
+        let mut harness = build_harness();
+        enable_successful_finish_passkey_for_harness(&mut harness);
+        let service = harness
+            .service
+            .clone()
+            .with_v2(build_v2_dependencies(&harness).await);
+        let user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+        harness
+            .passkeys
+            .upsert_for_user(&user.id, dummy_passkey(), Utc::now())
+            .await
+            .expect("dummy passkey should be inserted");
+
+        for attempt in 0..4 {
+            let result = harness
+                .service
+                .login(
+                    LoginCommand {
+                        email: harness.bootstrap_email.clone(),
+                        password: "definitely-wrong-password".to_string(),
+                        device_info: Some(format!("pre-v2-passkey-reset-{attempt}")),
+                    },
+                    test_context(&format!("pre-v2-passkey-reset-{attempt}")),
+                )
+                .await;
+            assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+        }
+
+        let discovery = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: true,
+                    supports_pake: false,
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-passkey-reset-discovery")
+                },
+            )
+            .await
+            .expect("v2 methods should succeed");
+        let start = service
+            .passkey_login_start_v2(
+                &harness.bootstrap_email,
+                &discovery.discovery_token,
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    auth_api_surface: AuthApiSurface::V2,
+                    ..test_context("v2-passkey-reset-start")
+                },
+            )
+            .await
+            .expect("v2 passkey login start should succeed");
+        let result = service
+            .passkey_login_finish(
+                &start.flow_id,
+                successful_passkey_login_credential(),
+                Some("reset-check".to_string()),
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    auth_api_surface: AuthApiSurface::V2,
+                    ..test_context("v2-passkey-reset-finish")
+                },
+            )
+            .await
+            .expect("v2 passkey login finish should succeed");
+        assert!(matches!(result, LoginResult::Authenticated { .. }));
+
+        for attempt in 0..2 {
+            let result = harness
+                .service
+                .login(
+                    LoginCommand {
+                        email: harness.bootstrap_email.clone(),
+                        password: "definitely-wrong-password".to_string(),
+                        device_info: Some(format!("post-v2-passkey-reset-{attempt}")),
+                    },
+                    test_context(&format!("post-v2-passkey-reset-{attempt}")),
+                )
+                .await;
+            assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+        }
+    }
+
+    #[tokio::test]
+    async fn passkey_login_finish_v2_returns_recovery_required_when_risk_step_up_lacks_mfa() {
+        let harness = build_harness_with_login_risk(Arc::new(IpChallengeLoginRiskAnalyzer));
+        let mut passkey_harness = harness;
+        enable_successful_finish_passkey_for_harness(&mut passkey_harness);
+        let service = passkey_harness
+            .service
+            .clone()
+            .with_v2(build_v2_dependencies(&passkey_harness).await);
+        let user = passkey_harness
+            .users
+            .find_by_email(&passkey_harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+        passkey_harness
+            .passkeys
+            .upsert_for_user(&user.id, dummy_passkey(), Utc::now())
+            .await
+            .expect("dummy passkey should be inserted");
+
+        let discovery = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: passkey_harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: true,
+                    supports_pake: false,
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ip: Some("198.51.100.10".to_string()),
+                    ..test_context("v2-passkey-methods-risk-recovery-required")
+                },
+            )
+            .await
+            .expect("v2 methods should succeed");
+
+        let start = service
+            .passkey_login_start_v2(
+                &passkey_harness.bootstrap_email,
+                &discovery.discovery_token,
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ip: Some("198.51.100.10".to_string()),
+                    auth_api_surface: AuthApiSurface::V2,
+                    ..test_context("v2-passkey-start-risk-recovery-required")
+                },
+            )
+            .await
+            .expect("v2 passkey login start should succeed");
+
+        let result = service
+            .passkey_login_finish(
+                &start.flow_id,
+                successful_passkey_login_credential(),
+                Some("risk-device".to_string()),
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ip: Some("198.51.100.10".to_string()),
+                    auth_api_surface: AuthApiSurface::V2,
+                    ..test_context("v2-passkey-finish-risk-recovery-required")
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::RecoveryRequired)));
+    }
+
     #[test]
     fn login_risk_penalty_profiles_are_stable() {
         assert_eq!(
@@ -6137,6 +7147,41 @@ mod tests {
         assert_eq!(
             super::login_risk_penalty_profile("unknown_reason"),
             ("standard", 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_flow_abuse_penalty_uses_configured_units() {
+        let harness = build_harness();
+        let mut dependencies = build_v2_dependencies(&harness).await;
+        dependencies.config.auth_flow_abuse_penalty_units = 5;
+        let service = harness.service.clone().with_v2(dependencies);
+
+        service
+            .try_lock_login_for_auth_flow_abuse(
+                &harness.bootstrap_email,
+                Some("127.0.0.1"),
+                &test_context("v2-auth-flow-abuse-penalty"),
+                Utc::now(),
+            )
+            .await;
+
+        let audit_events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit storage should be available");
+        let event = audit_events
+            .iter()
+            .find(|event| {
+                event.event_type == "auth.login.locked"
+                    && event.trace_id == "v2-auth-flow-abuse-penalty"
+            })
+            .expect("configured auth-flow abuse penalty should lock immediately");
+
+        assert_eq!(
+            event.metadata.get("email"),
+            Some(&json!(harness.bootstrap_email.clone()))
         );
     }
 
@@ -7228,6 +8273,7 @@ mod tests {
                 opaque_server_key_ref: None,
                 passkey_namespace_enabled: true,
                 auth_flows_enabled: true,
+                auth_flow_abuse_penalty_units: 1,
                 legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
                 client_allowlist: vec!["canary_web".to_string()],
                 shadow_audit_only: false,
@@ -7332,6 +8378,7 @@ mod tests {
             opaque_server_key_ref: None,
             passkey_namespace_enabled: true,
             auth_flows_enabled: true,
+            auth_flow_abuse_penalty_units: 1,
             legacy_fallback_mode,
             client_allowlist: vec!["canary_web".to_string()],
             shadow_audit_only: false,
@@ -7737,6 +8784,7 @@ mod tests {
                 opaque_server_key_ref: None,
                 passkey_namespace_enabled: true,
                 auth_flows_enabled: true,
+                auth_flow_abuse_penalty_units: 1,
                 legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
                 client_allowlist: vec!["canary_web".to_string()],
                 shadow_audit_only: false,
@@ -7985,6 +9033,7 @@ mod tests {
                 opaque_server_key_ref: None,
                 passkey_namespace_enabled: true,
                 auth_flows_enabled: true,
+                auth_flow_abuse_penalty_units: 1,
                 legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
                 client_allowlist: vec!["canary_web".to_string()],
                 shadow_audit_only: false,
@@ -8050,7 +9099,8 @@ mod tests {
             as Arc<dyn crate::modules::auth::ports::MfaBackupCodeRepository>;
         let passkeys = Arc::new(adapters.passkeys)
             as Arc<dyn crate::modules::auth::ports::PasskeyCredentialRepository>;
-        let passkey_challenges = Arc::new(adapters.passkey_challenges)
+        let passkey_challenges = Arc::new(adapters.passkey_challenges);
+        let passkey_challenge_repo = passkey_challenges.clone()
             as Arc<dyn crate::modules::auth::ports::PasskeyChallengeRepository>;
         let sessions = Arc::new(adapters.sessions)
             as Arc<dyn crate::modules::sessions::ports::SessionRepository>;
@@ -8082,7 +9132,7 @@ mod tests {
             mfa_challenges,
             mfa_backup_codes,
             passkeys.clone(),
-            passkey_challenges.clone(),
+            passkey_challenge_repo,
             sessions,
             refresh_tokens,
             audit,
@@ -8138,6 +9188,7 @@ mod tests {
                 opaque_server_key_ref: None,
                 passkey_namespace_enabled: false,
                 auth_flows_enabled: false,
+                auth_flow_abuse_penalty_units: 1,
                 legacy_fallback_mode: crate::config::AuthV2LegacyFallbackMode::Disabled,
                 client_allowlist: Vec::new(),
                 shadow_audit_only: false,
