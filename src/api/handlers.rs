@@ -4300,8 +4300,11 @@ mod tests {
             "https://example.com/problems/invalid-recovery-bridge"
         );
 
-        let metrics_payload =
-            metrics_payload(&harness, "handler-v2-password-upgrade-invalid-bridge-metrics").await;
+        let metrics_payload = metrics_payload(
+            &harness,
+            "handler-v2-password-upgrade-invalid-bridge-metrics",
+        )
+        .await;
         assert!(metrics_payload.contains("auth_v2_password_rejected_total"));
         assert!(metrics_payload.contains("reason=\"invalid_recovery_bridge\""));
     }
@@ -4531,7 +4534,8 @@ mod tests {
 
     #[tokio::test]
     async fn password_login_finish_v2_handler_returns_recovery_required_problem_contract() {
-        let harness = build_v2_harness_with_login_risk(Arc::new(IpChallengeLoginRiskAnalyzer)).await;
+        let harness =
+            build_v2_harness_with_login_risk(Arc::new(IpChallengeLoginRiskAnalyzer)).await;
 
         let discovery = super::auth_methods_v2(
             State(harness.state.clone()),
@@ -4595,7 +4599,8 @@ mod tests {
             "https://example.com/problems/recovery-required"
         );
 
-        let metrics_payload = metrics_payload(&harness, "handler-v2-recovery-required-metrics").await;
+        let metrics_payload =
+            metrics_payload(&harness, "handler-v2-recovery-required-metrics").await;
         assert!(metrics_payload.contains("auth_v2_password_rejected_total"));
         assert!(metrics_payload.contains("reason=\"recovery_required\""));
     }

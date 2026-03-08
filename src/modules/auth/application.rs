@@ -1631,7 +1631,9 @@ impl AuthService {
             .await
         {
             Ok(reason) => reason,
-            Err(AuthError::RecoveryRequired) if matches!(ctx.auth_api_surface, AuthApiSurface::V2) => {
+            Err(AuthError::RecoveryRequired)
+                if matches!(ctx.auth_api_surface, AuthApiSurface::V2) =>
+            {
                 self.audit_passkey_login_rejected(
                     "recovery_required",
                     Some(user.id.as_str()),
@@ -4331,8 +4333,8 @@ mod tests {
                 LegacyPasswordRepository, LoginRiskAnalyzer, LoginRiskDecision,
                 OpaqueCredentialRepository, PakeFinishResult, PakeLoginCredentialView,
                 PakeStartRequest, PakeStartResult, PasskeyAuthenticationChallengeRecord,
-                PasskeyChallengeRepository, PasskeyRegistrationChallengeRecord,
-                PasskeyService, PasswordPakeService, UserRepository,
+                PasskeyChallengeRepository, PasskeyRegistrationChallengeRecord, PasskeyService,
+                PasswordPakeService, UserRepository,
             },
             tokens::{domain::RefreshTokenRecord, ports::RefreshRotationState},
         },
@@ -6633,7 +6635,10 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(locked_discovery, Err(AuthError::LoginLocked { .. })));
+        assert!(matches!(
+            locked_discovery,
+            Err(AuthError::LoginLocked { .. })
+        ));
     }
 
     #[tokio::test]
@@ -6696,7 +6701,10 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(locked_discovery, Err(AuthError::LoginLocked { .. })));
+        assert!(matches!(
+            locked_discovery,
+            Err(AuthError::LoginLocked { .. })
+        ));
     }
 
     #[tokio::test]
@@ -6875,7 +6883,10 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(locked_discovery, Err(AuthError::LoginLocked { .. })));
+        assert!(matches!(
+            locked_discovery,
+            Err(AuthError::LoginLocked { .. })
+        ));
     }
 
     #[tokio::test]
