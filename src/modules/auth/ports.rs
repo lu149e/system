@@ -11,7 +11,7 @@ use webauthn_rs::prelude::{
 use crate::modules::auth::domain::{
     AccountRecord, AuthFlowRecord, EmailOutboxMessage, EmailOutboxPayload, EmailTemplate,
     LegacyPasswordRecord, MfaChallengeRecord, MfaFactorRecord, OpaqueCredentialRecord,
-    PasswordResetTokenRecord, User, VerificationTokenRecord,
+    PasswordResetTokenRecord, RecoveryBridgeSource, User, VerificationTokenRecord,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,6 +67,11 @@ pub trait LegacyPasswordRepository: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<(), String>;
     async fn mark_verified(&self, user_id: &str, now: DateTime<Utc>) -> Result<(), String>;
+    async fn mark_upgraded_to_opaque(
+        &self,
+        user_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), String>;
     async fn set_legacy_login_allowed(
         &self,
         user_id: &str,
@@ -134,6 +139,19 @@ pub struct AuthMethodDescriptor {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
+pub enum AccountRecoveryKind {
+    PasswordReset,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct AccountRecoveryDescriptor {
+    pub kind: AccountRecoveryKind,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct AuthMethodDiscoveryRequest {
     pub identifier: String,
     pub client_id: Option<String>,
@@ -147,6 +165,26 @@ pub struct AuthMethodDiscoveryResult {
     pub discovery_token: String,
     pub recommended_method: Option<AuthMethodKind>,
     pub methods: Vec<AuthMethodDescriptor>,
+    pub account_recovery: Option<AccountRecoveryDescriptor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct RecoveryBridgeProvenance {
+    pub bridge_flow_id: String,
+    pub source: RecoveryBridgeSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum PasswordUpgradeSubject {
+    Session {
+        user_id: String,
+    },
+    RecoveryBridge {
+        user_id: String,
+        provenance: RecoveryBridgeProvenance,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -118,6 +118,10 @@ X-Trace-Id: 6c90d0d2-4f83-4f23-94d8-9d4b1d8dfad9
       "client_mediation": "conditional_if_available"
     }
   ],
+  "account_recovery": {
+    "kind": "password_reset",
+    "path": "/v1/auth/password/forgot"
+  },
   "recommended_method": "passkey",
   "legacy_password_fallback": {
     "possible": false,
@@ -130,6 +134,7 @@ X-Trace-Id: 6c90d0d2-4f83-4f23-94d8-9d4b1d8dfad9
 
 - `discovery_token` is an opaque, signed token binding normalized identifier, channel, and client capabilities for 300 seconds.
 - Response stays structurally valid even if the account does not exist; do not leak `account_exists`, `passkey_registered`, or `opaque_enrolled`.
+- `account_recovery` is intentionally policy-neutral. Returning it does NOT confirm the identifier exists; it tells the client which recovery entrypoint is safe to offer.
 - `recommended_method` is a UX hint, not proof of account state.
 - `legacy_password_fallback.user_visible` stays `false` for anonymous callers. If you surface this externally you are asking for enumeration bugs.
 
@@ -333,6 +338,27 @@ Pragma: no-cache
 }
 ```
 
+### Reserved recovery-bridge request shape
+
+When the server issues a recovery bridge, the same endpoint uses the existing `upgrade_context` field plus the free-form client payload to carry the bridge reference:
+
+```json
+{
+  "upgrade_context": "recovery_bridge",
+  "client_message": {
+    "recovery_flow_id": "af_recovery_bridge_123"
+  },
+  "client": {
+    "supports_pake": true,
+    "platform": "firefox-linux"
+  }
+}
+```
+
+- `recovery_flow_id` is a server-issued, one-time auth-flow identifier.
+- Unknown, expired, or replayed bridge ids MUST fail with `https://example.com/problems/invalid-recovery-bridge`.
+- Policy-driven login risk that cannot step up with MFA SHOULD fail with `https://example.com/problems/recovery-required` instead of collapsing into generic invalid credentials.
+
 ### Response 200
 
 ```json
@@ -354,6 +380,8 @@ Pragma: no-cache
 ### Errors
 
 - `401 Unauthorized` - missing or invalid session/upgrade ticket.
+- `401 Unauthorized` - invalid or expired recovery bridge.
+- `403 Forbidden` - recovery bridge required by policy but not satisfied.
 - `409 Conflict` - account already has active OPAQUE credential and policy forbids re-enrollment.
 - `429 Too Many Requests` - upgrade abuse/throttle.
 - `503 Service Unavailable` - PAKE dependency unavailable.
@@ -391,7 +419,7 @@ Pragma: no-cache
 ### Side effects
 
 - Write or upsert `opaque_credentials`.
-- Mark `credentials.last_legacy_verified_at` or equivalent reporting field.
+- Mark `credentials.migrated_to_opaque_at` and `credentials.last_legacy_verified_at` or equivalent reporting fields.
 - Optionally set `credentials.legacy_login_allowed=false` later in rollout phases, never at phase 1 by surprise.
 - Emit audit event `auth.v2.password.upgrade.completed`.
 

@@ -185,6 +185,20 @@ pub fn from_auth_error(
             "https://example.com/problems/invalid-token".to_string(),
             None,
         ),
+        AuthError::RecoveryRequired => (
+            StatusCode::FORBIDDEN,
+            "Recovery required".to_string(),
+            "Complete account recovery before retrying this authentication step".to_string(),
+            "https://example.com/problems/recovery-required".to_string(),
+            None,
+        ),
+        AuthError::InvalidRecoveryBridge => (
+            StatusCode::UNAUTHORIZED,
+            "Invalid recovery bridge".to_string(),
+            "Recovery bridge is invalid, expired, or already consumed".to_string(),
+            "https://example.com/problems/invalid-recovery-bridge".to_string(),
+            None,
+        ),
         AuthError::TokenExpired => (
             StatusCode::UNAUTHORIZED,
             "Token expired".to_string(),
@@ -357,6 +371,38 @@ mod tests {
         assert_eq!(
             problem.body.type_url,
             "https://example.com/problems/auth-v2-rollout-denied"
+        );
+    }
+
+    #[test]
+    fn recovery_required_maps_to_expected_problem_contract() {
+        let problem = from_auth_error(
+            AuthError::RecoveryRequired,
+            "trace-recovery-required".to_string(),
+        );
+
+        assert_eq!(problem.status, StatusCode::FORBIDDEN);
+        assert_eq!(problem.body.status, 403);
+        assert_eq!(problem.body.title, "Recovery required");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/recovery-required"
+        );
+    }
+
+    #[test]
+    fn invalid_recovery_bridge_maps_to_expected_problem_contract() {
+        let problem = from_auth_error(
+            AuthError::InvalidRecoveryBridge,
+            "trace-invalid-recovery-bridge".to_string(),
+        );
+
+        assert_eq!(problem.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(problem.body.status, 401);
+        assert_eq!(problem.body.title, "Invalid recovery bridge");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/invalid-recovery-bridge"
         );
     }
 

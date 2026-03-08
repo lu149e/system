@@ -168,8 +168,16 @@ pub struct AuthMethodsContractResponse {
     pub discovery_token: String,
     pub discovery_expires_in: i64,
     pub methods: Vec<AuthMethodContractResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_recovery: Option<AccountRecoveryContractResponse>,
     pub recommended_method: Option<String>,
     pub legacy_password_fallback: LegacyPasswordFallbackResponse,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AccountRecoveryContractResponse {
+    pub kind: String,
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -337,6 +345,8 @@ pub struct PasswordForgotResponse {
 #[derive(Debug, Serialize)]
 pub struct PasswordResetResponse {
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_flow_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -529,6 +539,7 @@ pub async fn password_reset(
     {
         Ok(result) => Ok(Json(PasswordResetResponse {
             message: result.message,
+            recovery_flow_id: result.recovery_flow_id,
         })),
         Err(err) => Err(from_auth_error(err, trace_id)),
     }
@@ -1044,7 +1055,7 @@ pub async fn password_upgrade_start_v2(
     let started_at = Instant::now();
     let trace_id = trace_id(&headers);
     let cohort_label = auth_v2_metric_cohort_label(payload.client.platform.as_deref());
-    if payload.upgrade_context != "session" || !payload.client.supports_pake {
+    if !payload.client.supports_pake {
         observability::record_auth_v2_password_request(
             "upgrade_start",
             "invalid_request",
@@ -1059,7 +1070,28 @@ pub async fn password_upgrade_start_v2(
         return Err(from_auth_error(AuthError::InvalidRequest, trace_id));
     }
 
-    let principal = extract_principal(&state, &headers, trace_id.clone()).await?;
+    let (user_id, upgrade_context) = match payload.upgrade_context.as_str() {
+        "session" => {
+            let principal = extract_principal(&state, &headers, trace_id.clone()).await?;
+            (
+                Some(principal.user_id),
+                crate::modules::auth::domain::PasswordUpgradeContext::session(),
+            )
+        }
+        "recovery_bridge" => {
+            let recovery_flow_id =
+                recovery_flow_id_from_client_message(payload.client_message.as_ref())
+                    .ok_or_else(|| from_auth_error(AuthError::InvalidRequest, trace_id.clone()))?;
+            (
+                None,
+                crate::modules::auth::domain::PasswordUpgradeContext::recovery_bridge(
+                    recovery_flow_id,
+                ),
+            )
+        }
+        _ => return Err(from_auth_error(AuthError::InvalidRequest, trace_id)),
+    };
+
     let client_id = payload.client.platform.clone();
     let rollout = auth_v2_rollout_for_request(&state, client_id.as_deref(), &trace_id)
         .map_err(|problem| *problem)?;
@@ -1093,7 +1125,8 @@ pub async fn password_upgrade_start_v2(
         .auth_service
         .start_password_upgrade_v2(
             PasswordUpgradeStartCommand {
-                user_id: principal.user_id,
+                user_id,
+                context: upgrade_context,
                 request: merge_pake_start_request(
                     payload.client_message,
                     serde_json::json!({
@@ -1688,6 +1721,12 @@ fn auth_methods_contract_response(
             .into_iter()
             .map(auth_method_contract_response)
             .collect(),
+        account_recovery: response.account_recovery.map(|recovery| {
+            AccountRecoveryContractResponse {
+                kind: recovery.kind,
+                path: recovery.path,
+            }
+        }),
         recommended_method: response.recommended_method,
         legacy_password_fallback: LegacyPasswordFallbackResponse {
             possible: false,
@@ -1744,6 +1783,16 @@ fn merge_pake_start_request(
         (Some(client_message), _) => client_message,
         (None, fallback) => fallback,
     }
+}
+
+fn recovery_flow_id_from_client_message(
+    client_message: Option<&serde_json::Value>,
+) -> Option<&str> {
+    client_message
+        .and_then(|value| value.get("recovery_flow_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn password_upgrade_start_contract_response(
@@ -1965,7 +2014,9 @@ mod tests {
                     AuthError, AuthService, LoginCommand, LoginResult, MfaActivateCommand,
                     RequestContext,
                 },
-                ports::{PasskeyCredentialRepository, PasskeyService, UserRepository},
+                ports::{
+                    AuthFlowRepository, PasskeyCredentialRepository, PasskeyService, UserRepository,
+                },
             },
             tokens::{domain::AccessTokenClaims, ports::JwtService},
         },
@@ -1987,6 +2038,7 @@ mod tests {
 
     struct HandlerHarness {
         state: AppState,
+        auth_flows: Arc<StaticAuthFlowRepository>,
         passkeys: Arc<dyn PasskeyCredentialRepository>,
         bootstrap_email: String,
         bootstrap_password: String,
@@ -3489,6 +3541,11 @@ mod tests {
         assert_eq!(response.request_id, "handler-v2-methods");
         assert_eq!(response.discovery_expires_in, 300);
         assert_eq!(response.recommended_method.as_deref(), Some("passkey"));
+        let recovery = response
+            .account_recovery
+            .expect("v2 methods contract should include account recovery guidance");
+        assert_eq!(recovery.kind, "password_reset");
+        assert_eq!(recovery.path, "/v1/auth/password/forgot");
         assert_eq!(response.methods.len(), 2);
         assert_eq!(response.methods[0].path, "/v2/auth/password/login/start");
         assert_eq!(
@@ -3826,6 +3883,149 @@ mod tests {
         )
         .await
         .expect("v2 password upgrade finish should succeed")
+        .0;
+
+        assert!(finish.upgraded);
+        assert_eq!(finish.opaque_version, "opaque_v1");
+        assert!(finish.legacy_password.login_allowed);
+    }
+
+    #[tokio::test]
+    async fn password_upgrade_start_v2_handler_accepts_recovery_bridge_context() {
+        let harness = build_v2_harness_with_options(true, true, false).await;
+        let bootstrap_access_token =
+            login_success(&harness, "handler-v2-recovery-bridge-bootstrap")
+                .await
+                .access_token
+                .expect("login should issue access token");
+        let bootstrap_user = harness
+            .state
+            .auth_service
+            .authenticate_access_token(&bootstrap_access_token)
+            .await
+            .expect("bootstrap access token should resolve principal");
+        let now = Utc::now();
+
+        harness
+            .auth_flows
+            .issue(crate::modules::auth::domain::AuthFlowRecord {
+                flow_id: "handler-recovery-bridge".to_string(),
+                subject_user_id: Some(bootstrap_user.user_id),
+                subject_identifier_hash: None,
+                flow_kind: crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge,
+                protocol: "recovery_upgrade_bridge_v1".to_string(),
+                state: serde_json::json!({"source": "password_reset"}),
+                status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                rollout_channel: Some("canary_web".to_string()),
+                fallback_policy: Some("disabled".to_string()),
+                trace_id: Some("handler-v2-recovery-bridge-trace".to_string()),
+                issued_ip: Some("127.0.0.1".to_string()),
+                issued_user_agent: Some("unit-test".to_string()),
+                attempt_count: 0,
+                expires_at: now + chrono::Duration::seconds(300),
+                consumed_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("recovery bridge should be stored");
+
+        let start = super::password_upgrade_start_v2(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-password-upgrade-recovery-bridge"),
+            Json(super::PasswordUpgradeStartRequest {
+                upgrade_context: "recovery_bridge".to_string(),
+                client_message: Some(serde_json::json!({
+                    "recovery_flow_id": "handler-recovery-bridge",
+                })),
+                client: super::PasswordUpgradeStartClientRequest {
+                    supports_pake: true,
+                    platform: Some("canary_web".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("recovery bridge upgrade start should succeed")
+        .0;
+
+        assert_eq!(start.flow_kind, "password_upgrade");
+        assert_eq!(start.next.path, "/v2/auth/password/upgrade/finish");
+    }
+
+    #[tokio::test]
+    async fn password_upgrade_v2_handlers_complete_recovery_bridge_flow() {
+        let harness = build_v2_harness_with_options(true, true, false).await;
+        let bootstrap_access_token =
+            login_success(&harness, "handler-v2-recovery-bridge-finish-bootstrap")
+                .await
+                .access_token
+                .expect("login should issue access token");
+        let bootstrap_user = harness
+            .state
+            .auth_service
+            .authenticate_access_token(&bootstrap_access_token)
+            .await
+            .expect("bootstrap access token should resolve principal");
+        let now = Utc::now();
+
+        harness
+            .auth_flows
+            .issue(crate::modules::auth::domain::AuthFlowRecord {
+                flow_id: "handler-recovery-bridge-finish".to_string(),
+                subject_user_id: Some(bootstrap_user.user_id),
+                subject_identifier_hash: None,
+                flow_kind: crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge,
+                protocol: "recovery_upgrade_bridge_v1".to_string(),
+                state: serde_json::json!({"source": "password_reset"}),
+                status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                rollout_channel: Some("canary_web".to_string()),
+                fallback_policy: Some("disabled".to_string()),
+                trace_id: Some("handler-v2-recovery-bridge-finish-trace".to_string()),
+                issued_ip: Some("127.0.0.1".to_string()),
+                issued_user_agent: Some("unit-test".to_string()),
+                attempt_count: 0,
+                expires_at: now + chrono::Duration::seconds(300),
+                consumed_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("recovery bridge should be stored");
+
+        let start = super::password_upgrade_start_v2(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-password-upgrade-recovery-bridge-finish-start"),
+            Json(super::PasswordUpgradeStartRequest {
+                upgrade_context: "recovery_bridge".to_string(),
+                client_message: Some(serde_json::json!({
+                    "recovery_flow_id": "handler-recovery-bridge-finish",
+                })),
+                client: super::PasswordUpgradeStartClientRequest {
+                    supports_pake: true,
+                    platform: Some("canary_web".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("recovery bridge upgrade start should succeed")
+        .0;
+        let start_flow_id = start.flow_id.clone();
+
+        let finish = super::password_upgrade_finish_v2(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-password-upgrade-recovery-bridge-finish-complete"),
+            Json(super::PasswordUpgradeFinishRequest {
+                flow_id: start_flow_id.clone(),
+                client_message: serde_json::json!({
+                    "registration_upload": format!("ok-reg:{}", start_flow_id),
+                }),
+            }),
+        )
+        .await
+        .expect("recovery bridge upgrade finish should succeed")
         .0;
 
         assert!(finish.upgraded);
@@ -4289,6 +4489,14 @@ mod tests {
             None
         };
 
+        let (v2_dependencies, auth_flows) = build_test_v2_dependencies(
+            &bootstrap_user,
+            password_upgrade_enabled,
+            auth_flows_enabled,
+            include_active_opaque_credential,
+            shadow_audit_only,
+            client_allowlist,
+        );
         let auth_service = Arc::new(
             AuthService::new(
                 Arc::new(adapters.users),
@@ -4329,14 +4537,7 @@ mod tests {
             )
             .expect("auth service should initialize")
             .with_passkey_service_for_tests(passkey_service)
-            .with_v2(build_test_v2_dependencies(
-                &bootstrap_user,
-                password_upgrade_enabled,
-                auth_flows_enabled,
-                include_active_opaque_credential,
-                shadow_audit_only,
-                client_allowlist,
-            )),
+            .with_v2(v2_dependencies),
         );
 
         HandlerHarness {
@@ -4369,6 +4570,7 @@ mod tests {
                 trusted_proxy_ips: Vec::new(),
                 trusted_proxy_cidrs: Vec::new(),
             },
+            auth_flows,
             passkeys,
             bootstrap_email,
             bootstrap_password,
@@ -4382,69 +4584,76 @@ mod tests {
         include_active_opaque_credential: bool,
         shadow_audit_only: bool,
         client_allowlist: &[&str],
-    ) -> crate::modules::auth::application::AuthV2Dependencies {
+    ) -> (
+        crate::modules::auth::application::AuthV2Dependencies,
+        Arc<StaticAuthFlowRepository>,
+    ) {
         let now = Utc::now();
+        let auth_flows = Arc::new(StaticAuthFlowRepository::new());
 
-        crate::modules::auth::application::AuthV2Dependencies {
-            config: crate::config::AuthV2Config {
-                enabled: true,
-                methods_enabled: true,
-                password_pake_enabled: true,
-                password_upgrade_enabled,
-                pake_provider: crate::config::AuthV2PakeProvider::Unavailable,
-                opaque_server_setup: None,
-                opaque_server_key_ref: None,
-                passkey_namespace_enabled: true,
-                auth_flows_enabled,
-                legacy_fallback_mode: crate::config::AuthV2LegacyFallbackMode::Allowlisted,
-                client_allowlist: client_allowlist
-                    .iter()
-                    .map(|value| (*value).to_string())
-                    .collect(),
-                shadow_audit_only,
-            },
-            accounts: Arc::new(StaticAccountRepository::new(vec![
-                crate::modules::auth::domain::AccountRecord {
-                    id: bootstrap_user.id.clone(),
-                    email: bootstrap_user.email.clone(),
-                    status: crate::modules::auth::domain::AccountStatus::Active,
-                    created_at: now,
-                    updated_at: now,
+        (
+            crate::modules::auth::application::AuthV2Dependencies {
+                config: crate::config::AuthV2Config {
+                    enabled: true,
+                    methods_enabled: true,
+                    password_pake_enabled: true,
+                    password_upgrade_enabled,
+                    pake_provider: crate::config::AuthV2PakeProvider::Unavailable,
+                    opaque_server_setup: None,
+                    opaque_server_key_ref: None,
+                    passkey_namespace_enabled: true,
+                    auth_flows_enabled,
+                    legacy_fallback_mode: crate::config::AuthV2LegacyFallbackMode::Allowlisted,
+                    client_allowlist: client_allowlist
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect(),
+                    shadow_audit_only,
                 },
-            ])),
-            legacy_passwords: Arc::new(StaticLegacyPasswordRepository::new(vec![
-                crate::modules::auth::domain::LegacyPasswordRecord {
-                    user_id: bootstrap_user.id.clone(),
-                    password_hash: bootstrap_user.password_hash.clone(),
-                    legacy_login_allowed: true,
-                    migrated_to_opaque_at: None,
-                    last_legacy_verified_at: None,
-                    legacy_deprecation_at: None,
-                },
-            ])),
-            opaque_credentials: Arc::new(StaticOpaqueCredentialRepository::new(
-                if include_active_opaque_credential {
-                    vec![crate::modules::auth::domain::OpaqueCredentialRecord {
-                        user_id: bootstrap_user.id.clone(),
-                        protocol: "opaque_v1".to_string(),
-                        credential_blob: b"opaque-credential".to_vec(),
-                        server_key_ref: None,
-                        envelope_kms_key_id: None,
-                        state: crate::modules::auth::domain::OpaqueCredentialState::Active,
-                        migrated_from_legacy_at: None,
-                        last_verified_at: None,
+                accounts: Arc::new(StaticAccountRepository::new(vec![
+                    crate::modules::auth::domain::AccountRecord {
+                        id: bootstrap_user.id.clone(),
+                        email: bootstrap_user.email.clone(),
+                        status: crate::modules::auth::domain::AccountStatus::Active,
                         created_at: now,
                         updated_at: now,
-                    }]
-                } else {
-                    Vec::new()
-                },
-            )),
-            auth_flows: Arc::new(StaticAuthFlowRepository::new()),
-            pake_service: Arc::new(DeterministicPakeService {
-                default_device_info: Some("Firefox on Linux".to_string()),
-            }),
-        }
+                    },
+                ])),
+                legacy_passwords: Arc::new(StaticLegacyPasswordRepository::new(vec![
+                    crate::modules::auth::domain::LegacyPasswordRecord {
+                        user_id: bootstrap_user.id.clone(),
+                        password_hash: bootstrap_user.password_hash.clone(),
+                        legacy_login_allowed: true,
+                        migrated_to_opaque_at: None,
+                        last_legacy_verified_at: None,
+                        legacy_deprecation_at: None,
+                    },
+                ])),
+                opaque_credentials: Arc::new(StaticOpaqueCredentialRepository::new(
+                    if include_active_opaque_credential {
+                        vec![crate::modules::auth::domain::OpaqueCredentialRecord {
+                            user_id: bootstrap_user.id.clone(),
+                            protocol: "opaque_v1".to_string(),
+                            credential_blob: b"opaque-credential".to_vec(),
+                            server_key_ref: None,
+                            envelope_kms_key_id: None,
+                            state: crate::modules::auth::domain::OpaqueCredentialState::Active,
+                            migrated_from_legacy_at: None,
+                            last_verified_at: None,
+                            created_at: now,
+                            updated_at: now,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                )),
+                auth_flows: auth_flows.clone(),
+                pake_service: Arc::new(DeterministicPakeService {
+                    default_device_info: Some("Firefox on Linux".to_string()),
+                }),
+            },
+            auth_flows,
+        )
     }
 
     #[derive(Default)]
@@ -4503,17 +4712,20 @@ mod tests {
 
     #[derive(Default)]
     struct StaticLegacyPasswordRepository {
-        by_user_id:
+        by_user_id: std::sync::Mutex<
             std::collections::HashMap<String, crate::modules::auth::domain::LegacyPasswordRecord>,
+        >,
     }
 
     impl StaticLegacyPasswordRepository {
         fn new(records: Vec<crate::modules::auth::domain::LegacyPasswordRecord>) -> Self {
             Self {
-                by_user_id: records
-                    .into_iter()
-                    .map(|record| (record.user_id.clone(), record))
-                    .collect(),
+                by_user_id: std::sync::Mutex::new(
+                    records
+                        .into_iter()
+                        .map(|record| (record.user_id.clone(), record))
+                        .collect(),
+                ),
             }
         }
     }
@@ -4524,7 +4736,12 @@ mod tests {
             &self,
             user_id: &str,
         ) -> Result<Option<crate::modules::auth::domain::LegacyPasswordRecord>, String> {
-            Ok(self.by_user_id.get(user_id).cloned())
+            Ok(self
+                .by_user_id
+                .lock()
+                .map_err(|_| "legacy password storage unavailable".to_string())?
+                .get(user_id)
+                .cloned())
         }
 
         async fn upsert_hash(
@@ -4541,6 +4758,23 @@ mod tests {
             _user_id: &str,
             _now: chrono::DateTime<Utc>,
         ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn mark_upgraded_to_opaque(
+            &self,
+            user_id: &str,
+            now: chrono::DateTime<Utc>,
+        ) -> Result<(), String> {
+            let mut guard = self
+                .by_user_id
+                .lock()
+                .map_err(|_| "legacy password storage unavailable".to_string())?;
+            let Some(record) = guard.get_mut(user_id) else {
+                return Err("legacy password not found".to_string());
+            };
+            record.migrated_to_opaque_at = record.migrated_to_opaque_at.or(Some(now));
+            record.last_legacy_verified_at = Some(now);
             Ok(())
         }
 
@@ -4704,12 +4938,58 @@ mod tests {
 
         async fn cancel_active_for_subject(
             &self,
-            _subject_user_id: Option<&str>,
-            _subject_identifier_hash: Option<&str>,
-            _flow_kind: &str,
-            _now: chrono::DateTime<Utc>,
+            subject_user_id: Option<&str>,
+            subject_identifier_hash: Option<&str>,
+            flow_kind: &str,
+            now: chrono::DateTime<Utc>,
         ) -> Result<u64, String> {
-            Ok(0)
+            let mut flows = self
+                .flows
+                .lock()
+                .map_err(|_| "auth flow storage unavailable".to_string())?;
+            let mut cancelled = 0_u64;
+            for flow in flows.values_mut() {
+                if flow.status != crate::modules::auth::domain::AuthFlowStatus::Pending
+                    || flow.expires_at <= now
+                {
+                    continue;
+                }
+                let flow_kind_matches = match flow.flow_kind {
+                    crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery => {
+                        flow_kind == "methods_discovery"
+                    }
+                    crate::modules::auth::domain::AuthFlowKind::PasswordLogin => {
+                        flow_kind == "password_login"
+                    }
+                    crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge => {
+                        flow_kind == "recovery_upgrade_bridge"
+                    }
+                    crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade => {
+                        flow_kind == "password_upgrade"
+                    }
+                    crate::modules::auth::domain::AuthFlowKind::PasskeyLogin => {
+                        flow_kind == "passkey_login"
+                    }
+                    crate::modules::auth::domain::AuthFlowKind::PasskeyRegister => {
+                        flow_kind == "passkey_register"
+                    }
+                };
+                if !flow_kind_matches {
+                    continue;
+                }
+                let subject_matches = subject_user_id
+                    .is_some_and(|user_id| flow.subject_user_id.as_deref() == Some(user_id))
+                    || subject_identifier_hash.is_some_and(|identifier_hash| {
+                        flow.subject_identifier_hash.as_deref() == Some(identifier_hash)
+                    });
+                if !subject_matches {
+                    continue;
+                }
+                flow.status = crate::modules::auth::domain::AuthFlowStatus::Cancelled;
+                flow.updated_at = now;
+                cancelled += 1;
+            }
+            Ok(cancelled)
         }
 
         async fn metrics_snapshot(
@@ -4720,7 +5000,7 @@ mod tests {
                 .flows
                 .lock()
                 .map_err(|_| "auth flow storage unavailable".to_string())?;
-            let mut active_counts = [0_u64; 5];
+            let mut active_counts = [0_u64; 6];
             let mut expired_pending_total = 0_u64;
             let mut oldest_expired_pending_age_seconds = 0_u64;
 
@@ -4733,9 +5013,10 @@ mod tests {
                     let index = match flow.flow_kind {
                         crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery => 0,
                         crate::modules::auth::domain::AuthFlowKind::PasswordLogin => 1,
-                        crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade => 2,
-                        crate::modules::auth::domain::AuthFlowKind::PasskeyLogin => 3,
-                        crate::modules::auth::domain::AuthFlowKind::PasskeyRegister => 4,
+                        crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge => 2,
+                        crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade => 3,
+                        crate::modules::auth::domain::AuthFlowKind::PasskeyLogin => 4,
+                        crate::modules::auth::domain::AuthFlowKind::PasskeyRegister => 5,
                     };
                     active_counts[index] += 1;
                     continue;
@@ -4750,6 +5031,7 @@ mod tests {
             let active_by_kind = [
                 crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery,
                 crate::modules::auth::domain::AuthFlowKind::PasswordLogin,
+                crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge,
                 crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade,
                 crate::modules::auth::domain::AuthFlowKind::PasskeyLogin,
                 crate::modules::auth::domain::AuthFlowKind::PasskeyRegister,
@@ -5007,6 +5289,7 @@ mod tests {
                 trusted_proxy_ips: Vec::new(),
                 trusted_proxy_cidrs: Vec::new(),
             },
+            auth_flows: Arc::new(StaticAuthFlowRepository::new()),
             passkeys,
             bootstrap_email,
             bootstrap_password,
@@ -5139,6 +5422,7 @@ mod tests {
                 trusted_proxy_ips: Vec::new(),
                 trusted_proxy_cidrs: Vec::new(),
             },
+            auth_flows: Arc::new(StaticAuthFlowRepository::new()),
             passkeys,
             bootstrap_email,
             bootstrap_password,

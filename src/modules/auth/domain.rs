@@ -67,9 +67,56 @@ pub struct OpaqueCredentialRecord {
 pub enum AuthFlowKind {
     MethodsDiscovery,
     PasswordLogin,
+    RecoveryUpgradeBridge,
     PasswordUpgrade,
     PasskeyLogin,
     PasskeyRegister,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryBridgeSource {
+    PasswordReset,
+    PasswordChange,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryUpgradeBridge {
+    pub flow_id: String,
+    pub user_id: String,
+    pub source: RecoveryBridgeSource,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PasswordUpgradeContext {
+    Session,
+    RecoveryBridge { flow_id: String },
+}
+
+impl PasswordUpgradeContext {
+    pub fn session() -> Self {
+        Self::Session
+    }
+
+    pub fn recovery_bridge(flow_id: impl Into<String>) -> Self {
+        Self::RecoveryBridge {
+            flow_id: flow_id.into(),
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::RecoveryBridge { .. } => "recovery_bridge",
+        }
+    }
+
+    pub fn flow_id(&self) -> Option<&str> {
+        match self {
+            Self::Session => None,
+            Self::RecoveryBridge { flow_id } => Some(flow_id.as_str()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
