@@ -426,6 +426,30 @@ impl LegacyPasswordRepository for PostgresLegacyPasswordRepository {
         Ok(())
     }
 
+    async fn mark_upgraded_to_opaque(
+        &self,
+        user_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let updated = sqlx::query(
+            "UPDATE credentials
+             SET migrated_to_opaque_at = COALESCE(migrated_to_opaque_at, $2),
+                 last_legacy_verified_at = $2
+             WHERE user_id = $1::uuid",
+        )
+        .bind(user_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| "legacy password upgrade mark failed".to_string())?;
+
+        if updated.rows_affected() == 0 {
+            return Err("legacy password not found".to_string());
+        }
+
+        Ok(())
+    }
+
     async fn set_legacy_login_allowed(
         &self,
         user_id: &str,
@@ -716,10 +740,11 @@ impl AuthFlowRepository for PostgresAuthFlowRepository {
     ) -> Result<u64, String> {
         let updated = sqlx::query(
             "UPDATE auth_flows
-             SET status = 'cancelled', updated_at = $4
-             WHERE flow_kind = $3
-               AND status = 'pending'
-               AND ((subject_user_id = $1::uuid) OR (subject_identifier_hash = $2))",
+              SET status = 'cancelled', updated_at = $4
+              WHERE flow_kind = $3
+                AND status = 'pending'
+                AND expires_at > $4
+                AND ((subject_user_id = $1::uuid) OR (subject_identifier_hash = $2))",
         )
         .bind(subject_user_id)
         .bind(subject_identifier_hash)
@@ -2269,6 +2294,7 @@ fn parse_auth_flow_kind(value: String) -> AuthFlowKind {
     match value.as_str() {
         "methods_discovery" => AuthFlowKind::MethodsDiscovery,
         "password_login" => AuthFlowKind::PasswordLogin,
+        "recovery_upgrade_bridge" => AuthFlowKind::RecoveryUpgradeBridge,
         "password_upgrade" => AuthFlowKind::PasswordUpgrade,
         "passkey_login" => AuthFlowKind::PasskeyLogin,
         "passkey_register" => AuthFlowKind::PasskeyRegister,
@@ -2280,6 +2306,7 @@ fn auth_flow_kind_to_db(kind: &AuthFlowKind) -> &'static str {
     match kind {
         AuthFlowKind::MethodsDiscovery => "methods_discovery",
         AuthFlowKind::PasswordLogin => "password_login",
+        AuthFlowKind::RecoveryUpgradeBridge => "recovery_upgrade_bridge",
         AuthFlowKind::PasswordUpgrade => "password_upgrade",
         AuthFlowKind::PasskeyLogin => "passkey_login",
         AuthFlowKind::PasskeyRegister => "passkey_register",

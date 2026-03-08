@@ -19,7 +19,8 @@ use crate::modules::{
     auth::{
         domain::{
             AuthFlowRecord, LegacyPasswordRecord, MfaChallengeRecord, MfaFactorRecord,
-            OpaqueCredentialRecord, PasswordResetTokenRecord, UserStatus, VerificationTokenRecord,
+            OpaqueCredentialRecord, PasswordResetTokenRecord, RecoveryBridgeSource,
+            RecoveryUpgradeBridge, UserStatus, VerificationTokenRecord,
         },
         ports::{
             LoginAbuseProtector, LoginGateDecision, LoginRiskAnalyzer, LoginRiskDecision,
@@ -195,6 +196,10 @@ pub enum AuthError {
     InvalidPasskeyResponse,
     #[error("invalid token")]
     InvalidToken,
+    #[error("recovery required")]
+    RecoveryRequired,
+    #[error("invalid recovery bridge")]
+    InvalidRecoveryBridge,
     #[error("token expired")]
     TokenExpired,
     #[error("refresh token reuse detected")]
@@ -300,6 +305,7 @@ pub struct PasswordForgotAccepted {
 #[derive(Clone, Serialize)]
 pub struct PasswordResetCompleted {
     pub message: String,
+    pub recovery_flow_id: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -346,12 +352,19 @@ pub struct AuthMethodsCommand {
 pub struct AuthMethodsResponse {
     pub discovery_token: String,
     pub methods: Vec<AuthMethodResponse>,
+    pub account_recovery: Option<AccountRecoveryResponse>,
     pub recommended_method: Option<String>,
     pub expires_in: i64,
 }
 
 #[derive(Clone, Serialize)]
 pub struct AuthMethodResponse {
+    pub kind: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct AccountRecoveryResponse {
     pub kind: String,
     pub path: String,
 }
@@ -380,7 +393,8 @@ pub struct PakeLoginFinishCommand {
 
 #[derive(Clone)]
 pub struct PasswordUpgradeStartCommand {
-    pub user_id: String,
+    pub user_id: Option<String>,
+    pub context: crate::modules::auth::domain::PasswordUpgradeContext,
     pub request: serde_json::Value,
 }
 
@@ -741,17 +755,32 @@ impl AuthService {
             .revoke_by_session_ids(&session_ids, now)
             .await;
 
+        let recovery_flow_id = self
+            .maybe_issue_recovery_upgrade_bridge(
+                &user_id,
+                RecoveryBridgeSource::PasswordReset,
+                &ctx,
+                now,
+            )
+            .await?
+            .map(|bridge| bridge.flow_id);
+
         self.audit
             .append(AuditEvent {
                 event_type: "auth.password.reset.success".to_string(),
                 actor_user_id: Some(user_id),
                 trace_id: ctx.trace_id.clone(),
-                metadata: json!({"revoked_sessions": session_ids.len(), "ip": ctx.ip, "user_agent": ctx.user_agent}),
+                metadata: json!({
+                    "revoked_sessions": session_ids.len(),
+                    "ip": ctx.ip,
+                    "user_agent": ctx.user_agent,
+                    "recovery_flow_id": recovery_flow_id,
+                }),
                 created_at: now,
             })
             .await;
 
-        Ok(password_reset_completed_response())
+        Ok(password_reset_completed_response(recovery_flow_id))
     }
 
     pub async fn password_change(
@@ -821,12 +850,27 @@ impl AuthService {
             .revoke_by_session_ids(&session_ids, now)
             .await;
 
+        let recovery_flow_id = self
+            .maybe_issue_recovery_upgrade_bridge(
+                &cmd.user_id,
+                RecoveryBridgeSource::PasswordChange,
+                &ctx,
+                now,
+            )
+            .await?
+            .map(|bridge| bridge.flow_id);
+
         self.audit
             .append(AuditEvent {
                 event_type: "auth.password.change.success".to_string(),
                 actor_user_id: Some(cmd.user_id),
                 trace_id: ctx.trace_id.clone(),
-                metadata: json!({"revoked_sessions": session_ids.len(), "ip": ctx.ip, "user_agent": ctx.user_agent}),
+                metadata: json!({
+                    "revoked_sessions": session_ids.len(),
+                    "ip": ctx.ip,
+                    "user_agent": ctx.user_agent,
+                    "recovery_flow_id": recovery_flow_id,
+                }),
                 created_at: now,
             })
             .await;
@@ -1816,6 +1860,7 @@ impl AuthService {
                     path: method.path,
                 })
                 .collect(),
+            account_recovery: build_account_recovery_response(),
             recommended_method: recommended_method_label,
             expires_in: self.mfa_challenge_ttl_seconds,
         })
@@ -2185,11 +2230,28 @@ impl AuthService {
         let mut audit_fallback_policy: Option<String> = None;
         let result = async {
             let now = Utc::now();
-            let account = v2
-                .accounts
-                .find_by_id(&cmd.user_id)
-                .await
-                .ok_or(AuthError::InvalidToken)?;
+            let (account, recovery_bridge) = match &cmd.context {
+                crate::modules::auth::domain::PasswordUpgradeContext::Session => {
+                    let user_id = cmd.user_id.as_deref().ok_or(AuthError::InvalidToken)?;
+                    let account = v2
+                        .accounts
+                        .find_by_id(user_id)
+                        .await
+                        .ok_or(AuthError::InvalidToken)?;
+                    (account, None)
+                }
+                crate::modules::auth::domain::PasswordUpgradeContext::RecoveryBridge {
+                    flow_id,
+                } => {
+                    let bridge = self.consume_recovery_upgrade_bridge(flow_id, now).await?;
+                    let account = v2
+                        .accounts
+                        .find_by_id(&bridge.user_id)
+                        .await
+                        .ok_or(AuthError::InvalidRecoveryBridge)?;
+                    (account, Some(bridge))
+                }
+            };
             if account.status != crate::modules::auth::domain::AccountStatus::Active {
                 return Err(AuthError::AccountNotActive);
             }
@@ -2246,6 +2308,11 @@ impl AuthService {
                     protocol: "opaque_v1".to_string(),
                     state: json!({
                         "server_state": result.server_state,
+                        "upgrade_context": cmd.context.kind(),
+                        "recovery_bridge": recovery_bridge.as_ref().map(|bridge| json!({
+                            "flow_id": bridge.flow_id,
+                            "source": bridge.source,
+                        })),
                         "legacy_login_allowed": legacy.legacy_login_allowed,
                         "client_id": ctx.client_id.clone(),
                         "rollout_cohort": rollout.cohort.clone(),
@@ -2272,6 +2339,12 @@ impl AuthService {
                     actor_user_id: Some(account.id),
                     trace_id: ctx.trace_id.clone(),
                     metadata: json!({
+                        "flow_id": flow_id.clone(),
+                        "upgrade_context": cmd.context.kind(),
+                        "recovery_bridge": recovery_bridge.as_ref().map(|bridge| json!({
+                            "flow_id": bridge.flow_id,
+                            "source": bridge.source,
+                        })),
                         "rollout_channel": rollout.cohort_label(),
                         "fallback_policy": rollout.fallback_policy.as_str(),
                         "ip": ctx.ip,
@@ -2293,10 +2366,11 @@ impl AuthService {
             self.audit
                 .append(AuditEvent {
                     event_type: "auth.v2.password.upgrade.rejected".to_string(),
-                    actor_user_id: Some(cmd.user_id.clone()),
+                    actor_user_id: cmd.user_id.clone(),
                     trace_id: ctx.trace_id.clone(),
                     metadata: json!({
                         "reason": reason,
+                        "upgrade_context": cmd.context.kind(),
                         "rollout_channel": metrics_channel,
                         "fallback_policy": audit_fallback_policy,
                         "ip": ctx.ip,
@@ -2360,6 +2434,13 @@ impl AuthService {
 
             let user_id = flow.subject_user_id.ok_or(AuthError::InvalidToken)?;
             audit_actor_user_id = Some(user_id.clone());
+            let upgrade_context = flow
+                .state
+                .get("upgrade_context")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("session")
+                .to_string();
+            let recovery_bridge = flow.state.get("recovery_bridge").cloned();
             let legacy = v2
                 .legacy_passwords
                 .find_by_user_id(&user_id)
@@ -2405,7 +2486,10 @@ impl AuthService {
                 })
                 .await
                 .map_err(|_| AuthError::Internal)?;
-            let _ = v2.legacy_passwords.mark_verified(&user_id, now).await;
+            let _ = v2
+                .legacy_passwords
+                .mark_upgraded_to_opaque(&user_id, now)
+                .await;
 
             self.audit
                 .append(AuditEvent {
@@ -2413,6 +2497,9 @@ impl AuthService {
                     actor_user_id: Some(user_id),
                     trace_id: ctx.trace_id.clone(),
                     metadata: json!({
+                        "flow_id": cmd.flow_id.clone(),
+                        "upgrade_context": upgrade_context,
+                        "recovery_bridge": recovery_bridge,
                         "rollout_channel": rollout.cohort_label(),
                         "fallback_policy": rollout.fallback_policy.as_str(),
                         "ip": ctx.ip,
@@ -2508,6 +2595,122 @@ impl AuthService {
         }))
     }
 
+    async fn maybe_issue_recovery_upgrade_bridge(
+        &self,
+        user_id: &str,
+        source: RecoveryBridgeSource,
+        ctx: &RequestContext,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<RecoveryUpgradeBridge>, AuthError> {
+        let Some(v2) = self.auth_v2.as_ref() else {
+            return Ok(None);
+        };
+        if !v2.config.enabled
+            || !v2.config.password_upgrade_enabled
+            || !v2.config.auth_flows_enabled
+            || !recovery_bridge_policy_allows(&v2.config, source.clone())
+        {
+            return Ok(None);
+        }
+
+        let legacy = v2
+            .legacy_passwords
+            .find_by_user_id(user_id)
+            .await
+            .map_err(|_| AuthError::Internal)?;
+        if legacy.is_none() {
+            return Ok(None);
+        }
+
+        let existing_opaque = v2
+            .opaque_credentials
+            .find_by_user_id(user_id)
+            .await
+            .map_err(|_| AuthError::Internal)?;
+        if existing_opaque.as_ref().is_some_and(|record| {
+            record.state == crate::modules::auth::domain::OpaqueCredentialState::Active
+        }) {
+            return Ok(None);
+        }
+
+        let flow_id = self.refresh_crypto.generate_refresh_token().await;
+        let _ = v2
+            .auth_flows
+            .cancel_active_for_subject(Some(user_id), None, "recovery_upgrade_bridge", now)
+            .await;
+        v2.auth_flows
+            .issue(AuthFlowRecord {
+                flow_id: flow_id.clone(),
+                subject_user_id: Some(user_id.to_string()),
+                subject_identifier_hash: None,
+                flow_kind: crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge,
+                protocol: "recovery_upgrade_bridge_v1".to_string(),
+                state: json!({
+                    "source": source,
+                }),
+                status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                rollout_channel: Some(auth_v2_rollout_channel_hint(ctx.client_id.as_deref())),
+                fallback_policy: Some(AuthV2FallbackPolicy::Disabled.as_str().to_string()),
+                trace_id: Some(ctx.trace_id.clone()),
+                issued_ip: ctx.ip.clone(),
+                issued_user_agent: ctx.user_agent.clone(),
+                attempt_count: 0,
+                expires_at: now + Duration::seconds(self.mfa_challenge_ttl_seconds),
+                consumed_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .map_err(|_| AuthError::Internal)?;
+
+        Ok(Some(RecoveryUpgradeBridge {
+            flow_id,
+            user_id: user_id.to_string(),
+            source,
+        }))
+    }
+
+    async fn consume_recovery_upgrade_bridge(
+        &self,
+        flow_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<RecoveryUpgradeBridge, AuthError> {
+        let v2 = self.auth_v2.as_ref().ok_or(AuthError::Internal)?;
+        let flow = match v2
+            .auth_flows
+            .consume(flow_id, now)
+            .await
+            .map_err(|_| AuthError::Internal)?
+        {
+            crate::modules::auth::ports::AuthFlowConsumeState::Active(flow)
+                if matches!(
+                    flow.flow_kind,
+                    crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge
+                ) =>
+            {
+                *flow
+            }
+            _ => return Err(AuthError::InvalidRecoveryBridge),
+        };
+
+        let user_id = flow
+            .subject_user_id
+            .ok_or(AuthError::InvalidRecoveryBridge)?;
+        let source = serde_json::from_value(
+            flow.state
+                .get("source")
+                .cloned()
+                .ok_or(AuthError::InvalidRecoveryBridge)?,
+        )
+        .map_err(|_| AuthError::InvalidRecoveryBridge)?;
+
+        Ok(RecoveryUpgradeBridge {
+            flow_id: flow.flow_id,
+            user_id,
+            source,
+        })
+    }
+
     async fn evaluate_login_risk_policy(
         &self,
         email: &str,
@@ -2541,26 +2744,18 @@ impl AuthService {
             }
             LoginRiskDecision::Challenge { reason } => {
                 if !mfa_enabled {
-                    self.audit_login_rejected(
-                        "risk_challenge_unavailable",
-                        email,
-                        Some(user_id),
-                        ctx,
-                    )
-                    .await;
-                    crate::observability::record_login_risk_decision(
-                        "block",
-                        "challenge_without_mfa",
-                    );
+                    self.audit_login_rejected("recovery_required", email, Some(user_id), ctx)
+                        .await;
+                    crate::observability::record_login_risk_decision("block", "recovery_required");
                     self.try_lock_login_for_risk(
                         email,
                         ctx.ip.as_deref(),
-                        "challenge_without_mfa",
+                        "recovery_required",
                         ctx,
                         now,
                     )
                     .await;
-                    return Err(AuthError::InvalidCredentials);
+                    return Err(AuthError::RecoveryRequired);
                 }
 
                 crate::observability::record_login_risk_decision("challenge", &reason);
@@ -3479,9 +3674,10 @@ fn password_forgot_accepted_response() -> PasswordForgotAccepted {
     }
 }
 
-fn password_reset_completed_response() -> PasswordResetCompleted {
+fn password_reset_completed_response(recovery_flow_id: Option<String>) -> PasswordResetCompleted {
     PasswordResetCompleted {
         message: "Password has been reset".to_string(),
+        recovery_flow_id,
     }
 }
 
@@ -3503,7 +3699,7 @@ fn login_risk_penalty_profile(reason: &str) -> (&'static str, u32) {
     match reason {
         "blocked_source_ip" => ("aggressive", 5),
         "blocked_user_agent" | "blocked_email_domain" => ("elevated", 3),
-        "challenge_without_mfa" => ("elevated", 2),
+        "recovery_required" | "challenge_without_mfa" => ("elevated", 2),
         _ => ("standard", 1),
     }
 }
@@ -3671,6 +3867,13 @@ fn build_auth_method_descriptors(
     methods
 }
 
+fn build_account_recovery_response() -> Option<AccountRecoveryResponse> {
+    Some(AccountRecoveryResponse {
+        kind: "password_reset".to_string(),
+        path: "/v1/auth/password/forgot".to_string(),
+    })
+}
+
 fn recommend_auth_method(
     methods: &[crate::modules::auth::ports::AuthMethodDescriptor],
 ) -> Option<crate::modules::auth::ports::AuthMethodKind> {
@@ -3758,6 +3961,8 @@ fn auth_v2_error_reason(error: &AuthError) -> &'static str {
         AuthError::InvalidRequest => "invalid_request",
         AuthError::InvalidCredentials => "invalid_credentials",
         AuthError::InvalidToken => "invalid_token",
+        AuthError::RecoveryRequired => "recovery_required",
+        AuthError::InvalidRecoveryBridge => "invalid_recovery_bridge",
         AuthError::LoginLocked { .. } => "login_locked",
         AuthError::OpaqueCredentialAlreadyActive => "opaque_credential_already_active",
         AuthError::InvalidOpaqueRegistration => "invalid_opaque_registration",
@@ -3765,6 +3970,15 @@ fn auth_v2_error_reason(error: &AuthError) -> &'static str {
         AuthError::AuthV2RolloutDenied => "rollout_denied",
         AuthError::Internal => "internal_error",
         _ => "other",
+    }
+}
+
+fn recovery_bridge_policy_allows(config: &AuthV2Config, source: RecoveryBridgeSource) -> bool {
+    match source {
+        RecoveryBridgeSource::PasswordReset => {
+            config.enabled && config.password_upgrade_enabled && config.auth_flows_enabled
+        }
+        RecoveryBridgeSource::PasswordChange => false,
     }
 }
 
@@ -4116,6 +4330,23 @@ mod tests {
             Ok(())
         }
 
+        async fn mark_upgraded_to_opaque(
+            &self,
+            user_id: &str,
+            now: DateTime<Utc>,
+        ) -> Result<(), String> {
+            let mut guard = self
+                .records_by_user
+                .lock()
+                .map_err(|_| "legacy lock unavailable".to_string())?;
+            let Some(record) = guard.get_mut(user_id) else {
+                return Err("legacy password not found".to_string());
+            };
+            record.migrated_to_opaque_at = record.migrated_to_opaque_at.or(Some(now));
+            record.last_legacy_verified_at = Some(now);
+            Ok(())
+        }
+
         async fn set_legacy_login_allowed(
             &self,
             _user_id: &str,
@@ -4251,12 +4482,56 @@ mod tests {
 
         async fn cancel_active_for_subject(
             &self,
-            _subject_user_id: Option<&str>,
-            _subject_identifier_hash: Option<&str>,
-            _flow_kind: &str,
-            _now: DateTime<Utc>,
+            subject_user_id: Option<&str>,
+            subject_identifier_hash: Option<&str>,
+            flow_kind: &str,
+            now: DateTime<Utc>,
         ) -> Result<u64, String> {
-            Ok(0)
+            let mut guard = self
+                .flows
+                .lock()
+                .map_err(|_| "flow lock unavailable".to_string())?;
+            let mut cancelled = 0_u64;
+            for flow in guard.values_mut() {
+                if flow.status != AuthFlowStatus::Pending || flow.expires_at <= now {
+                    continue;
+                }
+                let flow_kind_matches = match flow.flow_kind {
+                    crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery => {
+                        flow_kind == "methods_discovery"
+                    }
+                    crate::modules::auth::domain::AuthFlowKind::PasswordLogin => {
+                        flow_kind == "password_login"
+                    }
+                    crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge => {
+                        flow_kind == "recovery_upgrade_bridge"
+                    }
+                    crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade => {
+                        flow_kind == "password_upgrade"
+                    }
+                    crate::modules::auth::domain::AuthFlowKind::PasskeyLogin => {
+                        flow_kind == "passkey_login"
+                    }
+                    crate::modules::auth::domain::AuthFlowKind::PasskeyRegister => {
+                        flow_kind == "passkey_register"
+                    }
+                };
+                if !flow_kind_matches {
+                    continue;
+                }
+                let subject_matches = subject_user_id
+                    .is_some_and(|user_id| flow.subject_user_id.as_deref() == Some(user_id))
+                    || subject_identifier_hash.is_some_and(|identifier_hash| {
+                        flow.subject_identifier_hash.as_deref() == Some(identifier_hash)
+                    });
+                if !subject_matches {
+                    continue;
+                }
+                flow.status = AuthFlowStatus::Cancelled;
+                flow.updated_at = now;
+                cancelled += 1;
+            }
+            Ok(cancelled)
         }
 
         async fn metrics_snapshot(
@@ -4267,7 +4542,7 @@ mod tests {
                 .flows
                 .lock()
                 .map_err(|_| "flow lock unavailable".to_string())?;
-            let mut active_counts = [0_u64; 5];
+            let mut active_counts = [0_u64; 6];
             let mut expired_pending_total = 0_u64;
             let mut oldest_expired_pending_age_seconds = 0_u64;
 
@@ -4280,9 +4555,10 @@ mod tests {
                     let index = match flow.flow_kind {
                         crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery => 0,
                         crate::modules::auth::domain::AuthFlowKind::PasswordLogin => 1,
-                        crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade => 2,
-                        crate::modules::auth::domain::AuthFlowKind::PasskeyLogin => 3,
-                        crate::modules::auth::domain::AuthFlowKind::PasskeyRegister => 4,
+                        crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge => 2,
+                        crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade => 3,
+                        crate::modules::auth::domain::AuthFlowKind::PasskeyLogin => 4,
+                        crate::modules::auth::domain::AuthFlowKind::PasskeyRegister => 5,
                     };
                     active_counts[index] += 1;
                     continue;
@@ -4297,6 +4573,7 @@ mod tests {
             let active_by_kind = [
                 crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery,
                 crate::modules::auth::domain::AuthFlowKind::PasswordLogin,
+                crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge,
                 crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade,
                 crate::modules::auth::domain::AuthFlowKind::PasskeyLogin,
                 crate::modules::auth::domain::AuthFlowKind::PasskeyRegister,
@@ -4756,6 +5033,377 @@ mod tests {
             })
             .expect("password reset rejected event should exist");
         assert_eq!(rejected.metadata["reason"], "account_not_active");
+    }
+
+    #[tokio::test]
+    async fn password_reset_mints_recovery_bridge_for_v2_upgrade() {
+        let harness = build_harness();
+        let auth_flows = Arc::new(StaticAuthFlowRepository::new());
+        let mut dependencies = build_v2_dependencies_with_options(&harness, true, false).await;
+        dependencies.auth_flows = auth_flows.clone();
+        let service = harness.service.clone().with_v2(dependencies);
+        let user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+
+        let now = Utc::now();
+        let reset_token = "recovery-bridge-reset-token";
+        let token_hash = service.refresh_crypto.hash_refresh_token(reset_token).await;
+        service
+            .password_reset_tokens
+            .issue(PasswordResetTokenRecord {
+                id: Uuid::new_v4().to_string(),
+                user_id: user.id.clone(),
+                token_hash,
+                expires_at: now + chrono::Duration::seconds(300),
+                used_at: None,
+                created_at: now,
+            })
+            .await
+            .expect("password reset token should be issued");
+
+        let result = service
+            .password_reset(
+                PasswordResetCommand {
+                    token: reset_token.to_string(),
+                    new_password: generated_test_password(),
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("password-reset-recovery-bridge")
+                },
+            )
+            .await
+            .expect("password reset should succeed");
+
+        let recovery_flow_id = result
+            .recovery_flow_id
+            .expect("password reset should return a recovery bridge");
+        let bridge = auth_flows
+            .peek(&recovery_flow_id)
+            .expect("recovery bridge should be persisted");
+
+        assert_eq!(bridge.subject_user_id.as_deref(), Some(user.id.as_str()));
+        assert_eq!(
+            bridge.flow_kind,
+            crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge
+        );
+        assert_eq!(bridge.state.get("source"), Some(&json!("password_reset")));
+        assert_eq!(bridge.status, AuthFlowStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn password_reset_cancels_previous_recovery_bridge_for_same_user() {
+        let harness = build_harness();
+        let auth_flows = Arc::new(StaticAuthFlowRepository::new());
+        let mut dependencies = build_v2_dependencies_with_options(&harness, true, false).await;
+        dependencies.auth_flows = auth_flows.clone();
+        let service = harness.service.clone().with_v2(dependencies);
+        let user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+
+        for (token, password) in [
+            ("recovery-bridge-reset-token-1", generated_test_password()),
+            ("recovery-bridge-reset-token-2", generated_test_password()),
+        ] {
+            let now = Utc::now();
+            let token_hash = service.refresh_crypto.hash_refresh_token(token).await;
+            service
+                .password_reset_tokens
+                .issue(PasswordResetTokenRecord {
+                    id: Uuid::new_v4().to_string(),
+                    user_id: user.id.clone(),
+                    token_hash,
+                    expires_at: now + chrono::Duration::seconds(300),
+                    used_at: None,
+                    created_at: now,
+                })
+                .await
+                .expect("password reset token should be issued");
+            let _ = service
+                .password_reset(
+                    PasswordResetCommand {
+                        token: token.to_string(),
+                        new_password: password,
+                    },
+                    RequestContext {
+                        client_id: Some("web".to_string()),
+                        ..test_context(token)
+                    },
+                )
+                .await
+                .expect("password reset should succeed");
+        }
+
+        let flows = auth_flows
+            .flows
+            .lock()
+            .expect("flow storage should be available");
+        let mut bridge_flows = flows
+            .values()
+            .filter(|flow| {
+                flow.subject_user_id.as_deref() == Some(user.id.as_str())
+                    && flow.flow_kind
+                        == crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        bridge_flows.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+
+        assert_eq!(bridge_flows.len(), 2);
+        assert_eq!(bridge_flows[0].status, AuthFlowStatus::Cancelled);
+        assert_eq!(bridge_flows[1].status, AuthFlowStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn start_password_upgrade_v2_accepts_recovery_bridge_context() {
+        let harness = build_harness();
+        let auth_flows = Arc::new(StaticAuthFlowRepository::new());
+        let mut dependencies = build_v2_dependencies_with_options(&harness, true, false).await;
+        dependencies.auth_flows = auth_flows.clone();
+        let service = harness.service.clone().with_v2(dependencies);
+        let user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+        let now = Utc::now();
+
+        auth_flows
+            .issue(AuthFlowRecord {
+                flow_id: "recovery-bridge-start".to_string(),
+                subject_user_id: Some(user.id.clone()),
+                subject_identifier_hash: None,
+                flow_kind: crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge,
+                protocol: "recovery_upgrade_bridge_v1".to_string(),
+                state: json!({"source": "password_reset"}),
+                status: AuthFlowStatus::Pending,
+                rollout_channel: Some("canary_web".to_string()),
+                fallback_policy: Some("disabled".to_string()),
+                trace_id: Some("trace-recovery-bridge-start".to_string()),
+                issued_ip: Some("127.0.0.1".to_string()),
+                issued_user_agent: Some("unit-test".to_string()),
+                attempt_count: 0,
+                expires_at: now + Duration::seconds(300),
+                consumed_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("recovery bridge should be stored");
+
+        let start = service
+            .start_password_upgrade_v2(
+                PasswordUpgradeStartCommand {
+                    user_id: None,
+                    context: crate::modules::auth::domain::PasswordUpgradeContext::recovery_bridge(
+                        "recovery-bridge-start",
+                    ),
+                    request: json!({
+                        "platform": "web",
+                        "supports_pake": true,
+                        "recovery_flow_id": "recovery-bridge-start",
+                    }),
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-upgrade-recovery-bridge")
+                },
+            )
+            .await
+            .expect("recovery bridge upgrade start should succeed");
+
+        let flow = auth_flows
+            .peek(&start.flow_id)
+            .expect("password upgrade flow should be stored");
+        assert_eq!(flow.subject_user_id.as_deref(), Some(user.id.as_str()));
+        assert_eq!(
+            flow.state.get("upgrade_context"),
+            Some(&json!("recovery_bridge"))
+        );
+        assert_eq!(
+            flow.state.pointer("/recovery_bridge/flow_id"),
+            Some(&json!("recovery-bridge-start"))
+        );
+        assert_eq!(
+            flow.state.pointer("/recovery_bridge/source"),
+            Some(&json!("password_reset"))
+        );
+    }
+
+    #[tokio::test]
+    async fn start_password_upgrade_v2_rejects_invalid_recovery_bridge() {
+        let harness = build_harness();
+        let service = harness
+            .service
+            .clone()
+            .with_v2(build_v2_dependencies_with_options(&harness, true, false).await);
+
+        let result = service
+            .start_password_upgrade_v2(
+                PasswordUpgradeStartCommand {
+                    user_id: None,
+                    context: crate::modules::auth::domain::PasswordUpgradeContext::recovery_bridge(
+                        "missing-recovery-bridge",
+                    ),
+                    request: json!({
+                        "platform": "web",
+                        "supports_pake": true,
+                        "recovery_flow_id": "missing-recovery-bridge",
+                    }),
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-upgrade-invalid-recovery-bridge")
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::InvalidRecoveryBridge)));
+    }
+
+    #[tokio::test]
+    async fn finish_password_upgrade_v2_marks_legacy_migration_and_audits_recovery_provenance() {
+        let harness = build_harness();
+        let auth_flows = Arc::new(StaticAuthFlowRepository::new());
+        let user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+        let legacy_passwords = Arc::new(StaticLegacyPasswordRepository::new(vec![
+            LegacyPasswordRecord {
+                user_id: user.id.clone(),
+                password_hash: user.password_hash.clone(),
+                legacy_login_allowed: true,
+                migrated_to_opaque_at: None,
+                last_legacy_verified_at: None,
+                legacy_deprecation_at: None,
+            },
+        ]));
+        let mut dependencies = build_v2_dependencies_with_options(&harness, true, false).await;
+        dependencies.auth_flows = auth_flows.clone();
+        dependencies.legacy_passwords = legacy_passwords.clone();
+        let service = harness.service.clone().with_v2(dependencies);
+        let now = Utc::now();
+
+        auth_flows
+            .issue(AuthFlowRecord {
+                flow_id: "recovery-bridge-finish".to_string(),
+                subject_user_id: Some(user.id.clone()),
+                subject_identifier_hash: None,
+                flow_kind: crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge,
+                protocol: "recovery_upgrade_bridge_v1".to_string(),
+                state: json!({"source": "password_reset"}),
+                status: AuthFlowStatus::Pending,
+                rollout_channel: Some("canary_web".to_string()),
+                fallback_policy: Some("disabled".to_string()),
+                trace_id: Some("trace-recovery-bridge-finish".to_string()),
+                issued_ip: Some("127.0.0.1".to_string()),
+                issued_user_agent: Some("unit-test".to_string()),
+                attempt_count: 0,
+                expires_at: now + Duration::seconds(300),
+                consumed_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("recovery bridge should be stored");
+
+        let start = service
+            .start_password_upgrade_v2(
+                PasswordUpgradeStartCommand {
+                    user_id: None,
+                    context: crate::modules::auth::domain::PasswordUpgradeContext::recovery_bridge(
+                        "recovery-bridge-finish",
+                    ),
+                    request: json!({
+                        "platform": "web",
+                        "supports_pake": true,
+                        "recovery_flow_id": "recovery-bridge-finish",
+                    }),
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ..test_context("v2-upgrade-finish-recovery-bridge-start")
+                },
+            )
+            .await
+            .expect("recovery bridge upgrade start should succeed");
+        let start_flow_id = start.flow_id.clone();
+
+        let finish = service
+            .finish_password_upgrade_v2(
+                PasswordUpgradeFinishCommand {
+                    flow_id: start_flow_id.clone(),
+                    client_message: json!({
+                        "registration_upload": format!("ok-reg:{}", start_flow_id),
+                    }),
+                },
+                test_context("v2-upgrade-finish-recovery-bridge-complete"),
+            )
+            .await
+            .expect("recovery bridge upgrade finish should succeed");
+
+        assert!(finish.upgraded);
+
+        let legacy = legacy_passwords
+            .find_by_user_id(&user.id)
+            .await
+            .expect("legacy lookup should succeed")
+            .expect("legacy password should exist after upgrade");
+        assert!(legacy.migrated_to_opaque_at.is_some());
+        assert!(legacy.last_legacy_verified_at.is_some());
+
+        let audit_events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit storage should be available");
+        let started = audit_events
+            .iter()
+            .find(|event| {
+                event.event_type == "auth.v2.password.upgrade.started"
+                    && event.trace_id == "v2-upgrade-finish-recovery-bridge-start"
+            })
+            .expect("password upgrade start audit should be recorded");
+        let completed = audit_events
+            .iter()
+            .find(|event| {
+                event.event_type == "auth.v2.password.upgrade.completed"
+                    && event.trace_id == "v2-upgrade-finish-recovery-bridge-complete"
+            })
+            .expect("password upgrade completion audit should be recorded");
+
+        assert_eq!(
+            started.metadata.get("flow_id"),
+            Some(&json!(start_flow_id.clone()))
+        );
+        assert_eq!(
+            started.metadata.get("upgrade_context"),
+            Some(&json!("recovery_bridge"))
+        );
+        assert_eq!(
+            started.metadata.pointer("/recovery_bridge/flow_id"),
+            Some(&json!("recovery-bridge-finish"))
+        );
+        assert_eq!(
+            completed.metadata.get("flow_id"),
+            Some(&json!(start_flow_id.clone()))
+        );
+        assert_eq!(
+            completed.metadata.get("upgrade_context"),
+            Some(&json!("recovery_bridge"))
+        );
+        assert_eq!(
+            completed.metadata.pointer("/recovery_bridge/flow_id"),
+            Some(&json!("recovery-bridge-finish"))
+        );
     }
 
     #[tokio::test]
@@ -5309,7 +5957,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_risk_challenge_without_mfa_returns_invalid_credentials() {
+    async fn login_risk_challenge_without_mfa_returns_recovery_required() {
         let harness = build_harness_with_login_risk(Arc::new(IpChallengeLoginRiskAnalyzer));
 
         let result = harness
@@ -5330,7 +5978,19 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+        assert!(matches!(result, Err(AuthError::RecoveryRequired)));
+
+        let events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit lock should be available");
+        let event = events
+            .iter()
+            .find(|event| event.trace_id == "login-risk-challenge-no-mfa")
+            .expect("recovery-required login rejection audit should exist");
+        assert_eq!(event.event_type, "auth.login.rejected");
+        assert_eq!(event.metadata["reason"], "recovery_required");
     }
 
     #[tokio::test]
@@ -5388,6 +6048,70 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn finish_password_login_v2_returns_recovery_required_when_risk_step_up_lacks_mfa() {
+        let harness = build_harness_with_login_risk(Arc::new(IpChallengeLoginRiskAnalyzer));
+        let service = harness
+            .service
+            .clone()
+            .with_v2(build_v2_dependencies(&harness).await);
+
+        let discovery = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: false,
+                    supports_pake: true,
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ip: Some("198.51.100.10".to_string()),
+                    ..test_context("v2-methods-risk-recovery-required")
+                },
+            )
+            .await
+            .expect("v2 methods should succeed");
+
+        let start = service
+            .start_password_login_v2(
+                PakeLoginStartCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    discovery_token: discovery.discovery_token,
+                    request: json!({
+                        "supports_pake": true,
+                        "platform": "canary_web",
+                    }),
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ip: Some("198.51.100.10".to_string()),
+                    ..test_context("v2-login-start-risk-recovery-required")
+                },
+            )
+            .await
+            .expect("v2 password login start should succeed");
+
+        let result = service
+            .finish_password_login_v2(
+                PakeLoginFinishCommand {
+                    flow_id: start.flow_id.clone(),
+                    client_message: json!({
+                        "opaque_message": format!("ok:{}", start.flow_id),
+                    }),
+                    device_info: Some("risk-device".to_string()),
+                },
+                RequestContext {
+                    client_id: Some("web".to_string()),
+                    ip: Some("198.51.100.10".to_string()),
+                    ..test_context("v2-login-finish-risk-recovery-required")
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(AuthError::RecoveryRequired)));
+    }
+
     #[test]
     fn login_risk_penalty_profiles_are_stable() {
         assert_eq!(
@@ -5401,6 +6125,10 @@ mod tests {
         assert_eq!(
             super::login_risk_penalty_profile("blocked_email_domain"),
             ("elevated", 3)
+        );
+        assert_eq!(
+            super::login_risk_penalty_profile("recovery_required"),
+            ("elevated", 2)
         );
         assert_eq!(
             super::login_risk_penalty_profile("challenge_without_mfa"),
@@ -6430,6 +7158,11 @@ mod tests {
 
         assert_eq!(response.expires_in, 300);
         assert_eq!(response.recommended_method.as_deref(), Some("passkey"));
+        let recovery = response
+            .account_recovery
+            .expect("v2 methods should include neutral recovery guidance");
+        assert_eq!(recovery.kind, "password_reset");
+        assert_eq!(recovery.path, "/v1/auth/password/forgot");
         assert_eq!(response.methods.len(), 2);
         assert_eq!(response.methods[0].path, "/v2/auth/password/login/start");
         assert_eq!(response.methods[1].path, "/v2/auth/passkeys/login/start");
@@ -6470,6 +7203,7 @@ mod tests {
             .expect("unknown-account discovery should stay neutral");
 
         assert_eq!(unknown.expires_in, known.expires_in);
+        assert_eq!(unknown.account_recovery, known.account_recovery);
         assert_eq!(unknown.recommended_method, known.recommended_method);
         assert_eq!(unknown.methods.len(), known.methods.len());
         assert_eq!(unknown.methods[0].kind, known.methods[0].kind);
@@ -6881,7 +7615,8 @@ mod tests {
         let start = service
             .start_password_upgrade_v2(
                 PasswordUpgradeStartCommand {
-                    user_id: user.id.clone(),
+                    user_id: Some(user.id.clone()),
+                    context: crate::modules::auth::domain::PasswordUpgradeContext::session(),
                     request: json!({"platform": "web", "supports_pake": true}),
                 },
                 RequestContext {
@@ -6969,7 +7704,8 @@ mod tests {
         let result = service
             .start_password_upgrade_v2(
                 PasswordUpgradeStartCommand {
-                    user_id: user.id,
+                    user_id: Some(user.id),
+                    context: crate::modules::auth::domain::PasswordUpgradeContext::session(),
                     request: json!({"platform": "web", "supports_pake": true}),
                 },
                 RequestContext {

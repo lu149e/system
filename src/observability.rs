@@ -1179,6 +1179,12 @@ fn normalize_auth_v2_rejection_reason(reason: &str) -> &'static str {
         "invalid-token" | "invalid_token" | "https://example.com/problems/invalid-token" => {
             "invalid_token"
         }
+        "recovery-required"
+        | "recovery_required"
+        | "https://example.com/problems/recovery-required" => "recovery_required",
+        "invalid-recovery-bridge"
+        | "invalid_recovery_bridge"
+        | "https://example.com/problems/invalid-recovery-bridge" => "invalid_recovery_bridge",
         "invalid-credentials"
         | "invalid_credentials"
         | "https://example.com/problems/invalid-credentials" => "invalid_credentials",
@@ -1221,6 +1227,9 @@ fn auth_flow_kind_metric_label(kind: &crate::modules::auth::domain::AuthFlowKind
     match kind {
         crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery => "methods_discovery",
         crate::modules::auth::domain::AuthFlowKind::PasswordLogin => "password_login",
+        crate::modules::auth::domain::AuthFlowKind::RecoveryUpgradeBridge => {
+            "recovery_upgrade_bridge"
+        }
         crate::modules::auth::domain::AuthFlowKind::PasswordUpgrade => "password_upgrade",
         crate::modules::auth::domain::AuthFlowKind::PasskeyLogin => "passkey_login",
         crate::modules::auth::domain::AuthFlowKind::PasskeyRegister => "passkey_register",
@@ -1234,16 +1243,16 @@ mod tests {
         observe_auth_v2_password_duration, record_auth_v2_auth_flow_prune_error,
         record_auth_v2_auth_flow_prune_run, record_auth_v2_auth_flow_pruned,
         record_auth_v2_legacy_fallback, record_auth_v2_methods_rejected,
-        record_auth_v2_methods_request, record_auth_v2_password_request, record_email_delivery,
-        record_email_outbox_claim_failure, record_email_outbox_claim_poll,
-        record_email_outbox_dispatch, record_email_retry_intensity, record_login_risk_decision,
-        record_login_risk_penalty, record_passkey_challenge_prune_error,
-        record_passkey_challenge_prune_run, record_passkey_challenge_pruned,
-        record_passkey_login_rejected, record_passkey_register_rejected, record_passkey_request,
-        record_password_forgot_accepted, record_password_reset_rejected, record_problem_response,
-        record_refresh_error, record_refresh_success, render_prometheus,
-        set_auth_v2_auth_flow_janitor_enabled, set_auth_v2_auth_flow_metrics,
-        set_auth_v2_auth_flow_prune_interval_seconds,
+        record_auth_v2_methods_request, record_auth_v2_password_rejected,
+        record_auth_v2_password_request, record_email_delivery, record_email_outbox_claim_failure,
+        record_email_outbox_claim_poll, record_email_outbox_dispatch, record_email_retry_intensity,
+        record_login_risk_decision, record_login_risk_penalty,
+        record_passkey_challenge_prune_error, record_passkey_challenge_prune_run,
+        record_passkey_challenge_pruned, record_passkey_login_rejected,
+        record_passkey_register_rejected, record_passkey_request, record_password_forgot_accepted,
+        record_password_reset_rejected, record_problem_response, record_refresh_error,
+        record_refresh_success, render_prometheus, set_auth_v2_auth_flow_janitor_enabled,
+        set_auth_v2_auth_flow_metrics, set_auth_v2_auth_flow_prune_interval_seconds,
         set_auth_v2_auth_flow_prune_last_failure_unixtime,
         set_auth_v2_auth_flow_prune_last_success_unixtime, set_email_outbox_oldest_due_age_seconds,
         set_email_outbox_oldest_pending_age_seconds, set_email_outbox_queue_depth,
@@ -1275,6 +1284,8 @@ mod tests {
         record_auth_v2_password_request("login_finish", "error", "android");
         record_auth_v2_password_request("upgrade_start", "success", "ios");
         record_auth_v2_password_request("upgrade_finish", "error", "ios");
+        record_auth_v2_password_rejected("https://example.com/problems/recovery-required");
+        record_auth_v2_password_rejected("https://example.com/problems/invalid-recovery-bridge");
         observe_auth_v2_password_duration(
             "login_start",
             "success",
@@ -1417,6 +1428,8 @@ mod tests {
         assert!(payload.contains("reason=\"invalid_or_expired_challenge\""));
         assert!(payload.contains("reason=\"challenge_user_mismatch\""));
         assert!(payload.contains("reason=\"account_not_active\""));
+        assert!(payload.contains("reason=\"recovery_required\""));
+        assert!(payload.contains("reason=\"invalid_recovery_bridge\""));
         assert!(payload.contains("outcome=\"existing_not_active\""));
         assert!(payload.contains("channel=\"canary_web\""));
         assert!(payload.contains("channel=\"canary_mobile\""));
