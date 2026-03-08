@@ -887,7 +887,8 @@ pub async fn auth_methods_v2(
         .channel
         .clone()
         .or_else(|| payload.client.platform.clone());
-    let rollout = auth_v2_rollout_for_request(&state, client_id.as_deref(), &trace_id)?;
+    let rollout = auth_v2_rollout_for_request(&state, client_id.as_deref(), &trace_id)
+        .map_err(|problem| *problem)?;
     let cohort_label = rollout.cohort_label().to_string();
     if !auth_v2_allows_external_access(&rollout) {
         let rejection_reason = auth_v2_gate_rejection_reason(&state);
@@ -1060,7 +1061,8 @@ pub async fn password_upgrade_start_v2(
 
     let principal = extract_principal(&state, &headers, trace_id.clone()).await?;
     let client_id = payload.client.platform.clone();
-    let rollout = auth_v2_rollout_for_request(&state, client_id.as_deref(), &trace_id)?;
+    let rollout = auth_v2_rollout_for_request(&state, client_id.as_deref(), &trace_id)
+        .map_err(|problem| *problem)?;
     let rollout_cohort_label = rollout.cohort_label().to_string();
     if !auth_v2_allows_external_access(&rollout) {
         let rejection_reason = auth_v2_gate_rejection_reason(&state);
@@ -1849,9 +1851,12 @@ fn auth_v2_rollout_for_request(
     state: &AppState,
     client_id: Option<&str>,
     trace_id: &str,
-) -> Result<AuthV2RolloutDecision, ApiProblem> {
+) -> Result<AuthV2RolloutDecision, Box<ApiProblem>> {
     let Some(config) = state.auth_service.auth_v2_config() else {
-        return Err(from_auth_error(AuthError::Internal, trace_id.to_string()));
+        return Err(Box::new(from_auth_error(
+            AuthError::Internal,
+            trace_id.to_string(),
+        )));
     };
 
     Ok(evaluate_auth_v2_rollout(&config, client_id, None))
