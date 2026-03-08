@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PRODUCTION_OVERLAY_GENERATED_DIR="${ROOT_DIR}/artifacts/production-overlay/generated"
 ARTIFACT_DIR="${ROOT_DIR}/artifacts/deploy-readiness"
 STRICT_DEPLOY_VALIDATION="${STRICT_DEPLOY_VALIDATION:-false}"
+GENERATE_PRODUCTION_OVERLAY_SCRIPT="${ROOT_DIR}/scripts/generate-production-overlay.sh"
+NORMALIZE_AUTH_V2_COHORTS_SCRIPT="${ROOT_DIR}/scripts/normalize-auth-v2-cohorts.sh"
 
 AUTH_V2_ENABLED="${AUTH_V2_ENABLED:-false}"
 AUTH_V2_METHODS_ENABLED="${AUTH_V2_METHODS_ENABLED:-false}"
@@ -48,6 +50,97 @@ warn_or_fail_missing_tool() {
     fail "missing optional tool '${tool}' required for strict mode (${purpose})"
   else
     warn "missing optional tool '${tool}' (${purpose}); continuing with fallback checks"
+  fi
+}
+
+readiness_assert_eq() {
+  local actual="$1"
+  local expected="$2"
+  local message="$3"
+
+  if [[ "${actual}" != "${expected}" ]]; then
+    printf 'self-test failed: %s\nexpected: %s\nactual: %s\n' "${message}" "${expected}" "${actual}" >&2
+    exit 1
+  fi
+}
+
+readiness_assert_contains() {
+  local haystack="$1"
+  local needle="$2"
+  local message="$3"
+
+  if [[ "${haystack}" != *"${needle}"* ]]; then
+    printf 'self-test failed: %s\nexpected substring: %s\noutput: %s\n' "${message}" "${needle}" "${haystack}" >&2
+    exit 1
+  fi
+}
+
+normalize_expected_auth_v2_allowlist() {
+  local normalized_allowlist
+  local status=0
+
+  [[ -f "${NORMALIZE_AUTH_V2_COHORTS_SCRIPT}" ]] || fail "missing auth v2 cohort normalizer: ${NORMALIZE_AUTH_V2_COHORTS_SCRIPT}"
+  normalized_allowlist="$(bash "${NORMALIZE_AUTH_V2_COHORTS_SCRIPT}" "${AUTH_V2_CLIENT_ALLOWLIST}")" || status=$?
+  if [[ ${status} -ne 0 ]]; then
+    return "${status}"
+  fi
+
+  AUTH_V2_CLIENT_ALLOWLIST="${normalized_allowlist}"
+}
+
+validate_auth_v2_boolean_flag() {
+  local flag_name="$1"
+  local value="$2"
+
+  case "${value}" in
+    true|false) ;;
+    *)
+      fail "${flag_name} must be either 'true' or 'false'"
+      ;;
+  esac
+}
+
+check_auth_v2_flag_relationships() {
+  local -a enabled_children=()
+  local -a flow_dependent_children=()
+  local report_file="${ARTIFACT_DIR}/production-auth-v2-rollout-relationships.txt"
+
+  validate_auth_v2_boolean_flag "AUTH_V2_ENABLED" "${AUTH_V2_ENABLED}"
+  validate_auth_v2_boolean_flag "AUTH_V2_METHODS_ENABLED" "${AUTH_V2_METHODS_ENABLED}"
+  validate_auth_v2_boolean_flag "AUTH_V2_PASSWORD_PAKE_ENABLED" "${AUTH_V2_PASSWORD_PAKE_ENABLED}"
+  validate_auth_v2_boolean_flag "AUTH_V2_PASSWORD_UPGRADE_ENABLED" "${AUTH_V2_PASSWORD_UPGRADE_ENABLED}"
+  validate_auth_v2_boolean_flag "AUTH_V2_PASSKEY_NAMESPACE_ENABLED" "${AUTH_V2_PASSKEY_NAMESPACE_ENABLED}"
+  validate_auth_v2_boolean_flag "AUTH_V2_AUTH_FLOWS_ENABLED" "${AUTH_V2_AUTH_FLOWS_ENABLED}"
+  validate_auth_v2_boolean_flag "AUTH_V2_SHADOW_AUDIT_ONLY" "${AUTH_V2_SHADOW_AUDIT_ONLY}"
+
+  if [[ "${AUTH_V2_ENABLED}" != "true" ]]; then
+    [[ "${AUTH_V2_METHODS_ENABLED}" == "true" ]] && enabled_children+=("AUTH_V2_METHODS_ENABLED")
+    [[ "${AUTH_V2_PASSWORD_PAKE_ENABLED}" == "true" ]] && enabled_children+=("AUTH_V2_PASSWORD_PAKE_ENABLED")
+    [[ "${AUTH_V2_PASSWORD_UPGRADE_ENABLED}" == "true" ]] && enabled_children+=("AUTH_V2_PASSWORD_UPGRADE_ENABLED")
+    [[ "${AUTH_V2_PASSKEY_NAMESPACE_ENABLED}" == "true" ]] && enabled_children+=("AUTH_V2_PASSKEY_NAMESPACE_ENABLED")
+    [[ "${AUTH_V2_AUTH_FLOWS_ENABLED}" == "true" ]] && enabled_children+=("AUTH_V2_AUTH_FLOWS_ENABLED")
+  fi
+
+  if [[ "${AUTH_V2_AUTH_FLOWS_ENABLED}" != "true" ]]; then
+    [[ "${AUTH_V2_METHODS_ENABLED}" == "true" ]] && flow_dependent_children+=("AUTH_V2_METHODS_ENABLED")
+    [[ "${AUTH_V2_PASSWORD_PAKE_ENABLED}" == "true" ]] && flow_dependent_children+=("AUTH_V2_PASSWORD_PAKE_ENABLED")
+    [[ "${AUTH_V2_PASSWORD_UPGRADE_ENABLED}" == "true" ]] && flow_dependent_children+=("AUTH_V2_PASSWORD_UPGRADE_ENABLED")
+  fi
+
+  {
+    printf 'Validated auth v2 rollout flag relationships.\n'
+    printf 'AUTH_V2_ENABLED=%s\n' "${AUTH_V2_ENABLED}"
+    printf 'AUTH_V2_AUTH_FLOWS_ENABLED=%s\n' "${AUTH_V2_AUTH_FLOWS_ENABLED}"
+  } >"${report_file}"
+
+  if [[ ${#enabled_children[@]} -gt 0 ]]; then
+    printf '\nInconsistencies:\n- AUTH_V2_ENABLED=false is inconsistent with enabled child rollout flags: %s\n' "${enabled_children[*]}" >>"${report_file}"
+    fail "AUTH_V2_ENABLED=false is inconsistent with enabled child rollout flags: ${enabled_children[*]}"
+  fi
+
+  if [[ ${#flow_dependent_children[@]} -gt 0 ]]; then
+    printf '\nInconsistencies:\n- AUTH_V2_AUTH_FLOWS_ENABLED=false is inconsistent with flow-dependent rollout flags: %s\n' "${flow_dependent_children[*]}" >>"${report_file}"
+    fail "AUTH_V2_AUTH_FLOWS_ENABLED=false is inconsistent with flow-dependent rollout flags: ${flow_dependent_children[*]}"
   fi
 }
 
@@ -158,6 +251,18 @@ check_auth_v2_rollout_contract() {
     return
   fi
 
+  local normalize_status=0
+  normalize_expected_auth_v2_allowlist || normalize_status=$?
+  if [[ ${normalize_status} -ne 0 ]]; then
+    fail "invalid AUTH_V2_CLIENT_ALLOWLIST provided to readiness validation"
+    return
+  fi
+
+  check_auth_v2_flag_relationships
+  if [[ ${failures} -gt 0 ]]; then
+    return
+  fi
+
   if ! python3 - "${configmap_patch}" "${report_file}" \
     "AUTH_V2_ENABLED=${AUTH_V2_ENABLED}" \
     "AUTH_V2_METHODS_ENABLED=${AUTH_V2_METHODS_ENABLED}" \
@@ -195,23 +300,6 @@ for key, expected in expected_pairs:
     else:
         lines.append(f"OK {key}={actual!r}")
 
-feature_flags = {
-    "AUTH_V2_METHODS_ENABLED": dict(expected_pairs).get("AUTH_V2_METHODS_ENABLED", "false"),
-    "AUTH_V2_PASSWORD_PAKE_ENABLED": dict(expected_pairs).get("AUTH_V2_PASSWORD_PAKE_ENABLED", "false"),
-    "AUTH_V2_PASSWORD_UPGRADE_ENABLED": dict(expected_pairs).get("AUTH_V2_PASSWORD_UPGRADE_ENABLED", "false"),
-    "AUTH_V2_PASSKEY_NAMESPACE_ENABLED": dict(expected_pairs).get("AUTH_V2_PASSKEY_NAMESPACE_ENABLED", "false"),
-    "AUTH_V2_AUTH_FLOWS_ENABLED": dict(expected_pairs).get("AUTH_V2_AUTH_FLOWS_ENABLED", "false"),
-}
-
-auth_v2_enabled = dict(expected_pairs).get("AUTH_V2_ENABLED", "false")
-if auth_v2_enabled != "true":
-    enabled_children = [name for name, value in feature_flags.items() if value == "true"]
-    if enabled_children:
-        errors.append(
-            "AUTH_V2_ENABLED=false is inconsistent with enabled child rollout flags: "
-            + ", ".join(enabled_children)
-        )
-
 report_lines = [f"Validated auth v2 rollout contract in {patch_path}."]
 report_lines.extend(lines)
 if errors:
@@ -234,7 +322,118 @@ PY
   info "Auth v2 rollout contract check passed"
 }
 
+run_generate_overlay_for_self_test() {
+  GENERATED_DIR="${PRODUCTION_OVERLAY_GENERATED_DIR}" "${GENERATE_PRODUCTION_OVERLAY_SCRIPT}" >/dev/null
+}
+
+self_test() {
+  local temp_dir output report_contents
+  temp_dir="$(mktemp -d)"
+
+  PRODUCTION_OVERLAY_GENERATED_DIR="${temp_dir}/generated"
+  ARTIFACT_DIR="${temp_dir}/artifacts"
+
+  IMAGE_DIGEST="sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  INGRESS_HOST="auth.example.org"
+  TLS_SECRET_NAME="auth-prod-tls"
+  POSTGRES_CIDR="10.20.0.0/24"
+  REDIS_CIDR="10.30.0.0/24"
+  ENFORCE_DATABASE_TLS="true"
+  ENFORCE_REDIS_TLS="true"
+  ENFORCE_SECURE_TRANSPORT="true"
+  PASSKEY_ENABLED="false"
+  PASSKEY_RP_ID=""
+  PASSKEY_RP_ORIGIN=""
+  PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS="60"
+  LOGIN_RISK_MODE="baseline"
+  LOGIN_RISK_BLOCKED_CIDRS=""
+  LOGIN_RISK_BLOCKED_USER_AGENT_SUBSTRINGS=""
+  LOGIN_RISK_BLOCKED_EMAIL_DOMAINS=""
+  LOGIN_RISK_CHALLENGE_CIDRS=""
+  LOGIN_RISK_CHALLENGE_USER_AGENT_SUBSTRINGS=""
+  LOGIN_RISK_CHALLENGE_EMAIL_DOMAINS=""
+  AUTH_V2_ENABLED="true"
+  AUTH_V2_METHODS_ENABLED="true"
+  AUTH_V2_PASSWORD_PAKE_ENABLED="true"
+  AUTH_V2_PASSWORD_UPGRADE_ENABLED="true"
+  AUTH_V2_PASSKEY_NAMESPACE_ENABLED="false"
+  AUTH_V2_AUTH_FLOWS_ENABLED="true"
+  AUTH_V2_LEGACY_FALLBACK_MODE="allowlisted"
+  AUTH_V2_CLIENT_ALLOWLIST="internal,canary_mobile"
+  AUTH_V2_SHADOW_AUDIT_ONLY="false"
+  AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS="300"
+
+  export IMAGE_DIGEST INGRESS_HOST TLS_SECRET_NAME POSTGRES_CIDR REDIS_CIDR
+  export ENFORCE_DATABASE_TLS ENFORCE_REDIS_TLS ENFORCE_SECURE_TRANSPORT
+  export PASSKEY_ENABLED PASSKEY_RP_ID PASSKEY_RP_ORIGIN PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS
+  export LOGIN_RISK_MODE LOGIN_RISK_BLOCKED_CIDRS LOGIN_RISK_BLOCKED_USER_AGENT_SUBSTRINGS
+  export LOGIN_RISK_BLOCKED_EMAIL_DOMAINS LOGIN_RISK_CHALLENGE_CIDRS
+  export LOGIN_RISK_CHALLENGE_USER_AGENT_SUBSTRINGS LOGIN_RISK_CHALLENGE_EMAIL_DOMAINS
+  export AUTH_V2_ENABLED AUTH_V2_METHODS_ENABLED AUTH_V2_PASSWORD_PAKE_ENABLED
+  export AUTH_V2_PASSWORD_UPGRADE_ENABLED AUTH_V2_PASSKEY_NAMESPACE_ENABLED
+  export AUTH_V2_AUTH_FLOWS_ENABLED AUTH_V2_LEGACY_FALLBACK_MODE AUTH_V2_CLIENT_ALLOWLIST
+  export AUTH_V2_SHADOW_AUDIT_ONLY AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS
+
+  mkdir -p "${ARTIFACT_DIR}"
+  run_generate_overlay_for_self_test
+
+  AUTH_V2_CLIENT_ALLOWLIST=" internal-web , ios-beta "
+  output="$(main 2>&1)"
+  readiness_assert_contains "${output}" "Deploy readiness validation passed" "normalizes alias allowlist before readiness comparison"
+  report_contents="$(<"${ARTIFACT_DIR}/production-auth-v2-rollout-report.txt")"
+  readiness_assert_contains "${report_contents}" "OK AUTH_V2_CLIENT_ALLOWLIST='internal,canary_mobile'" "writes canonicalized allowlist into readiness report"
+
+  AUTH_V2_CLIENT_ALLOWLIST="partner-preview"
+  if output="$(main 2>&1)"; then
+    printf 'self-test failed: invalid allowlist should fail readiness validation\n' >&2
+    exit 1
+  fi
+  readiness_assert_contains "${output}" "invalid AUTH_V2_CLIENT_ALLOWLIST provided to readiness validation" "rejects unsupported allowlist input during readiness validation"
+
+  AUTH_V2_CLIENT_ALLOWLIST="internal"
+  AUTH_V2_ENABLED="false"
+  AUTH_V2_METHODS_ENABLED="true"
+  AUTH_V2_PASSWORD_PAKE_ENABLED="false"
+  AUTH_V2_PASSWORD_UPGRADE_ENABLED="false"
+  AUTH_V2_PASSKEY_NAMESPACE_ENABLED="false"
+  AUTH_V2_AUTH_FLOWS_ENABLED="true"
+  run_generate_overlay_for_self_test
+  if output="$(main 2>&1)"; then
+    printf 'self-test failed: disabled auth v2 with enabled child flags should fail readiness validation\n' >&2
+    exit 1
+  fi
+  readiness_assert_contains "${output}" "AUTH_V2_ENABLED=false is inconsistent with enabled child rollout flags" "fails closed when top-level auth v2 is disabled but child flags are enabled"
+
+  AUTH_V2_ENABLED="true"
+  AUTH_V2_METHODS_ENABLED="true"
+  AUTH_V2_PASSWORD_PAKE_ENABLED="true"
+  AUTH_V2_PASSWORD_UPGRADE_ENABLED="false"
+  AUTH_V2_AUTH_FLOWS_ENABLED="false"
+  run_generate_overlay_for_self_test
+  if output="$(main 2>&1)"; then
+    printf 'self-test failed: flow-dependent flags without auth flows should fail readiness validation\n' >&2
+    exit 1
+  fi
+  readiness_assert_contains "${output}" "AUTH_V2_AUTH_FLOWS_ENABLED=false is inconsistent with flow-dependent rollout flags" "fails closed when flow-dependent flags are enabled without auth flows"
+
+  rm -rf "${temp_dir}"
+  printf 'deploy readiness self-test passed\n'
+}
+
 main() {
+  if [[ "${1:-}" == "--self-test" ]]; then
+    self_test
+    return 0
+  fi
+
+  if [[ "$#" -gt 0 ]]; then
+    printf 'usage: %s [--self-test]\n' "$0" >&2
+    return 1
+  fi
+
+  failures=0
+  warnings=0
+
   cd "${ROOT_DIR}"
   mkdir -p "${ARTIFACT_DIR}"
 

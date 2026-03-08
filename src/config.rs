@@ -75,6 +75,29 @@ pub struct AuthV2Config {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthV2Cohort {
+    Internal,
+    CanaryWeb,
+    CanaryMobile,
+    BetaExternal,
+    BroadGeneral,
+    LegacyHoldout,
+}
+
+impl AuthV2Cohort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::CanaryWeb => "canary_web",
+            Self::CanaryMobile => "canary_mobile",
+            Self::BetaExternal => "beta_external",
+            Self::BroadGeneral => "broad_general",
+            Self::LegacyHoldout => "legacy_holdout",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthV2PakeProvider {
     Unavailable,
     OpaqueKe,
@@ -96,13 +119,20 @@ impl AuthV2Config {
     }
 
     pub fn client_is_allowlisted(&self, client_id: Option<&str>) -> bool {
-        let Some(client_id) = Self::normalized_client_id(client_id) else {
+        let Some(normalized_client_id) = Self::normalized_client_id(client_id) else {
             return false;
         };
+        let canonical_client_id = normalize_auth_v2_cohort_label(Some(&normalized_client_id));
 
-        self.client_allowlist
-            .iter()
-            .any(|value| value == &client_id)
+        self.client_allowlist.iter().any(|value| {
+            let stored_value = normalize_auth_v2_cohort_label(Some(value))
+                .unwrap_or_else(|| value.trim().to_ascii_lowercase());
+
+            stored_value == normalized_client_id
+                || canonical_client_id
+                    .as_ref()
+                    .is_some_and(|canonical| canonical == &stored_value)
+        })
     }
 }
 
@@ -239,7 +269,7 @@ impl AppConfig {
             )?,
             client_allowlist: parse_auth_v2_client_allowlist(
                 std::env::var("AUTH_V2_CLIENT_ALLOWLIST").unwrap_or_default(),
-            ),
+            )?,
             shadow_audit_only: std::env::var("AUTH_V2_SHADOW_AUDIT_ONLY")
                 .unwrap_or_else(|_| "false".to_string())
                 .parse::<bool>()
@@ -837,14 +867,42 @@ fn parse_auth_v2_legacy_fallback_mode(value: String) -> Result<AuthV2LegacyFallb
     }
 }
 
-fn parse_auth_v2_client_allowlist(value: String) -> Vec<String> {
+pub(crate) fn resolve_auth_v2_cohort(value: &str) -> Result<AuthV2Cohort> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "internal" | "internal-web" | "staff" | "qa" => Ok(AuthV2Cohort::Internal),
+        "canary_web" | "web" => Ok(AuthV2Cohort::CanaryWeb),
+        "canary_mobile" | "ios" | "android" | "ios-beta" | "android-beta" => {
+            Ok(AuthV2Cohort::CanaryMobile)
+        }
+        "beta_external" | "external-beta" => Ok(AuthV2Cohort::BetaExternal),
+        "broad_general" | "general" | "prod" => Ok(AuthV2Cohort::BroadGeneral),
+        "legacy_holdout" | "legacy" => Ok(AuthV2Cohort::LegacyHoldout),
+        "" => anyhow::bail!("unsupported AUTH_V2_CLIENT_ALLOWLIST value: "),
+        other => anyhow::bail!("unsupported AUTH_V2_CLIENT_ALLOWLIST value: {other}"),
+    }
+}
+
+fn normalize_auth_v2_cohort_label(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| resolve_auth_v2_cohort(value).ok())
+        .map(|cohort| cohort.as_str().to_string())
+}
+
+fn parse_auth_v2_client_allowlist(value: String) -> Result<Vec<String>> {
     let mut seen = HashSet::new();
 
     parse_csv_non_empty_values(value)
         .into_iter()
-        .filter_map(|entry| AuthV2Config::normalized_client_id(Some(&entry)))
-        .filter(|entry| seen.insert(entry.clone()))
-        .collect()
+        .map(|entry| resolve_auth_v2_cohort(&entry).map(|cohort| cohort.as_str().to_string()))
+        .collect::<Result<Vec<_>>>()
+        .map(|entries| {
+            entries
+                .into_iter()
+                .filter(|entry| seen.insert(entry.clone()))
+                .collect()
+        })
 }
 
 fn parse_auth_v2_pake_provider(value: String) -> Result<AuthV2PakeProvider> {
@@ -1247,10 +1305,11 @@ mod tests {
         parse_auth_v2_legacy_fallback_mode, parse_auth_v2_pake_provider, parse_email_delivery_mode,
         parse_email_provider_config, parse_login_risk_blocked_cidrs,
         parse_login_risk_challenge_cidrs, parse_login_risk_mode, parse_metrics_allowed_cidrs,
-        parse_positive_u64_with_default, redis_url_uses_secure_transport,
+        parse_positive_u64_with_default, redis_url_uses_secure_transport, resolve_auth_v2_cohort,
         resolve_jwt_key_configuration, resolve_optional_secret_from_env,
-        validate_backend_transport_security, AppConfig, AuthRuntime, AuthV2LegacyFallbackMode,
-        AuthV2PakeProvider, EmailDeliveryMode, EmailProviderConfig, LoginRiskMode,
+        validate_backend_transport_security, AppConfig, AuthRuntime, AuthV2Cohort,
+        AuthV2LegacyFallbackMode, AuthV2PakeProvider, EmailDeliveryMode, EmailProviderConfig,
+        LoginRiskMode,
     };
 
     #[test]
@@ -1325,10 +1384,42 @@ mod tests {
 
     #[test]
     fn parse_auth_v2_client_allowlist_normalizes_and_deduplicates_values() {
-        let allowlist =
-            parse_auth_v2_client_allowlist(" Web ,ios,web,, ANDROID , ios ".to_string());
+        let allowlist = parse_auth_v2_client_allowlist(
+            " canary_web , WEB , ios-beta ,, internal-web , IOS ".to_string(),
+        )
+        .expect("supported cohorts and aliases should normalize");
 
-        assert_eq!(allowlist, vec!["web", "ios", "android"]);
+        assert_eq!(allowlist, vec!["canary_web", "canary_mobile", "internal"]);
+    }
+
+    #[test]
+    fn resolve_auth_v2_cohort_maps_supported_aliases_to_canonical_values() {
+        assert_eq!(
+            resolve_auth_v2_cohort("internal-web").expect("internal alias should resolve"),
+            AuthV2Cohort::Internal
+        );
+        assert_eq!(
+            resolve_auth_v2_cohort("web").expect("web alias should resolve"),
+            AuthV2Cohort::CanaryWeb
+        );
+        assert_eq!(
+            resolve_auth_v2_cohort("ios-beta").expect("ios beta alias should resolve"),
+            AuthV2Cohort::CanaryMobile
+        );
+        assert_eq!(
+            resolve_auth_v2_cohort("android").expect("android alias should resolve"),
+            AuthV2Cohort::CanaryMobile
+        );
+    }
+
+    #[test]
+    fn parse_auth_v2_client_allowlist_rejects_unknown_values() {
+        let error = parse_auth_v2_client_allowlist("web,partner-preview".to_string())
+            .expect_err("unsupported cohorts should fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("unsupported AUTH_V2_CLIENT_ALLOWLIST value: partner-preview"));
     }
 
     #[test]
@@ -1344,12 +1435,14 @@ mod tests {
             passkey_namespace_enabled: true,
             auth_flows_enabled: true,
             legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
-            client_allowlist: parse_auth_v2_client_allowlist("web, ios".to_string()),
+            client_allowlist: parse_auth_v2_client_allowlist("canary_web, ios-beta".to_string())
+                .expect("allowlist should parse"),
             shadow_audit_only: false,
         };
 
         assert!(config.client_is_allowlisted(Some("WEB")));
-        assert!(!config.client_is_allowlisted(Some("android")));
+        assert!(config.client_is_allowlisted(Some("ios")));
+        assert!(!config.client_is_allowlisted(Some("legacy-holdout")));
         assert!(!config.client_is_allowlisted(None));
     }
 
@@ -1411,7 +1504,10 @@ mod tests {
                 ("AUTH_V2_PASSKEY_NAMESPACE_ENABLED", Some("true")),
                 ("AUTH_V2_AUTH_FLOWS_ENABLED", Some("true")),
                 ("AUTH_V2_LEGACY_FALLBACK_MODE", Some("allowlisted")),
-                ("AUTH_V2_CLIENT_ALLOWLIST", Some(" web,ios ,, android ")),
+                (
+                    "AUTH_V2_CLIENT_ALLOWLIST",
+                    Some(" canary_web , internal-web ,, ios-beta "),
+                ),
                 ("AUTH_V2_SHADOW_AUDIT_ONLY", Some("true")),
                 ("AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS", Some("90")),
             ],
@@ -1430,10 +1526,56 @@ mod tests {
                 );
                 assert_eq!(
                     config.auth_v2.client_allowlist,
-                    vec!["web", "ios", "android"]
+                    vec!["canary_web", "internal", "canary_mobile"]
                 );
                 assert!(config.auth_v2.shadow_audit_only);
                 assert_eq!(config.auth_v2_auth_flow_prune_interval_seconds, 90);
+            },
+        );
+    }
+
+    #[test]
+    fn app_config_from_env_rejects_invalid_auth_v2_allowlist_value() {
+        let _guard = env_lock();
+        let private_key_path = write_temp_secret_file(TEST_PRIVATE_KEY_PEM);
+        let public_key_path = write_temp_secret_file(TEST_PUBLIC_KEY_PEM);
+        let keyset = format!(
+            "primary|{}|{}",
+            private_key_path.to_string_lossy(),
+            public_key_path.to_string_lossy()
+        );
+
+        with_env_vars(
+            &[
+                ("REFRESH_TOKEN_PEPPER", Some("test-refresh-pepper")),
+                (
+                    "MFA_ENCRYPTION_KEY_BASE64",
+                    Some("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
+                ),
+                (
+                    "DATABASE_URL",
+                    Some("postgres://auth:auth@127.0.0.1:5432/auth"),
+                ),
+                ("REDIS_URL", Some("redis://127.0.0.1:6379")),
+                ("JWT_PRIMARY_KID", None),
+                ("JWT_PRIVATE_KEY_PEM", None),
+                ("JWT_PUBLIC_KEY_PEM", None),
+                ("JWT_KEY_ID", None),
+                ("JWT_KEYSET", Some(keyset.as_str())),
+                (
+                    "AUTH_V2_CLIENT_ALLOWLIST",
+                    Some("canary_web,partner-preview"),
+                ),
+            ],
+            || {
+                let error = match AppConfig::from_env() {
+                    Ok(_) => panic!("invalid auth v2 allowlist value should fail"),
+                    Err(error) => error,
+                };
+
+                assert!(error
+                    .to_string()
+                    .contains("unsupported AUTH_V2_CLIENT_ALLOWLIST value: partner-preview"));
             },
         );
     }

@@ -139,12 +139,15 @@ jobs:
       AUTH_V2_PASSKEY_NAMESPACE_ENABLED: "false"
       AUTH_V2_AUTH_FLOWS_ENABLED: "true"
       AUTH_V2_LEGACY_FALLBACK_MODE: "allowlisted"
-      AUTH_V2_CLIENT_ALLOWLIST: "internal-web,ios-beta"
+      AUTH_V2_CLIENT_ALLOWLIST: "internal,canary_mobile"
       AUTH_V2_SHADOW_AUDIT_ONLY: "false"
       AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS: "300"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      - name: Validate auth v2 cohort normalization script
+        run: bash ./scripts/normalize-auth-v2-cohorts.sh --self-test
 
       - name: Install kustomize
         run: |

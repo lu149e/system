@@ -39,7 +39,7 @@
 - `AUTH_V2_PASSKEY_NAMESPACE_ENABLED` - exposes `/v2/auth/passkeys/*` aliases or new handlers
 - `AUTH_V2_AUTH_FLOWS_ENABLED` - enables shared flow store usage
 - `AUTH_V2_LEGACY_FALLBACK_MODE` - `disabled | allowlisted | broad`
-- `AUTH_V2_CLIENT_ALLOWLIST` - CSV or remote config of clients/channels allowed into v2
+- `AUTH_V2_CLIENT_ALLOWLIST` - CSV of canonical cohorts (`internal`, `canary_web`, `canary_mobile`, `beta_external`, `broad_general`, `legacy_holdout`); runtime and deploy tooling also normalize documented aliases like `internal-web` and `ios-beta`
 - `AUTH_V2_SHADOW_AUDIT_ONLY` - compute v2 eligibility without serving v2 externally
 
 ### Flag rules
@@ -95,7 +95,7 @@
 - `broad_general` - default production traffic
 - `legacy_holdout` - explicitly carved-out old clients
 
-Each auth event should include rollout channel in audit metadata.
+Each auth event should include the canonical rollout cohort in audit metadata, while shadow vs external serving stays separate.
 
 ## Observability
 

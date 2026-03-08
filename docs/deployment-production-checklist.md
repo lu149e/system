@@ -138,7 +138,7 @@ LOGIN_RISK_MODE='baseline' \
 # AUTH_V2_PASSKEY_NAMESPACE_ENABLED='false' \
 # AUTH_V2_AUTH_FLOWS_ENABLED='true' \
 # AUTH_V2_LEGACY_FALLBACK_MODE='allowlisted' \
-# AUTH_V2_CLIENT_ALLOWLIST='internal-web,ios-beta' \
+# AUTH_V2_CLIENT_ALLOWLIST='internal,canary_mobile' \
 # AUTH_V2_SHADOW_AUDIT_ONLY='false' \
 # AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS='300' \
 # PASSKEY_ENABLED='true' \
@@ -152,6 +152,7 @@ LOGIN_RISK_MODE='baseline' \
    - Templates are versioned in `deploy/k8s/overlays/production/templates/`.
    - Generated, environment-resolved manifests are written to `artifacts/production-overlay/generated/`.
    - The generator fails fast on missing/invalid inputs.
+   - `AUTH_V2_CLIENT_ALLOWLIST` should use canonical cohorts; the deploy workflow still accepts documented aliases but rewrites them before rendering artifacts.
 
 3. Run deploy readiness gate locally or in GitHub Actions:
 
@@ -189,7 +190,7 @@ STRICT_DEPLOY_VALIDATION=true ./scripts/validate-deploy-readiness.sh
 # - login_risk_challenge_user_agent_substrings (optional CSV)
 # - login_risk_challenge_email_domains (optional CSV)
 # Auth v2 rollout input:
-# - auth_v2_rollout_env (multiline KEY=VALUE block for AUTH_V2_* knobs)
+# - auth_v2_rollout_env (multiline KEY=VALUE block for AUTH_V2_* knobs; `AUTH_V2_CLIENT_ALLOWLIST` is normalized to canonical cohorts and rejected if it contains unsupported values)
 #   AUTH_V2_ENABLED=false
 #   AUTH_V2_METHODS_ENABLED=false
 #   AUTH_V2_PASSWORD_PAKE_ENABLED=false

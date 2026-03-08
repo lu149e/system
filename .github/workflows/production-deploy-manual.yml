@@ -183,6 +183,9 @@ jobs:
       - name: Ensure deploy scripts are executable
         run: chmod +x scripts/generate-production-overlay.sh scripts/generate-k8s-secret-manifest.sh scripts/generate-k8s-jwt-key-secret.sh scripts/validate-deploy-readiness.sh
 
+      - name: Validate auth v2 cohort normalization script
+        run: bash ./scripts/normalize-auth-v2-cohorts.sh --self-test
+
       - name: Generate production secret manifest
         env:
           DATABASE_URL: ${{ secrets.PROD_AUTH_DATABASE_URL }}
@@ -256,6 +259,10 @@ jobs:
             if [[ ! -v auth_v2_values[${key}] ]]; then
               echo "Unsupported auth_v2_rollout_env key: ${key}" >&2
               exit 1
+            fi
+
+            if [[ "${key}" == "AUTH_V2_CLIENT_ALLOWLIST" ]]; then
+              value="$(bash ./scripts/normalize-auth-v2-cohorts.sh "${value}")"
             fi
 
             auth_v2_values["${key}"]="${value}"

@@ -43,7 +43,7 @@ use crate::modules::{
     },
 };
 
-use crate::config::{AuthV2Config, AuthV2LegacyFallbackMode};
+use crate::config::{resolve_auth_v2_cohort, AuthV2Config, AuthV2LegacyFallbackMode};
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -124,11 +124,37 @@ impl AuthV2FallbackPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthV2ServingMode {
+    External,
+    Shadow,
+}
+
+impl AuthV2ServingMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::External => "external",
+            Self::Shadow => "shadow",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuthV2RolloutDecision {
-    pub(crate) rollout_channel: String,
+    pub(crate) requested_client_id: Option<String>,
+    pub(crate) cohort: Option<String>,
+    pub(crate) serving_mode: AuthV2ServingMode,
     pub(crate) client_allowed: bool,
     pub(crate) fallback_policy: AuthV2FallbackPolicy,
+}
+
+impl AuthV2RolloutDecision {
+    pub(crate) fn cohort_label(&self) -> &str {
+        self.cohort
+            .as_deref()
+            .or(self.requested_client_id.as_deref())
+            .unwrap_or("unknown")
+    }
 }
 
 #[derive(Debug, Error)]
@@ -1432,12 +1458,12 @@ impl AuthService {
         }
 
         let rollout = auth_v2_rollout_from_flow(&v2.config, &flow, None);
-        if !auth_v2_allows_external_access(&v2.config, &rollout) {
+        if !auth_v2_allows_external_access(&rollout) {
             return Err(AuthError::AuthV2RolloutDenied);
         }
 
         let mut ctx = ctx;
-        ctx.client_id = Some(rollout.rollout_channel);
+        ctx.client_id = Some(rollout.cohort_label().to_string());
         self.passkey_login_start(identifier, ctx).await
     }
 
@@ -1746,9 +1772,11 @@ impl AuthService {
                     "supports_pake": cmd.supports_pake,
                     "supports_passkeys": cmd.supports_passkeys,
                     "client_id": cmd.client_id,
+                    "rollout_cohort": rollout.cohort.clone(),
+                    "serving_mode": rollout.serving_mode.as_str(),
                 }),
                 status: crate::modules::auth::domain::AuthFlowStatus::Pending,
-                rollout_channel: Some(rollout.rollout_channel.clone()),
+                rollout_channel: Some(rollout.cohort_label().to_string()),
                 fallback_policy: Some(rollout.fallback_policy.as_str().to_string()),
                 trace_id: Some(ctx.trace_id.clone()),
                 issued_ip: ctx.ip.clone(),
@@ -1770,7 +1798,7 @@ impl AuthService {
                 metadata: json!({
                     "methods": methods.iter().map(|method| auth_method_kind_label(&method.kind)).collect::<Vec<_>>(),
                     "recommended_method": recommended_method_label.clone(),
-                    "rollout_channel": rollout.rollout_channel,
+                    "rollout_channel": rollout.cohort_label(),
                     "fallback_policy": rollout.fallback_policy.as_str(),
                     "ip": ctx.ip,
                     "user_agent": ctx.user_agent,
@@ -1859,14 +1887,14 @@ impl AuthService {
                 None
             };
             let rollout = auth_v2_rollout_from_flow(&v2.config, &discovery_flow, legacy.as_ref());
-            metrics_channel = rollout.rollout_channel.clone();
+            metrics_channel = rollout.cohort_label().to_string();
             audit_actor_user_id = account.as_ref().map(|record| record.id.clone());
             audit_fallback_policy = Some(rollout.fallback_policy.as_str().to_string());
             crate::observability::record_auth_v2_legacy_fallback(
                 auth_v2_fallback_reason(&v2.config, legacy.as_ref(), &rollout),
-                &rollout.rollout_channel,
+                rollout.cohort_label(),
             );
-            if !auth_v2_allows_external_access(&v2.config, &rollout) {
+            if !auth_v2_allows_external_access(&rollout) {
                 return Err(AuthError::AuthV2RolloutDenied);
             }
 
@@ -1911,9 +1939,12 @@ impl AuthService {
                         "identifier": identifier,
                         "server_state": result.server_state,
                         "legacy_fallback_allowed": rollout.fallback_policy.legacy_password_allowed(),
+                        "client_id": discovery_flow.state.get("client_id").cloned(),
+                        "rollout_cohort": rollout.cohort.clone(),
+                        "serving_mode": rollout.serving_mode.as_str(),
                     }),
                     status: crate::modules::auth::domain::AuthFlowStatus::Pending,
-                    rollout_channel: Some(rollout.rollout_channel.clone()),
+                    rollout_channel: Some(rollout.cohort_label().to_string()),
                     fallback_policy: Some(rollout.fallback_policy.as_str().to_string()),
                     trace_id: Some(ctx.trace_id.clone()),
                     issued_ip: ctx.ip.clone(),
@@ -1934,7 +1965,7 @@ impl AuthService {
                     trace_id: ctx.trace_id.clone(),
                     metadata: json!({
                         "flow_id": flow_id.clone(),
-                        "rollout_channel": rollout.rollout_channel,
+                        "rollout_channel": rollout.cohort_label(),
                         "fallback_policy": rollout.fallback_policy.as_str(),
                         "ip": ctx.ip,
                         "user_agent": ctx.user_agent,
@@ -2014,7 +2045,7 @@ impl AuthService {
                 _ => return Err(AuthError::InvalidCredentials),
             };
             let rollout = auth_v2_rollout_from_flow(&v2.config, &flow, None);
-            metrics_channel = rollout.rollout_channel.clone();
+            metrics_channel = rollout.cohort_label().to_string();
             audit_fallback_policy = Some(rollout.fallback_policy.as_str().to_string());
 
             let server_state = flow
@@ -2093,7 +2124,7 @@ impl AuthService {
                     trace_id: ctx.trace_id.clone(),
                     metadata: json!({
                         "session_id": principal.session_id,
-                        "rollout_channel": rollout.rollout_channel,
+                        "rollout_channel": rollout.cohort_label(),
                         "fallback_policy": rollout.fallback_policy.as_str(),
                         "ip": ctx.ip,
                         "user_agent": ctx.user_agent,
@@ -2181,9 +2212,9 @@ impl AuthService {
             }
             let rollout =
                 evaluate_auth_v2_rollout(&v2.config, ctx.client_id.as_deref(), Some(&legacy));
-            metrics_channel = rollout.rollout_channel.clone();
+            metrics_channel = rollout.cohort_label().to_string();
             audit_fallback_policy = Some(rollout.fallback_policy.as_str().to_string());
-            if !auth_v2_allows_external_access(&v2.config, &rollout) {
+            if !auth_v2_allows_external_access(&rollout) {
                 return Err(AuthError::AuthV2RolloutDenied);
             }
 
@@ -2216,9 +2247,12 @@ impl AuthService {
                     state: json!({
                         "server_state": result.server_state,
                         "legacy_login_allowed": legacy.legacy_login_allowed,
+                        "client_id": ctx.client_id.clone(),
+                        "rollout_cohort": rollout.cohort.clone(),
+                        "serving_mode": rollout.serving_mode.as_str(),
                     }),
                     status: crate::modules::auth::domain::AuthFlowStatus::Pending,
-                    rollout_channel: Some(rollout.rollout_channel.clone()),
+                    rollout_channel: Some(rollout.cohort_label().to_string()),
                     fallback_policy: Some(rollout.fallback_policy.as_str().to_string()),
                     trace_id: Some(ctx.trace_id.clone()),
                     issued_ip: ctx.ip.clone(),
@@ -2238,7 +2272,7 @@ impl AuthService {
                     actor_user_id: Some(account.id),
                     trace_id: ctx.trace_id.clone(),
                     metadata: json!({
-                        "rollout_channel": rollout.rollout_channel,
+                        "rollout_channel": rollout.cohort_label(),
                         "fallback_policy": rollout.fallback_policy.as_str(),
                         "ip": ctx.ip,
                         "user_agent": ctx.user_agent,
@@ -2321,7 +2355,7 @@ impl AuthService {
                 _ => return Err(AuthError::InvalidToken),
             };
             let rollout = auth_v2_rollout_from_flow(&v2.config, &flow, None);
-            metrics_channel = rollout.rollout_channel.clone();
+            metrics_channel = rollout.cohort_label().to_string();
             audit_fallback_policy = Some(rollout.fallback_policy.as_str().to_string());
 
             let user_id = flow.subject_user_id.ok_or(AuthError::InvalidToken)?;
@@ -2379,7 +2413,7 @@ impl AuthService {
                     actor_user_id: Some(user_id),
                     trace_id: ctx.trace_id.clone(),
                     metadata: json!({
-                        "rollout_channel": rollout.rollout_channel,
+                        "rollout_channel": rollout.cohort_label(),
                         "fallback_policy": rollout.fallback_policy.as_str(),
                         "ip": ctx.ip,
                         "user_agent": ctx.user_agent,
@@ -3673,14 +3707,18 @@ pub(crate) fn evaluate_auth_v2_rollout(
     client_id: Option<&str>,
     legacy: Option<&LegacyPasswordRecord>,
 ) -> AuthV2RolloutDecision {
-    let normalized_client_id = AuthV2Config::normalized_client_id(client_id);
-    let client_allowed = config.client_is_allowlisted(client_id);
-    let rollout_channel = if config.shadow_audit_only {
-        "shadow".to_string()
+    let requested_client_id = AuthV2Config::normalized_client_id(client_id);
+    let cohort = requested_client_id
+        .as_deref()
+        .and_then(|value| resolve_auth_v2_cohort(value).ok())
+        .map(|cohort| cohort.as_str().to_string());
+    let client_allowed = cohort
+        .as_ref()
+        .is_some_and(|cohort| config.client_allowlist.iter().any(|value| value == cohort));
+    let serving_mode = if config.shadow_audit_only {
+        AuthV2ServingMode::Shadow
     } else {
-        normalized_client_id
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string())
+        AuthV2ServingMode::External
     };
 
     let fallback_policy = match (config.legacy_fallback_mode, legacy) {
@@ -3695,17 +3733,16 @@ pub(crate) fn evaluate_auth_v2_rollout(
     };
 
     AuthV2RolloutDecision {
-        rollout_channel,
+        requested_client_id,
+        cohort,
+        serving_mode,
         client_allowed,
         fallback_policy,
     }
 }
 
-pub(crate) fn auth_v2_allows_external_access(
-    config: &AuthV2Config,
-    rollout: &AuthV2RolloutDecision,
-) -> bool {
-    !config.shadow_audit_only && rollout.client_allowed
+pub(crate) fn auth_v2_allows_external_access(rollout: &AuthV2RolloutDecision) -> bool {
+    rollout.serving_mode == AuthV2ServingMode::External && rollout.client_allowed
 }
 
 fn auth_v2_request_outcome<T>(result: &Result<T, AuthError>) -> &'static str {
@@ -3732,7 +3769,13 @@ fn auth_v2_error_reason(error: &AuthError) -> &'static str {
 }
 
 fn auth_v2_rollout_channel_hint(client_id: Option<&str>) -> String {
-    AuthV2Config::normalized_client_id(client_id).unwrap_or_else(|| "unknown".to_string())
+    let requested_client_id = AuthV2Config::normalized_client_id(client_id);
+    requested_client_id
+        .as_deref()
+        .and_then(|value| resolve_auth_v2_cohort(value).ok())
+        .map(|cohort| cohort.as_str().to_string())
+        .or(requested_client_id)
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn auth_v2_passkey_audit_metadata(
@@ -3781,22 +3824,58 @@ fn auth_v2_rollout_from_flow(
     flow: &AuthFlowRecord,
     legacy: Option<&LegacyPasswordRecord>,
 ) -> AuthV2RolloutDecision {
+    let requested_client_id = flow
+        .state
+        .get("client_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| AuthV2Config::normalized_client_id(Some(value)))
+        .or_else(|| match flow.rollout_channel.as_deref() {
+            Some("shadow") => None,
+            other => AuthV2Config::normalized_client_id(other),
+        });
+    let cohort = flow
+        .state
+        .get("rollout_cohort")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            flow.rollout_channel
+                .as_deref()
+                .and_then(|value| resolve_auth_v2_cohort(value).ok())
+                .map(|cohort| cohort.as_str().to_string())
+        })
+        .or_else(|| {
+            requested_client_id
+                .as_deref()
+                .and_then(|value| resolve_auth_v2_cohort(value).ok())
+                .map(|cohort| cohort.as_str().to_string())
+        });
+    let client_allowed = cohort
+        .as_ref()
+        .is_some_and(|cohort| config.client_allowlist.iter().any(|value| value == cohort));
     let fallback_policy = match flow.fallback_policy.as_deref() {
         Some("eligible") => AuthV2FallbackPolicy::Eligible,
         Some("disabled") => AuthV2FallbackPolicy::Disabled,
         _ => {
-            evaluate_auth_v2_rollout(config, flow.rollout_channel.as_deref(), legacy)
-                .fallback_policy
+            evaluate_auth_v2_rollout(config, requested_client_id.as_deref(), legacy).fallback_policy
         }
     };
-    let rollout_channel = flow
-        .rollout_channel
-        .clone()
-        .unwrap_or_else(|| evaluate_auth_v2_rollout(config, None, legacy).rollout_channel);
+    let serving_mode = match flow
+        .state
+        .get("serving_mode")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("shadow") => AuthV2ServingMode::Shadow,
+        Some("external") => AuthV2ServingMode::External,
+        _ if flow.rollout_channel.as_deref() == Some("shadow") => AuthV2ServingMode::Shadow,
+        _ => evaluate_auth_v2_rollout(config, requested_client_id.as_deref(), legacy).serving_mode,
+    };
 
     AuthV2RolloutDecision {
-        client_allowed: config.client_is_allowlisted(Some(&rollout_channel)),
-        rollout_channel,
+        requested_client_id,
+        cohort,
+        serving_mode,
+        client_allowed,
         fallback_policy,
     }
 }
@@ -6401,7 +6480,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_auth_methods_v2_persists_normalized_allowlisted_channel() {
+    async fn discover_auth_methods_v2_persists_canonical_cohort_and_serving_mode() {
         let harness = build_harness();
         let auth_flows = Arc::new(StaticAuthFlowRepository::new());
         let service = harness.service.clone().with_v2(AuthV2Dependencies {
@@ -6416,7 +6495,7 @@ mod tests {
                 passkey_namespace_enabled: true,
                 auth_flows_enabled: true,
                 legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
-                client_allowlist: vec!["web".to_string()],
+                client_allowlist: vec!["canary_web".to_string()],
                 shadow_audit_only: false,
             },
             accounts: Arc::new(StaticAccountRepository::new(vec![AccountRecord {
@@ -6449,8 +6528,16 @@ mod tests {
             .peek(&response.discovery_token)
             .expect("discovery flow should be stored");
 
-        assert_eq!(stored_flow.rollout_channel.as_deref(), Some("web"));
+        assert_eq!(stored_flow.rollout_channel.as_deref(), Some("canary_web"));
         assert_eq!(stored_flow.fallback_policy.as_deref(), Some("disabled"));
+        assert_eq!(
+            stored_flow.state.get("rollout_cohort"),
+            Some(&json!("canary_web"))
+        );
+        assert_eq!(
+            stored_flow.state.get("serving_mode"),
+            Some(&json!("external"))
+        );
     }
 
     #[tokio::test]
@@ -6489,7 +6576,7 @@ mod tests {
                 .metadata
                 .get("rollout_channel")
                 .and_then(|value| value.as_str()),
-            Some("web")
+            Some("canary_web")
         );
         assert_eq!(
             event
@@ -6512,7 +6599,7 @@ mod tests {
             passkey_namespace_enabled: true,
             auth_flows_enabled: true,
             legacy_fallback_mode,
-            client_allowlist: vec!["web".to_string()],
+            client_allowlist: vec!["canary_web".to_string()],
             shadow_audit_only: false,
         }
     }
@@ -6535,41 +6622,72 @@ mod tests {
             (
                 rollout_test_config(AuthV2LegacyFallbackMode::Disabled),
                 Some("web"),
-                "web",
+                Some("canary_web"),
+                "external",
                 true,
                 "disabled",
             ),
             (
                 rollout_test_config(AuthV2LegacyFallbackMode::Allowlisted),
                 Some("web"),
-                "web",
+                Some("canary_web"),
+                "external",
                 true,
                 "eligible",
             ),
             (
                 rollout_test_config(AuthV2LegacyFallbackMode::Allowlisted),
                 Some("android"),
-                "android",
+                Some("canary_mobile"),
+                "external",
                 false,
                 "disabled",
             ),
             (
                 rollout_test_config(AuthV2LegacyFallbackMode::Broad),
                 Some("android"),
-                "android",
+                Some("canary_mobile"),
+                "external",
                 false,
                 "eligible",
             ),
         ];
 
-        for (config, client_id, expected_channel, expected_client_allowed, expected_policy) in cases
+        for (
+            config,
+            client_id,
+            expected_cohort,
+            expected_serving_mode,
+            expected_client_allowed,
+            expected_policy,
+        ) in cases
         {
             let decision = evaluate_auth_v2_rollout(&config, client_id, Some(&legacy));
 
-            assert_eq!(decision.rollout_channel, expected_channel);
+            assert_eq!(decision.cohort.as_deref(), expected_cohort);
+            assert_eq!(decision.serving_mode.as_str(), expected_serving_mode);
+            assert_eq!(
+                decision.cohort_label(),
+                expected_cohort.unwrap_or("unknown")
+            );
             assert_eq!(decision.client_allowed, expected_client_allowed);
             assert_eq!(decision.fallback_policy.as_str(), expected_policy);
         }
+    }
+
+    #[test]
+    fn evaluate_auth_v2_rollout_tracks_shadow_mode_without_losing_canonical_cohort() {
+        let mut config = rollout_test_config(AuthV2LegacyFallbackMode::Allowlisted);
+        config.shadow_audit_only = true;
+
+        let decision =
+            evaluate_auth_v2_rollout(&config, Some("web"), Some(&eligible_legacy_password()));
+
+        assert_eq!(decision.cohort.as_deref(), Some("canary_web"));
+        assert_eq!(decision.cohort_label(), "canary_web");
+        assert_eq!(decision.serving_mode.as_str(), "shadow");
+        assert!(decision.client_allowed);
+        assert_eq!(decision.fallback_policy.as_str(), "eligible");
     }
 
     #[test]
@@ -6580,7 +6698,8 @@ mod tests {
             None,
         );
 
-        assert_eq!(decision.rollout_channel, "web");
+        assert_eq!(decision.cohort.as_deref(), Some("canary_web"));
+        assert_eq!(decision.cohort_label(), "canary_web");
         assert!(decision.client_allowed);
         assert_eq!(decision.fallback_policy.as_str(), "disabled");
     }
@@ -6596,7 +6715,8 @@ mod tests {
             Some(&legacy),
         );
 
-        assert_eq!(decision.rollout_channel, "web");
+        assert_eq!(decision.cohort.as_deref(), Some("canary_web"));
+        assert_eq!(decision.cohort_label(), "canary_web");
         assert!(decision.client_allowed);
         assert_eq!(decision.fallback_policy.as_str(), "disabled");
     }
@@ -6607,7 +6727,8 @@ mod tests {
 
         let decision = evaluate_auth_v2_rollout(&config, Some("android"), None);
 
-        assert_eq!(decision.rollout_channel, "android");
+        assert_eq!(decision.cohort.as_deref(), Some("canary_mobile"));
+        assert_eq!(decision.cohort_label(), "canary_mobile");
         assert!(!decision.client_allowed);
         assert_eq!(decision.fallback_policy.as_str(), "disabled");
     }
@@ -6675,7 +6796,7 @@ mod tests {
                 .metadata
                 .get("rollout_channel")
                 .and_then(|value| value.as_str()),
-            Some("web")
+            Some("canary_web")
         );
         assert_eq!(
             event
@@ -6807,7 +6928,7 @@ mod tests {
                 .metadata
                 .get("rollout_channel")
                 .and_then(|value| value.as_str()),
-            Some("web")
+            Some("canary_web")
         );
         assert_eq!(
             started
@@ -6821,7 +6942,7 @@ mod tests {
                 .metadata
                 .get("rollout_channel")
                 .and_then(|value| value.as_str()),
-            Some("web")
+            Some("canary_web")
         );
         assert_eq!(
             completed
@@ -6881,7 +7002,7 @@ mod tests {
                 passkey_namespace_enabled: true,
                 auth_flows_enabled: true,
                 legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
-                client_allowlist: vec!["web".to_string()],
+                client_allowlist: vec!["canary_web".to_string()],
                 shadow_audit_only: false,
             },
             accounts: Arc::new(StaticAccountRepository::new(vec![AccountRecord {
@@ -6920,7 +7041,7 @@ mod tests {
                     "supports_passkeys": false,
                 }),
                 status: crate::modules::auth::domain::AuthFlowStatus::Pending,
-                rollout_channel: Some("web".to_string()),
+                rollout_channel: Some("canary_web".to_string()),
                 fallback_policy: Some("eligible".to_string()),
                 trace_id: Some("trace-discovery-rollout".to_string()),
                 issued_ip: Some("127.0.0.1".to_string()),
@@ -6949,8 +7070,10 @@ mod tests {
         let flow = auth_flows
             .peek(&start.flow_id)
             .expect("password login flow should be stored");
-        assert_eq!(flow.rollout_channel.as_deref(), Some("web"));
+        assert_eq!(flow.rollout_channel.as_deref(), Some("canary_web"));
         assert_eq!(flow.fallback_policy.as_deref(), Some("eligible"));
+        assert_eq!(flow.state.get("rollout_cohort"), Some(&json!("canary_web")));
+        assert_eq!(flow.state.get("serving_mode"), Some(&json!("external")));
         assert_eq!(
             flow.state.get("legacy_fallback_allowed"),
             Some(&json!(true))
@@ -6981,8 +7104,19 @@ mod tests {
         let discovery_flow = auth_flows
             .peek(&discovery.discovery_token)
             .expect("discovery flow should be stored");
-        assert_eq!(discovery_flow.rollout_channel.as_deref(), Some("web"));
+        assert_eq!(
+            discovery_flow.rollout_channel.as_deref(),
+            Some("canary_web")
+        );
         assert_eq!(discovery_flow.fallback_policy.as_deref(), Some("eligible"));
+        assert_eq!(
+            discovery_flow.state.get("rollout_cohort"),
+            Some(&json!("canary_web"))
+        );
+        assert_eq!(
+            discovery_flow.state.get("serving_mode"),
+            Some(&json!("external"))
+        );
 
         let start = service
             .start_password_login_v2(
@@ -6999,8 +7133,16 @@ mod tests {
         let password_flow = auth_flows
             .peek(&start.flow_id)
             .expect("password login flow should be stored");
-        assert_eq!(password_flow.rollout_channel.as_deref(), Some("web"));
+        assert_eq!(password_flow.rollout_channel.as_deref(), Some("canary_web"));
         assert_eq!(password_flow.fallback_policy.as_deref(), Some("eligible"));
+        assert_eq!(
+            password_flow.state.get("rollout_cohort"),
+            Some(&json!("canary_web"))
+        );
+        assert_eq!(
+            password_flow.state.get("serving_mode"),
+            Some(&json!("external"))
+        );
         assert_eq!(
             password_flow.state.get("legacy_fallback_allowed"),
             Some(&json!(true))
@@ -7035,7 +7177,7 @@ mod tests {
                 .metadata
                 .get("rollout_channel")
                 .and_then(|value| value.as_str()),
-            Some("web")
+            Some("canary_web")
         );
         assert_eq!(
             event
@@ -7108,7 +7250,7 @@ mod tests {
                 passkey_namespace_enabled: true,
                 auth_flows_enabled: true,
                 legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
-                client_allowlist: vec!["web".to_string()],
+                client_allowlist: vec!["canary_web".to_string()],
                 shadow_audit_only: false,
             },
             accounts: Arc::new(StaticAccountRepository::new(vec![account])),

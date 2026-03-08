@@ -8,6 +8,7 @@ use prometheus::{
     IntGaugeVec, Opts, Registry, TextEncoder,
 };
 
+use crate::config::resolve_auth_v2_cohort;
 use crate::modules::auth::{application::AuthError, ports::AuthFlowMetricsSnapshot};
 
 struct MetricsRegistry {
@@ -1142,10 +1143,15 @@ fn normalize_auth_v2_rollout_channel(channel: &str) -> &str {
     match channel {
         "unknown" => "unknown",
         "shadow" => "shadow",
-        "web" => "web",
-        "ios" => "ios",
-        "android" => "android",
-        _ => "other",
+        "internal" => "internal",
+        "canary_web" => "canary_web",
+        "canary_mobile" => "canary_mobile",
+        "beta_external" => "beta_external",
+        "broad_general" => "broad_general",
+        "legacy_holdout" => "legacy_holdout",
+        value => resolve_auth_v2_cohort(value)
+            .map(|cohort| cohort.as_str())
+            .unwrap_or("other"),
     }
 }
 
@@ -1289,7 +1295,7 @@ mod tests {
             "error",
             std::time::Duration::from_millis(19),
         );
-        record_auth_v2_legacy_fallback("allowlisted", "web");
+        record_auth_v2_legacy_fallback("allowlisted", "internal-web");
         record_auth_v2_legacy_fallback("client_not_allowlisted", "android");
         record_passkey_request("login_finish", "success");
         record_passkey_login_rejected("invalid_passkey_response");
@@ -1398,6 +1404,9 @@ mod tests {
         assert!(payload.contains("auth_email_outbox_claimed_per_poll_bucket"));
         assert!(payload.contains("auth_email_outbox_reclaimed_after_expiry_total"));
         assert!(payload.contains("auth_email_outbox_claim_failures_total"));
+        assert!(payload.contains("channel=\"canary_web\""));
+        assert!(payload.contains("channel=\"canary_mobile\""));
+        assert!(payload.contains("channel=\"internal\""));
         assert!(payload.contains("reason=\"refresh_reuse_detected\""));
         assert!(payload.contains("status=\"429\""));
         assert!(payload.contains("provider=\"sendgrid\""));
@@ -1409,8 +1418,8 @@ mod tests {
         assert!(payload.contains("reason=\"challenge_user_mismatch\""));
         assert!(payload.contains("reason=\"account_not_active\""));
         assert!(payload.contains("outcome=\"existing_not_active\""));
-        assert!(payload.contains("channel=\"web\""));
-        assert!(payload.contains("channel=\"android\""));
+        assert!(payload.contains("channel=\"canary_web\""));
+        assert!(payload.contains("channel=\"canary_mobile\""));
         assert!(payload.contains("outcome=\"shadow_hidden\""));
         assert!(payload.contains("reason=\"rollout_denied\""));
         assert!(payload.contains("flow_kind=\"methods_discovery\""));
