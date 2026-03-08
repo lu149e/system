@@ -2,9 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TEMPLATES_DIR="${ROOT_DIR}/deploy/k8s/overlays/production/templates"
-GENERATED_DIR="${ROOT_DIR}/artifacts/production-overlay/generated"
-BASE_KUSTOMIZE_DIR="${ROOT_DIR}/deploy/k8s"
+TEMPLATES_DIR="${TEMPLATES_DIR:-${ROOT_DIR}/deploy/k8s/overlays/production/templates}"
+GENERATED_DIR="${GENERATED_DIR:-${ROOT_DIR}/artifacts/production-overlay/generated}"
+BASE_KUSTOMIZE_DIR="${BASE_KUSTOMIZE_DIR:-${ROOT_DIR}/deploy/k8s}"
+NORMALIZE_AUTH_V2_COHORTS_SCRIPT="${ROOT_DIR}/scripts/normalize-auth-v2-cohorts.sh"
 
 ENFORCE_DATABASE_TLS="${ENFORCE_DATABASE_TLS:-true}"
 ENFORCE_REDIS_TLS="${ENFORCE_REDIS_TLS:-true}"
@@ -42,6 +43,40 @@ required_vars=(
 fail() {
   echo "ERROR: $*" >&2
   exit 1
+}
+
+overlay_assert_eq() {
+  local actual="$1"
+  local expected="$2"
+  local message="$3"
+
+  if [[ "${actual}" != "${expected}" ]]; then
+    printf 'self-test failed: %s\nexpected: %s\nactual: %s\n' "${message}" "${expected}" "${actual}" >&2
+    exit 1
+  fi
+}
+
+overlay_assert_fails() {
+  local expected_message="$1"
+  shift
+  local temp_output status
+  temp_output="$(mktemp)"
+
+  if "$@" >"${temp_output}" 2>&1; then
+    printf 'self-test failed: expected command to fail: %s\n' "$*" >&2
+    rm -f "${temp_output}"
+    exit 1
+  fi
+
+  status=$?
+  local output
+  output="$(<"${temp_output}")"
+  rm -f "${temp_output}"
+
+  if [[ "${output}" != *"${expected_message}"* ]]; then
+    printf 'self-test failed: unexpected failure output\nexpected substring: %s\noutput: %s\n' "${expected_message}" "${output}" >&2
+    exit 1
+  fi
 }
 
 require_non_empty() {
@@ -199,6 +234,24 @@ for entry in entries:
 PY
 }
 
+load_auth_v2_normalizer() {
+  [[ -f "${NORMALIZE_AUTH_V2_COHORTS_SCRIPT}" ]] || fail "missing auth v2 cohort normalizer: ${NORMALIZE_AUTH_V2_COHORTS_SCRIPT}"
+  # shellcheck source=/dev/null
+  source "${NORMALIZE_AUTH_V2_COHORTS_SCRIPT}"
+}
+
+normalize_auth_v2_rollout_inputs() {
+  local normalized_allowlist
+  local status=0
+
+  normalized_allowlist="$(normalize_auth_v2_cohort_csv "${AUTH_V2_CLIENT_ALLOWLIST}")" || status=$?
+  if [[ ${status} -ne 0 ]]; then
+    return "${status}"
+  fi
+
+  AUTH_V2_CLIENT_ALLOWLIST="${normalized_allowlist}"
+}
+
 replace_tokens() {
   local template_file="$1"
   local output_file="$2"
@@ -259,7 +312,7 @@ print(os.path.relpath(target_path, from_path))
 PY
 }
 
-main() {
+run_overlay_generation() {
   for var_name in "${required_vars[@]}"; do
     require_non_empty "${var_name}"
   done
@@ -295,6 +348,14 @@ main() {
   [[ -f "${TEMPLATES_DIR}/configmap-runtime-security.patch.yaml" ]] || fail "missing template: ${TEMPLATES_DIR}/configmap-runtime-security.patch.yaml"
   [[ -d "${BASE_KUSTOMIZE_DIR}" ]] || fail "missing base kustomize directory: ${BASE_KUSTOMIZE_DIR}"
 
+  load_auth_v2_normalizer
+
+  local normalize_status=0
+  normalize_auth_v2_rollout_inputs || normalize_status=$?
+  if [[ ${normalize_status} -ne 0 ]]; then
+    return "${normalize_status}"
+  fi
+
   mkdir -p "${GENERATED_DIR}"
 
   local base_kustomize_relpath
@@ -306,6 +367,99 @@ main() {
   replace_tokens "${TEMPLATES_DIR}/configmap-runtime-security.patch.yaml" "${GENERATED_DIR}/configmap-runtime-security.patch.yaml" "${base_kustomize_relpath}"
 
   echo "Generated production overlay in ${GENERATED_DIR}"
+}
+
+self_test() {
+  local temp_dir expected_allowlist actual_allowlist
+  temp_dir="$(mktemp -d)"
+
+  IMAGE_DIGEST="sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  INGRESS_HOST="auth.example.org"
+  TLS_SECRET_NAME="auth-prod-tls"
+  POSTGRES_CIDR="10.20.0.0/24"
+  REDIS_CIDR="10.30.0.0/24"
+  ENFORCE_DATABASE_TLS="true"
+  ENFORCE_REDIS_TLS="true"
+  ENFORCE_SECURE_TRANSPORT="true"
+  AUTH_V2_ENABLED="true"
+  AUTH_V2_METHODS_ENABLED="true"
+  AUTH_V2_PASSWORD_PAKE_ENABLED="true"
+  AUTH_V2_PASSWORD_UPGRADE_ENABLED="true"
+  AUTH_V2_PASSKEY_NAMESPACE_ENABLED="false"
+  AUTH_V2_AUTH_FLOWS_ENABLED="true"
+  AUTH_V2_LEGACY_FALLBACK_MODE="allowlisted"
+  AUTH_V2_CLIENT_ALLOWLIST=" internal-web , ios-beta , internal , IOS "
+  AUTH_V2_SHADOW_AUDIT_ONLY="false"
+  AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS="300"
+  PASSKEY_ENABLED="false"
+  PASSKEY_RP_ID=""
+  PASSKEY_RP_ORIGIN=""
+  PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS="60"
+  LOGIN_RISK_MODE="baseline"
+  LOGIN_RISK_BLOCKED_CIDRS=""
+  LOGIN_RISK_BLOCKED_USER_AGENT_SUBSTRINGS=""
+  LOGIN_RISK_BLOCKED_EMAIL_DOMAINS=""
+  LOGIN_RISK_CHALLENGE_CIDRS=""
+  LOGIN_RISK_CHALLENGE_USER_AGENT_SUBSTRINGS=""
+  LOGIN_RISK_CHALLENGE_EMAIL_DOMAINS=""
+  GENERATED_DIR="${temp_dir}/generated"
+
+  run_overlay_generation >/dev/null
+
+  expected_allowlist='  AUTH_V2_CLIENT_ALLOWLIST: "internal,canary_mobile"'
+  actual_allowlist="$(python3 - "${GENERATED_DIR}/configmap-runtime-security.patch.yaml" <<'PY'
+import pathlib
+import re
+import sys
+
+content = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(r'^\s*AUTH_V2_CLIENT_ALLOWLIST:\s*".*"\s*$', content, re.MULTILINE)
+if match is None:
+    raise SystemExit("missing AUTH_V2_CLIENT_ALLOWLIST in generated configmap patch")
+print(match.group(0))
+PY
+)"
+  overlay_assert_eq "${actual_allowlist}" "${expected_allowlist}" "normalizes rollout allowlist before templating"
+
+  AUTH_V2_CLIENT_ALLOWLIST=""
+  GENERATED_DIR="${temp_dir}/generated-empty"
+  run_overlay_generation >/dev/null
+  actual_allowlist="$(python3 - "${GENERATED_DIR}/configmap-runtime-security.patch.yaml" <<'PY'
+import pathlib
+import re
+import sys
+
+content = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(r'^\s*AUTH_V2_CLIENT_ALLOWLIST:\s*".*"\s*$', content, re.MULTILINE)
+if match is None:
+    raise SystemExit("missing AUTH_V2_CLIENT_ALLOWLIST in generated configmap patch")
+print(match.group(0))
+PY
+)"
+  overlay_assert_eq "${actual_allowlist}" '  AUTH_V2_CLIENT_ALLOWLIST: ""' "preserves an empty rollout allowlist"
+
+  AUTH_V2_CLIENT_ALLOWLIST="partner-preview"
+  GENERATED_DIR="${temp_dir}/generated-invalid"
+  overlay_assert_fails \
+    "unsupported AUTH_V2_CLIENT_ALLOWLIST value: partner-preview" \
+    run_overlay_generation
+
+  rm -rf "${temp_dir}"
+  printf 'production overlay auth v2 self-test passed\n'
+}
+
+main() {
+  if [[ "${1:-}" == "--self-test" ]]; then
+    self_test
+    return 0
+  fi
+
+  if [[ "$#" -gt 0 ]]; then
+    printf 'usage: %s [--self-test]\n' "$0" >&2
+    return 1
+  fi
+
+  run_overlay_generation
 }
 
 main "$@"

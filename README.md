@@ -452,7 +452,7 @@ Pasos recomendados:
   - `enforce_database_tls` (boolean, default `true`): valor aplicado a `ENFORCE_DATABASE_TLS` en overlay generado.
   - `enforce_redis_tls` (boolean, default `true`): valor aplicado a `ENFORCE_REDIS_TLS` en overlay generado.
   - `enforce_secure_transport` (boolean, default `true`): valor aplicado a `ENFORCE_SECURE_TRANSPORT` en overlay generado.
-  - `auth_v2_rollout_env` (string multilinea): bloque `KEY=VALUE` para los knobs `AUTH_V2_*`; mantiene el workflow por debajo del limite real de 25 inputs de `workflow_dispatch`.
+  - `auth_v2_rollout_env` (string multilinea): bloque `KEY=VALUE` para los knobs `AUTH_V2_*`; mantiene el workflow por debajo del limite real de 25 inputs de `workflow_dispatch` y normaliza `AUTH_V2_CLIENT_ALLOWLIST` a cohorts canonicos.
   - `login_risk_mode` (choice, default `baseline`): valor aplicado a `LOGIN_RISK_MODE`.
   - `login_risk_blocked_cidrs` / `login_risk_blocked_user_agent_substrings` / `login_risk_blocked_email_domains` (string CSV opcional): valores aplicados a `LOGIN_RISK_BLOCKED_*`.
   - `login_risk_challenge_cidrs` / `login_risk_challenge_user_agent_substrings` / `login_risk_challenge_email_domains` (string CSV opcional): valores aplicados a `LOGIN_RISK_CHALLENGE_*`.
@@ -483,6 +483,7 @@ Pasos recomendados:
   - Ejecuta siempre `kubectl apply --dry-run=server` sobre el manifiesto renderizado.
   - Solo si `apply_changes=true`, ejecuta `kubectl apply` real y smoke checks (`rollout status`, endpoints, `GET /healthz`, `GET /readyz` via port-forward).
 - Controles de seguridad:
+  - `AUTH_V2_CLIENT_ALLOWLIST` acepta aliases documentados como `internal-web` o `ios-beta`, pero el workflow los reescribe a `internal` y `canary_mobile`; valores inventados fallan rapido.
   - Si `apply_changes=true` y falta `KUBE_CONFIG_B64`, falla rapido antes de cualquier intento de apply.
   - El fallback client-side nunca se usa en modo apply; solo aplica en dry-run no destructivo y con flag explicito.
   - Summary final explicita modo (`dry-run` vs `apply`) y estado del job.

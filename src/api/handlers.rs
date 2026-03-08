@@ -14,15 +14,16 @@ use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 
 use crate::{
     api::problem::{from_auth_error, ApiProblem, ProblemDetails},
+    config::resolve_auth_v2_cohort,
     health::ComponentState,
     modules::auth::application::{
         auth_v2_allows_external_access, evaluate_auth_v2_rollout, AuthError, AuthMethodsCommand,
-        AuthMethodsResponse, LoginCommand, LoginResult, LogoutCommand, MfaActivateCommand,
-        MfaDisableCommand, MfaVerifyCommand, PakeLoginFinishCommand, PakeLoginStartCommand,
-        PakeLoginStartResponse, PasskeyChallenge, PasswordChangeCommand, PasswordForgotCommand,
-        PasswordResetCommand, PasswordUpgradeFinishCommand, PasswordUpgradeFinishResponse,
-        PasswordUpgradeStartCommand, PasswordUpgradeStartResponse, Principal, RefreshCommand,
-        RegisterCommand, RequestContext, VerifyEmailCommand,
+        AuthMethodsResponse, AuthV2RolloutDecision, LoginCommand, LoginResult, LogoutCommand,
+        MfaActivateCommand, MfaDisableCommand, MfaVerifyCommand, PakeLoginFinishCommand,
+        PakeLoginStartCommand, PakeLoginStartResponse, PasskeyChallenge, PasswordChangeCommand,
+        PasswordForgotCommand, PasswordResetCommand, PasswordUpgradeFinishCommand,
+        PasswordUpgradeFinishResponse, PasswordUpgradeStartCommand, PasswordUpgradeStartResponse,
+        Principal, RefreshCommand, RegisterCommand, RequestContext, VerifyEmailCommand,
     },
     observability, AppState,
 };
@@ -886,13 +887,14 @@ pub async fn auth_methods_v2(
         .channel
         .clone()
         .or_else(|| payload.client.platform.clone());
-    let channel = client_id.clone().unwrap_or_else(|| "unknown".to_string());
-    if let Err(problem) = enforce_auth_v2_rollout_access(&state, client_id.as_deref(), &trace_id) {
+    let rollout = auth_v2_rollout_for_request(&state, client_id.as_deref(), &trace_id)?;
+    let cohort_label = rollout.cohort_label().to_string();
+    if !auth_v2_allows_external_access(&rollout) {
         let rejection_reason = auth_v2_gate_rejection_reason(&state);
-        observability::record_auth_v2_methods_request(&channel, rejection_reason);
+        observability::record_auth_v2_methods_request(&cohort_label, rejection_reason);
         observability::observe_auth_v2_methods_duration(rejection_reason, started_at.elapsed());
         observability::record_auth_v2_methods_rejected(rejection_reason);
-        return Err(*problem);
+        return Err(from_auth_error(AuthError::AuthV2RolloutDenied, trace_id));
     }
     let ctx = request_context(
         &headers,
@@ -918,7 +920,7 @@ pub async fn auth_methods_v2(
 
     match response {
         Ok(response) => {
-            observability::record_auth_v2_methods_request(&channel, "success");
+            observability::record_auth_v2_methods_request(&cohort_label, "success");
             observability::observe_auth_v2_methods_duration("success", started_at.elapsed());
 
             Ok(NoStoreJson(auth_methods_contract_response(
@@ -927,7 +929,7 @@ pub async fn auth_methods_v2(
         }
         Err(err) => {
             let problem = from_auth_error(err, trace_id.clone());
-            observability::record_auth_v2_methods_request(&channel, "error");
+            observability::record_auth_v2_methods_request(&cohort_label, "error");
             observability::observe_auth_v2_methods_duration("error", started_at.elapsed());
             observability::record_auth_v2_methods_rejected(&problem.body.type_url);
             Err(problem)
@@ -943,9 +945,13 @@ pub async fn password_login_start_v2(
 ) -> Result<NoStoreJson<PasswordLoginStartContractResponse>, ApiProblem> {
     let started_at = Instant::now();
     let trace_id = trace_id(&headers);
-    let channel = payload.client.platform.as_deref().unwrap_or("unknown");
+    let cohort_label = auth_v2_metric_cohort_label(payload.client.platform.as_deref());
     if !payload.client.supports_pake {
-        observability::record_auth_v2_password_request("login_start", "invalid_request", channel);
+        observability::record_auth_v2_password_request(
+            "login_start",
+            "invalid_request",
+            &cohort_label,
+        );
         observability::observe_auth_v2_password_duration(
             "login_start",
             "invalid_request",
@@ -1036,9 +1042,13 @@ pub async fn password_upgrade_start_v2(
 ) -> Result<NoStoreJson<PasswordUpgradeStartContractResponse>, ApiProblem> {
     let started_at = Instant::now();
     let trace_id = trace_id(&headers);
-    let channel = payload.client.platform.as_deref().unwrap_or("unknown");
+    let cohort_label = auth_v2_metric_cohort_label(payload.client.platform.as_deref());
     if payload.upgrade_context != "session" || !payload.client.supports_pake {
-        observability::record_auth_v2_password_request("upgrade_start", "invalid_request", channel);
+        observability::record_auth_v2_password_request(
+            "upgrade_start",
+            "invalid_request",
+            &cohort_label,
+        );
         observability::observe_auth_v2_password_duration(
             "upgrade_start",
             "invalid_request",
@@ -1050,16 +1060,22 @@ pub async fn password_upgrade_start_v2(
 
     let principal = extract_principal(&state, &headers, trace_id.clone()).await?;
     let client_id = payload.client.platform.clone();
-    if let Err(problem) = enforce_auth_v2_rollout_access(&state, client_id.as_deref(), &trace_id) {
+    let rollout = auth_v2_rollout_for_request(&state, client_id.as_deref(), &trace_id)?;
+    let rollout_cohort_label = rollout.cohort_label().to_string();
+    if !auth_v2_allows_external_access(&rollout) {
         let rejection_reason = auth_v2_gate_rejection_reason(&state);
-        observability::record_auth_v2_password_request("upgrade_start", rejection_reason, channel);
+        observability::record_auth_v2_password_request(
+            "upgrade_start",
+            rejection_reason,
+            &rollout_cohort_label,
+        );
         observability::observe_auth_v2_password_duration(
             "upgrade_start",
             rejection_reason,
             started_at.elapsed(),
         );
         observability::record_auth_v2_password_rejected(rejection_reason);
-        return Err(*problem);
+        return Err(from_auth_error(AuthError::AuthV2RolloutDenied, trace_id));
     }
     let mut ctx = request_context(
         &headers,
@@ -1829,26 +1845,16 @@ fn request_context(
     }
 }
 
-fn enforce_auth_v2_rollout_access(
+fn auth_v2_rollout_for_request(
     state: &AppState,
     client_id: Option<&str>,
     trace_id: &str,
-) -> Result<(), Box<ApiProblem>> {
+) -> Result<AuthV2RolloutDecision, ApiProblem> {
     let Some(config) = state.auth_service.auth_v2_config() else {
-        return Err(Box::new(from_auth_error(
-            AuthError::Internal,
-            trace_id.to_string(),
-        )));
+        return Err(from_auth_error(AuthError::Internal, trace_id.to_string()));
     };
-    let rollout = evaluate_auth_v2_rollout(&config, client_id, None);
-    if auth_v2_allows_external_access(&config, &rollout) {
-        Ok(())
-    } else {
-        Err(Box::new(from_auth_error(
-            AuthError::AuthV2RolloutDenied,
-            trace_id.to_string(),
-        )))
-    }
+
+    Ok(evaluate_auth_v2_rollout(&config, client_id, None))
 }
 
 fn auth_v2_gate_rejection_reason(state: &AppState) -> &'static str {
@@ -1858,6 +1864,14 @@ fn auth_v2_gate_rejection_reason(state: &AppState) -> &'static str {
         .filter(|config| config.shadow_audit_only)
         .map(|_| "shadow_hidden")
         .unwrap_or("rollout_denied")
+}
+
+fn auth_v2_metric_cohort_label(client_id: Option<&str>) -> String {
+    client_id
+        .and_then(|value| resolve_auth_v2_cohort(value).ok())
+        .map(|cohort| cohort.as_str().to_string())
+        .or_else(|| crate::config::AuthV2Config::normalized_client_id(client_id))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn parse_x_forwarded_for(value: &str) -> Option<String> {
@@ -3449,7 +3463,7 @@ mod tests {
                     supports_pake: true,
                     supports_passkeys: true,
                     supports_conditional_mediation: Some(true),
-                    platform: Some("firefox-linux".to_string()),
+                    platform: Some("canary_web".to_string()),
                 },
             }),
         )
@@ -3491,13 +3505,13 @@ mod tests {
         let metrics_payload =
             String::from_utf8(metrics_body.to_vec()).expect("metrics payload should be utf-8");
         assert!(metrics_payload.contains("auth_v2_methods_requests_total"));
-        assert!(metrics_payload.contains("channel=\"web\""));
+        assert!(metrics_payload.contains("channel=\"canary_web\""));
         assert!(metrics_payload.contains("outcome=\"success\""));
     }
 
     #[tokio::test]
     async fn auth_methods_v2_handler_rejects_non_allowlisted_channel() {
-        let harness = build_v2_harness_with_client_allowlist(&["web"]).await;
+        let harness = build_v2_harness_with_client_allowlist(&["canary_web"]).await;
 
         let problem = super::auth_methods_v2(
             State(harness.state.clone()),
@@ -3538,6 +3552,7 @@ mod tests {
             String::from_utf8(metrics_body.to_vec()).expect("metrics payload should be utf-8");
 
         assert!(metrics_payload.contains("auth_v2_methods_rejected_total"));
+        assert!(metrics_payload.contains("channel=\"canary_mobile\""));
         assert!(metrics_payload.contains("reason=\"rollout_denied\""));
         assert!(metrics_payload.contains("outcome=\"rollout_denied\""));
     }
@@ -3590,6 +3605,7 @@ mod tests {
             String::from_utf8(metrics_body.to_vec()).expect("metrics payload should be utf-8");
 
         assert!(metrics_payload.contains("auth_v2_methods_rejected_total"));
+        assert!(metrics_payload.contains("channel=\"canary_web\""));
         assert!(metrics_payload.contains("reason=\"shadow_hidden\""));
         assert!(metrics_payload.contains("outcome=\"shadow_hidden\""));
     }
@@ -3609,7 +3625,7 @@ mod tests {
                     supports_pake: true,
                     supports_passkeys: false,
                     supports_conditional_mediation: None,
-                    platform: Some("firefox-linux".to_string()),
+                    platform: Some("canary_web".to_string()),
                 },
             }),
         )
@@ -3781,7 +3797,7 @@ mod tests {
                 client_message: None,
                 client: super::PasswordUpgradeStartClientRequest {
                     supports_pake: true,
-                    platform: Some("firefox-linux".to_string()),
+                    platform: Some("canary_web".to_string()),
                 },
             }),
         )
@@ -3814,9 +3830,15 @@ mod tests {
 
     #[tokio::test]
     async fn password_upgrade_start_v2_handler_rejects_non_allowlisted_client() {
-        let harness =
-            build_v2_harness_with_options_and_allowlist(true, true, false, false, false, &["web"])
-                .await;
+        let harness = build_v2_harness_with_options_and_allowlist(
+            true,
+            true,
+            false,
+            false,
+            false,
+            &["canary_web"],
+        )
+        .await;
         let login = login_success(&harness, "handler-v2-password-upgrade-denied-login").await;
         let access_token = login
             .access_token
@@ -3982,7 +4004,7 @@ mod tests {
             headers_with_trace("handler-v2-passkey-login-discovery"),
             Json(super::AuthMethodsRequest {
                 identifier: harness.bootstrap_email.clone(),
-                channel: Some("firefox-linux".to_string()),
+                channel: Some("canary_web".to_string()),
                 client: super::AuthClientCapabilitiesRequest {
                     supports_pake: true,
                     supports_passkeys: true,
@@ -4161,7 +4183,8 @@ mod tests {
     }
 
     async fn build_v2_harness_in_shadow_audit_mode() -> HandlerHarness {
-        build_v2_harness_with_options_and_allowlist(false, true, true, false, true, &["web"]).await
+        build_v2_harness_with_options_and_allowlist(false, true, true, false, true, &["canary_web"])
+            .await
     }
 
     async fn build_v2_harness_with_client_allowlist(client_allowlist: &[&str]) -> HandlerHarness {
@@ -4183,7 +4206,7 @@ mod tests {
             true,
             true,
             false,
-            &["web", "firefox-linux"],
+            &["canary_web"],
         )
         .await
     }
@@ -4199,7 +4222,7 @@ mod tests {
             include_active_opaque_credential,
             false,
             false,
-            &["web", "firefox-linux"],
+            &["canary_web"],
         )
         .await
     }
