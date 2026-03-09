@@ -97,7 +97,7 @@ jobs:
           cosign sign --yes ghcr.io/lu149e/system@${{ steps.build.outputs.digest }}
 
       - name: Generate build provenance attestation
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ghcr.io/lu149e/system
           subject-digest: ${{ steps.build.outputs.digest }}
