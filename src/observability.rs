@@ -16,6 +16,7 @@ struct MetricsRegistry {
     login_risk_decisions_total: IntCounterVec,
     login_risk_penalty_total: IntCounterVec,
     auth_v2_methods_requests_total: IntCounterVec,
+    auth_v2_methods_recommendations_total: IntCounterVec,
     auth_v2_methods_rejected_total: IntCounterVec,
     auth_v2_methods_duration_seconds: HistogramVec,
     auth_v2_password_start_requests_total: IntCounterVec,
@@ -104,6 +105,15 @@ impl MetricsRegistry {
             &["outcome", "channel"],
         )
         .expect("auth v2 methods requests metric should initialize");
+
+        let auth_v2_methods_recommendations_total = IntCounterVec::new(
+            Opts::new(
+                "auth_v2_methods_recommendations_total",
+                "Total auth v2 method discovery recommendations partitioned by recommended method and reason",
+            ),
+            &["recommended_method", "reason"],
+        )
+        .expect("auth v2 methods recommendations metric should initialize");
 
         let auth_v2_methods_rejected_total = IntCounterVec::new(
             Opts::new(
@@ -473,6 +483,9 @@ impl MetricsRegistry {
             .register(Box::new(auth_v2_methods_requests_total.clone()))
             .expect("auth v2 methods requests metric should register");
         registry
+            .register(Box::new(auth_v2_methods_recommendations_total.clone()))
+            .expect("auth v2 methods recommendations metric should register");
+        registry
             .register(Box::new(auth_v2_methods_rejected_total.clone()))
             .expect("auth v2 methods rejected metric should register");
         registry
@@ -629,6 +642,7 @@ impl MetricsRegistry {
             login_risk_decisions_total,
             login_risk_penalty_total,
             auth_v2_methods_requests_total,
+            auth_v2_methods_recommendations_total,
             auth_v2_methods_rejected_total,
             auth_v2_methods_duration_seconds,
             auth_v2_password_start_requests_total,
@@ -733,6 +747,16 @@ pub fn observe_auth_v2_methods_duration(outcome: &str, duration: Duration) {
         .auth_v2_methods_duration_seconds
         .with_label_values(&[normalize_auth_v2_request_outcome(outcome)])
         .observe(duration.as_secs_f64());
+}
+
+pub fn record_auth_v2_methods_recommendation(recommended_method: &str, reason: &str) {
+    metrics()
+        .auth_v2_methods_recommendations_total
+        .with_label_values(&[
+            normalize_auth_v2_recommended_method(recommended_method),
+            normalize_auth_v2_methods_recommendation_reason(reason),
+        ])
+        .inc();
 }
 
 pub fn record_auth_v2_methods_rejected(reason: &str) {
@@ -1224,6 +1248,25 @@ fn normalize_auth_v2_rejection_reason(reason: &str) -> &'static str {
     }
 }
 
+fn normalize_auth_v2_recommended_method(recommended_method: &str) -> &'static str {
+    match recommended_method {
+        "passkey" => "passkey",
+        "password_pake" => "password_pake",
+        "none" => "none",
+        _ => "other",
+    }
+}
+
+fn normalize_auth_v2_methods_recommendation_reason(reason: &str) -> &'static str {
+    match reason {
+        "conditional_mediation_available" => "conditional_mediation_available",
+        "conditional_mediation_unavailable" => "conditional_mediation_unavailable",
+        "password_pake_available" => "password_pake_available",
+        "no_supported_methods" => "no_supported_methods",
+        _ => "other",
+    }
+}
+
 fn normalize_auth_v2_fallback_reason(reason: &str) -> &'static str {
     match reason {
         "allowlisted" => "allowlisted",
@@ -1255,17 +1298,18 @@ mod tests {
         configure_email_metrics, observe_auth_v2_methods_duration,
         observe_auth_v2_password_duration, record_auth_v2_auth_flow_prune_error,
         record_auth_v2_auth_flow_prune_run, record_auth_v2_auth_flow_pruned,
-        record_auth_v2_legacy_fallback, record_auth_v2_methods_rejected,
-        record_auth_v2_methods_request, record_auth_v2_password_rejected,
-        record_auth_v2_password_request, record_email_delivery, record_email_outbox_claim_failure,
-        record_email_outbox_claim_poll, record_email_outbox_dispatch, record_email_retry_intensity,
-        record_login_risk_decision, record_login_risk_penalty,
-        record_passkey_challenge_prune_error, record_passkey_challenge_prune_run,
-        record_passkey_challenge_pruned, record_passkey_login_rejected,
-        record_passkey_register_rejected, record_passkey_request, record_password_forgot_accepted,
-        record_password_reset_rejected, record_problem_response, record_refresh_error,
-        record_refresh_success, render_prometheus, set_auth_v2_auth_flow_janitor_enabled,
-        set_auth_v2_auth_flow_metrics, set_auth_v2_auth_flow_prune_interval_seconds,
+        record_auth_v2_legacy_fallback, record_auth_v2_methods_recommendation,
+        record_auth_v2_methods_rejected, record_auth_v2_methods_request,
+        record_auth_v2_password_rejected, record_auth_v2_password_request, record_email_delivery,
+        record_email_outbox_claim_failure, record_email_outbox_claim_poll,
+        record_email_outbox_dispatch, record_email_retry_intensity, record_login_risk_decision,
+        record_login_risk_penalty, record_passkey_challenge_prune_error,
+        record_passkey_challenge_prune_run, record_passkey_challenge_pruned,
+        record_passkey_login_rejected, record_passkey_register_rejected, record_passkey_request,
+        record_password_forgot_accepted, record_password_reset_rejected, record_problem_response,
+        record_refresh_error, record_refresh_success, render_prometheus,
+        set_auth_v2_auth_flow_janitor_enabled, set_auth_v2_auth_flow_metrics,
+        set_auth_v2_auth_flow_prune_interval_seconds,
         set_auth_v2_auth_flow_prune_last_failure_unixtime,
         set_auth_v2_auth_flow_prune_last_success_unixtime, set_email_outbox_oldest_due_age_seconds,
         set_email_outbox_oldest_pending_age_seconds, set_email_outbox_queue_depth,
@@ -1291,6 +1335,8 @@ mod tests {
         record_login_risk_penalty("aggressive", "blocked_source_ip", 5);
         record_auth_v2_methods_request("web", "success");
         record_auth_v2_methods_request("shadow", "shadow_hidden");
+        record_auth_v2_methods_recommendation("passkey", "conditional_mediation_available");
+        record_auth_v2_methods_recommendation("password_pake", "conditional_mediation_unavailable");
         observe_auth_v2_methods_duration("success", std::time::Duration::from_millis(8));
         record_auth_v2_methods_rejected("https://example.com/problems/auth-v2-rollout-denied");
         record_auth_v2_password_request("login_start", "success", "web");
@@ -1382,6 +1428,7 @@ mod tests {
         assert!(payload.contains("auth_login_risk_decisions_total"));
         assert!(payload.contains("auth_login_risk_penalty_total"));
         assert!(payload.contains("auth_v2_methods_requests_total"));
+        assert!(payload.contains("auth_v2_methods_recommendations_total"));
         assert!(payload.contains("auth_v2_methods_rejected_total"));
         assert!(payload.contains("auth_v2_methods_duration_seconds"));
         assert!(payload.contains("auth_passkey_requests_total"));
@@ -1431,6 +1478,10 @@ mod tests {
         assert!(payload.contains("channel=\"canary_web\""));
         assert!(payload.contains("channel=\"canary_mobile\""));
         assert!(payload.contains("channel=\"internal\""));
+        assert!(payload.contains("recommended_method=\"passkey\""));
+        assert!(payload.contains("recommended_method=\"password_pake\""));
+        assert!(payload.contains("reason=\"conditional_mediation_available\""));
+        assert!(payload.contains("reason=\"conditional_mediation_unavailable\""));
         assert!(payload.contains("reason=\"refresh_reuse_detected\""));
         assert!(payload.contains("status=\"429\""));
         assert!(payload.contains("provider=\"sendgrid\""));

@@ -345,6 +345,7 @@ pub struct AuthMethodsCommand {
     pub identifier: String,
     pub client_id: Option<String>,
     pub supports_passkeys: bool,
+    pub supports_conditional_mediation: bool,
     pub supports_pake: bool,
 }
 
@@ -361,6 +362,7 @@ pub struct AuthMethodsResponse {
 pub struct AuthMethodResponse {
     pub kind: String,
     pub path: String,
+    pub client_mediation: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -1839,19 +1841,15 @@ impl AuthService {
                 evaluate_auth_v2_rollout(&v2.config, cmd.client_id.as_deref(), legacy.as_ref());
             audit_rollout_channel = rollout.cohort_label().to_string();
             audit_fallback_policy = Some(rollout.fallback_policy.as_str().to_string());
-            let has_passkey = if let Some(account) = account.as_ref() {
-                !self.load_passkeys_for_user(&account.id).await?.is_empty()
-            } else {
-                false
-            };
             let methods = build_auth_method_descriptors(
                 &v2.config,
                 cmd.supports_pake,
                 cmd.supports_passkeys,
-                has_passkey,
+                cmd.supports_conditional_mediation,
             );
-            let recommended_method = recommend_auth_method(&methods);
-            let recommended_method_label = recommended_method
+            let recommendation = recommend_auth_method(&methods);
+            let recommended_method_label = recommendation
+                .method
                 .as_ref()
                 .map(|method| auth_method_kind_label(method).to_string());
             let discovery_token = self.refresh_crypto.generate_refresh_token().await;
@@ -1868,6 +1866,7 @@ impl AuthService {
                         "identifier": identifier,
                         "supports_pake": cmd.supports_pake,
                         "supports_passkeys": cmd.supports_passkeys,
+                        "supports_conditional_mediation": cmd.supports_conditional_mediation,
                         "client_id": cmd.client_id,
                         "rollout_cohort": rollout.cohort.clone(),
                         "serving_mode": rollout.serving_mode.as_str(),
@@ -1895,6 +1894,7 @@ impl AuthService {
                     metadata: json!({
                         "methods": methods.iter().map(|method| auth_method_kind_label(&method.kind)).collect::<Vec<_>>(),
                         "recommended_method": recommended_method_label.clone(),
+                        "recommendation_reason": recommendation.reason,
                         "rollout_channel": rollout.cohort_label(),
                         "fallback_policy": rollout.fallback_policy.as_str(),
                         "ip": ctx.ip,
@@ -1904,6 +1904,11 @@ impl AuthService {
                 })
                 .await;
 
+            crate::observability::record_auth_v2_methods_recommendation(
+                recommended_method_label.as_deref().unwrap_or("none"),
+                recommendation.reason,
+            );
+
             Ok(AuthMethodsResponse {
                 discovery_token,
                 methods: methods
@@ -1911,6 +1916,7 @@ impl AuthService {
                     .map(|method| AuthMethodResponse {
                         kind: auth_method_kind_label(&method.kind).to_string(),
                         path: method.path,
+                        client_mediation: method.client_mediation,
                     })
                     .collect(),
                 account_recovery: build_account_recovery_response(),
@@ -4053,19 +4059,22 @@ fn build_auth_method_descriptors(
     config: &AuthV2Config,
     supports_pake: bool,
     supports_passkeys: bool,
-    _has_passkey: bool,
+    supports_conditional_mediation: bool,
 ) -> Vec<crate::modules::auth::ports::AuthMethodDescriptor> {
     let mut methods = Vec::new();
     if config.password_pake_enabled && supports_pake {
         methods.push(crate::modules::auth::ports::AuthMethodDescriptor {
             kind: crate::modules::auth::ports::AuthMethodKind::PasswordPake,
             path: "/v2/auth/password/login/start".to_string(),
+            client_mediation: None,
         });
     }
     if config.passkey_namespace_enabled && supports_passkeys {
         methods.push(crate::modules::auth::ports::AuthMethodDescriptor {
             kind: crate::modules::auth::ports::AuthMethodKind::Passkey,
             path: "/v2/auth/passkeys/login/start".to_string(),
+            client_mediation: supports_conditional_mediation
+                .then(|| "conditional_if_available".to_string()),
         });
     }
     methods
@@ -4078,16 +4087,47 @@ fn build_account_recovery_response() -> Option<AccountRecoveryResponse> {
     })
 }
 
+struct AuthMethodRecommendation {
+    method: Option<crate::modules::auth::ports::AuthMethodKind>,
+    reason: &'static str,
+}
+
 fn recommend_auth_method(
     methods: &[crate::modules::auth::ports::AuthMethodDescriptor],
-) -> Option<crate::modules::auth::ports::AuthMethodKind> {
+) -> AuthMethodRecommendation {
+    if methods.iter().any(|method| {
+        matches!(
+            method.kind,
+            crate::modules::auth::ports::AuthMethodKind::Passkey
+        ) && method.client_mediation.as_deref() == Some("conditional_if_available")
+    }) {
+        return AuthMethodRecommendation {
+            method: Some(crate::modules::auth::ports::AuthMethodKind::Passkey),
+            reason: "conditional_mediation_available",
+        };
+    }
     if methods.iter().any(|method| {
         matches!(
             method.kind,
             crate::modules::auth::ports::AuthMethodKind::Passkey
         )
     }) {
-        return Some(crate::modules::auth::ports::AuthMethodKind::Passkey);
+        if methods.iter().any(|method| {
+            matches!(
+                method.kind,
+                crate::modules::auth::ports::AuthMethodKind::PasswordPake
+            )
+        }) {
+            return AuthMethodRecommendation {
+                method: Some(crate::modules::auth::ports::AuthMethodKind::PasswordPake),
+                reason: "conditional_mediation_unavailable",
+            };
+        }
+
+        return AuthMethodRecommendation {
+            method: None,
+            reason: "conditional_mediation_unavailable",
+        };
     }
     if methods.iter().any(|method| {
         matches!(
@@ -4095,9 +4135,16 @@ fn recommend_auth_method(
             crate::modules::auth::ports::AuthMethodKind::PasswordPake
         )
     }) {
-        return Some(crate::modules::auth::ports::AuthMethodKind::PasswordPake);
+        return AuthMethodRecommendation {
+            method: Some(crate::modules::auth::ports::AuthMethodKind::PasswordPake),
+            reason: "password_pake_available",
+        };
     }
-    None
+
+    AuthMethodRecommendation {
+        method: None,
+        reason: "no_supported_methods",
+    }
 }
 
 fn auth_method_kind_label(kind: &crate::modules::auth::ports::AuthMethodKind) -> &'static str {
@@ -6016,6 +6063,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: true,
+                    supports_conditional_mediation: false,
                     supports_pake: true,
                 },
                 RequestContext {
@@ -6102,6 +6150,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: true,
+                    supports_conditional_mediation: false,
                     supports_pake: false,
                 },
                 RequestContext {
@@ -6222,6 +6271,7 @@ mod tests {
                     identifier: passkey_harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: true,
+                    supports_conditional_mediation: false,
                     supports_pake: false,
                 },
                 RequestContext {
@@ -6510,6 +6560,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: false,
+                    supports_conditional_mediation: false,
                     supports_pake: true,
                 },
                 RequestContext {
@@ -6575,6 +6626,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: false,
+                    supports_conditional_mediation: false,
                     supports_pake: true,
                 },
                 RequestContext {
@@ -6626,6 +6678,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: false,
+                    supports_conditional_mediation: false,
                     supports_pake: true,
                 },
                 RequestContext {
@@ -6656,6 +6709,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: false,
+                    supports_conditional_mediation: false,
                     supports_pake: true,
                 },
                 RequestContext {
@@ -6692,6 +6746,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: false,
+                    supports_conditional_mediation: false,
                     supports_pake: true,
                 },
                 RequestContext {
@@ -6827,6 +6882,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: true,
+                    supports_conditional_mediation: false,
                     supports_pake: false,
                 },
                 RequestContext {
@@ -6874,6 +6930,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: true,
+                    supports_conditional_mediation: false,
                     supports_pake: false,
                 },
                 RequestContext {
@@ -6918,6 +6975,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: false,
+                    supports_conditional_mediation: false,
                     supports_pake: true,
                 },
                 RequestContext {
@@ -7013,6 +7071,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: true,
+                    supports_conditional_mediation: false,
                     supports_pake: false,
                 },
                 RequestContext {
@@ -7091,6 +7150,7 @@ mod tests {
                     identifier: passkey_harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: true,
+                    supports_conditional_mediation: false,
                     supports_pake: false,
                 },
                 RequestContext {
@@ -8205,6 +8265,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: true,
+                    supports_conditional_mediation: true,
                     supports_pake: true,
                 },
                 test_context("v2-methods"),
@@ -8222,6 +8283,38 @@ mod tests {
         assert_eq!(response.methods.len(), 2);
         assert_eq!(response.methods[0].path, "/v2/auth/password/login/start");
         assert_eq!(response.methods[1].path, "/v2/auth/passkeys/login/start");
+        assert_eq!(
+            response.methods[1].client_mediation.as_deref(),
+            Some("conditional_if_available")
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_auth_methods_v2_withholds_passkey_recommendation_without_conditional_mediation() {
+        let harness = build_harness();
+        let service = harness
+            .service
+            .clone()
+            .with_v2(build_v2_dependencies(&harness).await);
+
+        let response = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some("web".to_string()),
+                    supports_passkeys: true,
+                    supports_conditional_mediation: false,
+                    supports_pake: true,
+                },
+                test_context("v2-methods-no-conditional-mediation"),
+            )
+            .await
+            .expect("v2 methods should succeed without conditional mediation");
+
+        assert_eq!(response.recommended_method.as_deref(), Some("password_pake"));
+        assert_eq!(response.methods.len(), 2);
+        assert_eq!(response.methods[1].kind, "passkey");
+        assert_eq!(response.methods[1].client_mediation, None);
     }
 
     #[tokio::test]
@@ -8238,6 +8331,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: true,
+                    supports_conditional_mediation: false,
                     supports_pake: true,
                 },
                 test_context("v2-methods-known"),
@@ -8251,6 +8345,7 @@ mod tests {
                     identifier: "missing-user@example.com".to_string(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: true,
+                    supports_conditional_mediation: false,
                     supports_pake: true,
                 },
                 test_context("v2-methods-unknown"),
@@ -8308,6 +8403,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some(" Web ".to_string()),
                     supports_passkeys: true,
+                    supports_conditional_mediation: false,
                     supports_pake: true,
                 },
                 test_context("v2-methods-allowlisted"),
@@ -8345,6 +8441,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: true,
+                    supports_conditional_mediation: false,
                     supports_pake: true,
                 },
                 test_context("v2-methods-audit"),
@@ -8539,6 +8636,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: false,
+                    supports_conditional_mediation: false,
                     supports_pake: true,
                 },
                 test_context("v2-discovery-start-finish"),
@@ -8613,6 +8711,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: false,
+                    supports_conditional_mediation: false,
                     supports_pake: true,
                 },
                 test_context("v2-discovery-replay"),
@@ -8889,6 +8988,7 @@ mod tests {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
                     supports_passkeys: false,
+                    supports_conditional_mediation: false,
                     supports_pake: true,
                 },
                 test_context("v2-resume-discovery"),

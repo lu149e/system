@@ -136,6 +136,7 @@ pub enum AuthMethodKind {
 pub struct AuthMethodDescriptor {
     pub kind: AuthMethodKind,
     pub path: String,
+    pub client_mediation: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,6 +158,7 @@ pub struct AuthMethodDiscoveryRequest {
     pub identifier: String,
     pub client_id: Option<String>,
     pub supports_passkeys: bool,
+    pub supports_conditional_mediation: bool,
     pub supports_pake: bool,
 }
 

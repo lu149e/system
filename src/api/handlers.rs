@@ -924,6 +924,10 @@ pub async fn auth_methods_v2(
                 identifier: payload.identifier,
                 client_id,
                 supports_passkeys: payload.client.supports_passkeys,
+                supports_conditional_mediation: payload
+                    .client
+                    .supports_conditional_mediation
+                    .unwrap_or(false),
                 supports_pake: payload.client.supports_pake,
             },
             ctx,
@@ -1738,12 +1742,12 @@ fn auth_methods_contract_response(
 fn auth_method_contract_response(
     method: crate::modules::auth::application::AuthMethodResponse,
 ) -> AuthMethodContractResponse {
-    let (version, client_mediation) = match method.kind.as_str() {
-        "password_pake" => ("opaque_v1", None),
-        "password_upgrade" => ("opaque_v1", None),
-        "passkey" => ("webauthn_v1", Some("conditional_if_available".to_string())),
-        "legacy_password" => ("legacy_v1", None),
-        _ => ("unknown", None),
+    let version = match method.kind.as_str() {
+        "password_pake" => "opaque_v1",
+        "password_upgrade" => "opaque_v1",
+        "passkey" => "webauthn_v1",
+        "legacy_password" => "legacy_v1",
+        _ => "unknown",
     };
 
     AuthMethodContractResponse {
@@ -1751,7 +1755,7 @@ fn auth_method_contract_response(
         version: version.to_string(),
         action: "start".to_string(),
         path: method.path,
-        client_mediation,
+        client_mediation: method.client_mediation,
     }
 }
 
@@ -3626,6 +3630,40 @@ mod tests {
         assert!(metrics_payload.contains("auth_v2_methods_requests_total"));
         assert!(metrics_payload.contains("channel=\"canary_web\""));
         assert!(metrics_payload.contains("outcome=\"success\""));
+    }
+
+    #[tokio::test]
+    async fn auth_methods_v2_handler_omits_client_mediation_without_conditional_support() {
+        let harness = build_v2_harness().await;
+
+        let response = super::auth_methods_v2(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-methods-no-conditional"),
+            Json(AuthMethodsRequest {
+                identifier: harness.bootstrap_email.clone(),
+                channel: Some("web".to_string()),
+                client: super::AuthClientCapabilitiesRequest {
+                    supports_pake: true,
+                    supports_passkeys: true,
+                    supports_conditional_mediation: Some(false),
+                    platform: Some("canary_web".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect("v2 methods handler should succeed without conditional mediation");
+
+        let body = to_bytes(response.into_response().into_body(), 1024 * 1024)
+            .await
+            .expect("v2 methods body should be readable");
+        let response: super::AuthMethodsContractResponse =
+            serde_json::from_slice(&body).expect("v2 methods body should deserialize");
+
+        assert_eq!(response.recommended_method.as_deref(), Some("password_pake"));
+        assert_eq!(response.methods.len(), 2);
+        assert_eq!(response.methods[1].kind, "passkey");
+        assert_eq!(response.methods[1].client_mediation, None);
     }
 
     #[tokio::test]
