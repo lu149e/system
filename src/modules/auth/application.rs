@@ -8290,7 +8290,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_auth_methods_v2_withholds_passkey_recommendation_without_conditional_mediation() {
+    async fn discover_auth_methods_v2_withholds_passkey_recommendation_without_conditional_mediation(
+    ) {
         let harness = build_harness();
         let service = harness
             .service
@@ -8311,7 +8312,10 @@ mod tests {
             .await
             .expect("v2 methods should succeed without conditional mediation");
 
-        assert_eq!(response.recommended_method.as_deref(), Some("password_pake"));
+        assert_eq!(
+            response.recommended_method.as_deref(),
+            Some("password_pake")
+        );
         assert_eq!(response.methods.len(), 2);
         assert_eq!(response.methods[1].kind, "passkey");
         assert_eq!(response.methods[1].client_mediation, None);

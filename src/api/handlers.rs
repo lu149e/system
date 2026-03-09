@@ -3660,7 +3660,10 @@ mod tests {
         let response: super::AuthMethodsContractResponse =
             serde_json::from_slice(&body).expect("v2 methods body should deserialize");
 
-        assert_eq!(response.recommended_method.as_deref(), Some("password_pake"));
+        assert_eq!(
+            response.recommended_method.as_deref(),
+            Some("password_pake")
+        );
         assert_eq!(response.methods.len(), 2);
         assert_eq!(response.methods[1].kind, "passkey");
         assert_eq!(response.methods[1].client_mediation, None);
