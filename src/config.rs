@@ -69,6 +69,7 @@ pub struct AuthV2Config {
     pub opaque_server_key_ref: Option<String>,
     pub passkey_namespace_enabled: bool,
     pub auth_flows_enabled: bool,
+    pub auth_flow_abuse_penalty_units: u32,
     pub legacy_fallback_mode: AuthV2LegacyFallbackMode,
     pub client_allowlist: Vec<String>,
     pub shadow_audit_only: bool,
@@ -263,6 +264,11 @@ impl AppConfig {
                 .unwrap_or_else(|_| "false".to_string())
                 .parse::<bool>()
                 .context("AUTH_V2_AUTH_FLOWS_ENABLED must be true or false")?,
+            auth_flow_abuse_penalty_units: parse_positive_u32_with_default(
+                std::env::var("AUTH_V2_AUTH_FLOW_ABUSE_PENALTY_UNITS").ok(),
+                1,
+                "AUTH_V2_AUTH_FLOW_ABUSE_PENALTY_UNITS",
+            )?,
             legacy_fallback_mode: parse_auth_v2_legacy_fallback_mode(
                 std::env::var("AUTH_V2_LEGACY_FALLBACK_MODE")
                     .unwrap_or_else(|_| "disabled".to_string()),
@@ -1434,6 +1440,7 @@ mod tests {
             opaque_server_key_ref: None,
             passkey_namespace_enabled: true,
             auth_flows_enabled: true,
+            auth_flow_abuse_penalty_units: 1,
             legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
             client_allowlist: parse_auth_v2_client_allowlist("canary_web, ios-beta".to_string())
                 .expect("allowlist should parse"),
@@ -1503,6 +1510,7 @@ mod tests {
                 ("AUTH_V2_PASSWORD_UPGRADE_ENABLED", Some("true")),
                 ("AUTH_V2_PASSKEY_NAMESPACE_ENABLED", Some("true")),
                 ("AUTH_V2_AUTH_FLOWS_ENABLED", Some("true")),
+                ("AUTH_V2_AUTH_FLOW_ABUSE_PENALTY_UNITS", Some("3")),
                 ("AUTH_V2_LEGACY_FALLBACK_MODE", Some("allowlisted")),
                 (
                     "AUTH_V2_CLIENT_ALLOWLIST",
@@ -1520,6 +1528,7 @@ mod tests {
                 assert!(config.auth_v2.password_upgrade_enabled);
                 assert!(config.auth_v2.passkey_namespace_enabled);
                 assert!(config.auth_v2.auth_flows_enabled);
+                assert_eq!(config.auth_v2.auth_flow_abuse_penalty_units, 3);
                 assert_eq!(
                     config.auth_v2.legacy_fallback_mode,
                     AuthV2LegacyFallbackMode::Allowlisted
@@ -1530,6 +1539,48 @@ mod tests {
                 );
                 assert!(config.auth_v2.shadow_audit_only);
                 assert_eq!(config.auth_v2_auth_flow_prune_interval_seconds, 90);
+            },
+        );
+    }
+
+    #[test]
+    fn app_config_from_env_rejects_non_positive_auth_v2_flow_penalty_units() {
+        let _guard = env_lock();
+        let private_key_path = write_temp_secret_file(TEST_PRIVATE_KEY_PEM);
+        let public_key_path = write_temp_secret_file(TEST_PUBLIC_KEY_PEM);
+        let keyset = format!(
+            "primary|{}|{}",
+            private_key_path.to_string_lossy(),
+            public_key_path.to_string_lossy()
+        );
+
+        with_env_vars(
+            &[
+                ("REFRESH_TOKEN_PEPPER", Some("test-refresh-pepper")),
+                (
+                    "MFA_ENCRYPTION_KEY_BASE64",
+                    Some("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
+                ),
+                (
+                    "DATABASE_URL",
+                    Some("postgres://auth:auth@127.0.0.1:5432/auth"),
+                ),
+                ("REDIS_URL", Some("redis://127.0.0.1:6379")),
+                ("JWT_PRIMARY_KID", None),
+                ("JWT_PRIVATE_KEY_PEM", None),
+                ("JWT_PUBLIC_KEY_PEM", None),
+                ("JWT_KEY_ID", None),
+                ("JWT_KEYSET", Some(keyset.as_str())),
+                ("AUTH_V2_AUTH_FLOW_ABUSE_PENALTY_UNITS", Some("0")),
+            ],
+            || {
+                let error = AppConfig::from_env()
+                    .err()
+                    .expect("non-positive auth v2 flow abuse penalty should fail");
+
+                assert!(error
+                    .to_string()
+                    .contains("AUTH_V2_AUTH_FLOW_ABUSE_PENALTY_UNITS must be greater than 0"));
             },
         );
     }

@@ -330,6 +330,29 @@ mod tests {
     }
 
     #[test]
+    fn login_locked_maps_to_expected_problem_contract() {
+        let problem = from_auth_error(
+            AuthError::LoginLocked {
+                retry_after_seconds: 90,
+            },
+            "trace-login-locked".to_string(),
+        );
+
+        assert_eq!(problem.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(problem.body.status, 429);
+        assert_eq!(problem.body.title, "Login temporarily locked");
+        assert_eq!(
+            problem.body.detail,
+            "Too many failed attempts. Retry in 90 seconds"
+        );
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/login-locked"
+        );
+        assert_eq!(problem.retry_after_seconds, Some(90));
+    }
+
+    #[test]
     fn invalid_request_maps_to_expected_problem_contract() {
         let problem = from_auth_error(
             AuthError::InvalidRequest,
@@ -385,9 +408,14 @@ mod tests {
         assert_eq!(problem.body.status, 403);
         assert_eq!(problem.body.title, "Recovery required");
         assert_eq!(
+            problem.body.detail,
+            "Complete account recovery before retrying this authentication step"
+        );
+        assert_eq!(
             problem.body.type_url,
             "https://example.com/problems/recovery-required"
         );
+        assert_eq!(problem.retry_after_seconds, None);
     }
 
     #[test]
@@ -401,9 +429,29 @@ mod tests {
         assert_eq!(problem.body.status, 401);
         assert_eq!(problem.body.title, "Invalid recovery bridge");
         assert_eq!(
+            problem.body.detail,
+            "Recovery bridge is invalid, expired, or already consumed"
+        );
+        assert_eq!(
             problem.body.type_url,
             "https://example.com/problems/invalid-recovery-bridge"
         );
+        assert_eq!(problem.retry_after_seconds, None);
+    }
+
+    #[test]
+    fn invalid_token_maps_to_expected_problem_contract() {
+        let problem = from_auth_error(AuthError::InvalidToken, "trace-invalid-token".to_string());
+
+        assert_eq!(problem.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(problem.body.status, 401);
+        assert_eq!(problem.body.title, "Invalid token");
+        assert_eq!(problem.body.detail, "Provided token is invalid");
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/invalid-token"
+        );
+        assert_eq!(problem.retry_after_seconds, None);
     }
 
     #[test]

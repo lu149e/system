@@ -142,6 +142,10 @@ impl RedisLoginAbuseProtector {
         seconds.min(self.lockout_max_seconds)
     }
 
+    fn strikes_ttl_seconds(&self) -> i64 {
+        self.window_seconds
+    }
+
     pub fn health_client(&self) -> redis::Client {
         self.client.clone()
     }
@@ -281,7 +285,7 @@ impl LoginAbuseProtector for RedisLoginAbuseProtector {
                 .arg(&strikes_key)
                 .cmd("EXPIRE")
                 .arg(&strikes_key)
-                .arg(self.lockout_max_seconds.max(self.window_seconds))
+                .arg(self.strikes_ttl_seconds())
                 .query_async::<(u32, i32)>(&mut conn)
                 .await
             {
@@ -481,5 +485,24 @@ mod tests {
             .await;
 
         assert!(lock_until.is_none());
+    }
+
+    #[test]
+    fn redis_strike_retention_matches_attempt_window() {
+        let protector = RedisLoginAbuseProtector::new(
+            "redis://127.0.0.1:1",
+            5,
+            300,
+            900,
+            7200,
+            "test:attempts".to_string(),
+            "test:lock".to_string(),
+            "test:strikes".to_string(),
+            LoginAbuseRedisFailMode::FailClosed,
+            LoginAbuseBucketMode::EmailAndIp,
+        )
+        .expect("redis protector should initialize");
+
+        assert_eq!(protector.strikes_ttl_seconds(), 300);
     }
 }

@@ -656,6 +656,23 @@ impl AuthFlowRepository for PostgresAuthFlowRepository {
         Ok(())
     }
 
+    async fn lookup(&self, flow_id: &str) -> Result<Option<AuthFlowRecord>, String> {
+        let row = sqlx::query(
+            "SELECT flow_id, subject_user_id::text AS subject_user_id, subject_identifier_hash,
+                    flow_kind, protocol, state, status, rollout_channel, fallback_policy,
+                    trace_id, issued_ip::text AS issued_ip, issued_user_agent, attempt_count,
+                    expires_at, consumed_at, created_at, updated_at
+             FROM auth_flows
+             WHERE flow_id = $1",
+        )
+        .bind(flow_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| "auth flow lookup failed".to_string())?;
+
+        row.map(auth_flow_from_row).transpose()
+    }
+
     async fn consume(
         &self,
         flow_id: &str,

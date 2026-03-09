@@ -1104,6 +1104,19 @@ fn normalize_passkey_login_rejection_reason(reason: &str) -> &'static str {
         "account_not_active" => "account_not_active",
         "passkey_not_registered" => "passkey_not_registered",
         "invalid_passkey_response" => "invalid_passkey_response",
+        "invalid-token" | "invalid_token" | "https://example.com/problems/invalid-token" => {
+            "invalid_token"
+        }
+        "login-locked" | "login_locked" | "https://example.com/problems/login-locked" => {
+            "login_locked"
+        }
+        "recovery-required"
+        | "recovery_required"
+        | "https://example.com/problems/recovery-required" => "recovery_required",
+        "rollout_denied"
+        | "auth-v2-rollout-denied"
+        | "auth_v2_rollout_denied"
+        | "https://example.com/problems/auth-v2-rollout-denied" => "rollout_denied",
         _ => "other",
     }
 }
