@@ -6001,7 +6001,7 @@ mod tests {
                 .login(
                     LoginCommand {
                         email: harness.bootstrap_email.clone(),
-                        password: "definitely-wrong-password".to_string(),
+                        password: generated_test_password(),
                         device_info: Some(format!("methods-lockout-{attempt}")),
                     },
                     test_context(&format!("methods-lockout-{attempt}")),
@@ -6118,7 +6118,7 @@ mod tests {
                 .login(
                     LoginCommand {
                         email: harness.bootstrap_email.clone(),
-                        password: "definitely-wrong-password".to_string(),
+                        password: generated_test_password(),
                         device_info: Some(format!("passkey-locked-no-challenge-{attempt}")),
                     },
                     test_context(&format!("passkey-locked-no-challenge-{attempt}")),
@@ -6903,7 +6903,7 @@ mod tests {
                 .login(
                     LoginCommand {
                         email: harness.bootstrap_email.clone(),
-                        password: "definitely-wrong-password".to_string(),
+                        password: generated_test_password(),
                         device_info: Some(format!("pre-v2-reset-{attempt}")),
                     },
                     test_context(&format!("pre-v2-password-reset-{attempt}")),
@@ -6963,7 +6963,7 @@ mod tests {
                 .login(
                     LoginCommand {
                         email: harness.bootstrap_email.clone(),
-                        password: "definitely-wrong-password".to_string(),
+                        password: generated_test_password(),
                         device_info: Some(format!("post-v2-reset-{attempt}")),
                     },
                     test_context(&format!("post-v2-password-reset-{attempt}")),
@@ -6998,7 +6998,7 @@ mod tests {
                 .login(
                     LoginCommand {
                         email: harness.bootstrap_email.clone(),
-                        password: "definitely-wrong-password".to_string(),
+                        password: generated_test_password(),
                         device_info: Some(format!("pre-v2-passkey-reset-{attempt}")),
                     },
                     test_context(&format!("pre-v2-passkey-reset-{attempt}")),
@@ -7055,7 +7055,7 @@ mod tests {
                 .login(
                     LoginCommand {
                         email: harness.bootstrap_email.clone(),
-                        password: "definitely-wrong-password".to_string(),
+                        password: generated_test_password(),
                         device_info: Some(format!("post-v2-passkey-reset-{attempt}")),
                     },
                     test_context(&format!("post-v2-passkey-reset-{attempt}")),

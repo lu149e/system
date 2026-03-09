@@ -3511,7 +3511,7 @@ mod tests {
                 .login(
                     LoginCommand {
                         email: harness.bootstrap_email.clone(),
-                        password: "definitely-wrong-password".to_string(),
+                        password: generated_test_password(),
                         device_info: Some(format!("{trace_prefix}-device-{attempt}")),
                     },
                     test_context(&format!("{trace_prefix}-{attempt}")),
