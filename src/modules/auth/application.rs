@@ -3715,7 +3715,7 @@ impl AuthService {
     async fn audit_auth_v2_methods_rejected(
         &self,
         reason: &str,
-        actor_user_id: Option<&str>,
+        _actor_user_id: Option<&str>,
         rollout_channel: &str,
         fallback_policy: Option<&str>,
         ctx: &RequestContext,
@@ -3724,7 +3724,7 @@ impl AuthService {
         self.audit
             .append(AuditEvent {
                 event_type: "auth.v2.methods.rejected".to_string(),
-                actor_user_id: actor_user_id.map(str::to_string),
+                actor_user_id: None,
                 trace_id: ctx.trace_id.clone(),
                 metadata: json!({
                     "reason": reason,

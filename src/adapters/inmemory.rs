@@ -615,6 +615,7 @@ impl InMemoryPasskeyChallengeRepository {
         }
     }
 
+    #[cfg(test)]
     pub fn has_authentication_challenge(&self, flow_id: &str) -> bool {
         self.authentication_by_flow
             .lock()
