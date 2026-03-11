@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use uuid::Uuid;
-use webauthn_rs::prelude::{Passkey, PasskeyAuthentication, PasskeyRegistration};
+use webauthn_rs::prelude::Passkey;
 
 use crate::{
     adapters::outbox::PostgresEmailOutboxRepository,
@@ -602,6 +602,9 @@ impl AuthFlowRepository for PostgresAuthFlowRepository {
                 protocol,
                 state,
                 status,
+                rollout_tenant_id,
+                rollout_request_channel,
+                rollout_cohort,
                 rollout_channel,
                 fallback_policy,
                 trace_id,
@@ -613,7 +616,7 @@ impl AuthFlowRepository for PostgresAuthFlowRepository {
                 created_at,
                 updated_at
              )
-             VALUES ($1, $2::uuid, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11::inet, $12, $13, $14, $15, $16, $17)
+             VALUES ($1, $2::uuid, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14::inet, $15, $16, $17, $18, $19, $20)
              ON CONFLICT (flow_id)
              DO UPDATE SET
                 subject_user_id = EXCLUDED.subject_user_id,
@@ -622,6 +625,9 @@ impl AuthFlowRepository for PostgresAuthFlowRepository {
                 protocol = EXCLUDED.protocol,
                 state = EXCLUDED.state,
                 status = EXCLUDED.status,
+                rollout_tenant_id = EXCLUDED.rollout_tenant_id,
+                rollout_request_channel = EXCLUDED.rollout_request_channel,
+                rollout_cohort = EXCLUDED.rollout_cohort,
                 rollout_channel = EXCLUDED.rollout_channel,
                 fallback_policy = EXCLUDED.fallback_policy,
                 trace_id = EXCLUDED.trace_id,
@@ -639,6 +645,9 @@ impl AuthFlowRepository for PostgresAuthFlowRepository {
         .bind(flow.protocol)
         .bind(flow.state)
         .bind(auth_flow_status_to_db(&flow.status))
+        .bind(flow.rollout_tenant_id)
+        .bind(flow.rollout_request_channel)
+        .bind(flow.rollout_cohort)
         .bind(flow.rollout_channel)
         .bind(flow.fallback_policy)
         .bind(flow.trace_id)
@@ -659,7 +668,8 @@ impl AuthFlowRepository for PostgresAuthFlowRepository {
     async fn lookup(&self, flow_id: &str) -> Result<Option<AuthFlowRecord>, String> {
         let row = sqlx::query(
             "SELECT flow_id, subject_user_id::text AS subject_user_id, subject_identifier_hash,
-                    flow_kind, protocol, state, status, rollout_channel, fallback_policy,
+                    flow_kind, protocol, state, status, rollout_tenant_id, rollout_request_channel,
+                    rollout_cohort, rollout_channel, fallback_policy,
                     trace_id, issued_ip::text AS issued_ip, issued_user_agent, attempt_count,
                     expires_at, consumed_at, created_at, updated_at
              FROM auth_flows
@@ -683,7 +693,8 @@ impl AuthFlowRepository for PostgresAuthFlowRepository {
              SET status = 'consumed', consumed_at = $2, updated_at = $2
              WHERE flow_id = $1 AND status = 'pending' AND expires_at > $2
              RETURNING flow_id, subject_user_id::text AS subject_user_id, subject_identifier_hash,
-                       flow_kind, protocol, state, status, rollout_channel, fallback_policy,
+                       flow_kind, protocol, state, status, rollout_tenant_id, rollout_request_channel,
+                       rollout_cohort, rollout_channel, fallback_policy,
                        trace_id, issued_ip::text AS issued_ip, issued_user_agent, attempt_count,
                        expires_at, consumed_at, created_at, updated_at",
         )
@@ -701,7 +712,8 @@ impl AuthFlowRepository for PostgresAuthFlowRepository {
 
         let row = sqlx::query(
             "SELECT flow_id, subject_user_id::text AS subject_user_id, subject_identifier_hash,
-                    flow_kind, protocol, state, status, rollout_channel, fallback_policy,
+                    flow_kind, protocol, state, status, rollout_tenant_id, rollout_request_channel,
+                    rollout_cohort, rollout_channel, fallback_policy,
                     trace_id, issued_ip::text AS issued_ip, issued_user_agent, attempt_count,
                     expires_at, consumed_at, created_at, updated_at
              FROM auth_flows
@@ -998,6 +1010,12 @@ fn auth_flow_from_row(row: sqlx::postgres::PgRow) -> Result<AuthFlowRecord, Stri
             row.try_get::<String, _>("status")
                 .map_err(|_| "invalid auth flow status".to_string())?,
         ),
+        rollout_tenant_id: row.try_get("rollout_tenant_id").ok(),
+        rollout_request_channel: row.try_get("rollout_request_channel").ok(),
+        rollout_cohort: row
+            .try_get("rollout_cohort")
+            .ok()
+            .or_else(|| row.try_get("rollout_channel").ok()),
         rollout_channel: row
             .try_get("rollout_channel")
             .map_err(|_| "invalid auth flow rollout channel".to_string())?,
@@ -1713,8 +1731,15 @@ impl PasskeyChallengeRepository for PostgresPasskeyChallengeRepository {
         flow_id: &str,
         challenge: PasskeyRegistrationChallengeRecord,
     ) -> Result<(), String> {
-        let challenge_state = serde_json::to_value(&challenge.state)
-            .map_err(|_| "passkey registration challenge serialization failed".to_string())?;
+        let challenge_state = serde_json::json!({
+            "webauthn_state": serde_json::to_value(&challenge.state)
+                .map_err(|_| "passkey registration challenge serialization failed".to_string())?,
+            "tenant_id": challenge.tenant_id,
+            "request_channel": challenge.request_channel,
+            "requested_client_id": challenge.requested_client_id,
+            "rollout_cohort": challenge.rollout_cohort,
+            "fallback_policy": challenge.fallback_policy,
+        });
 
         let mut tx =
             self.pool.begin().await.map_err(|_| {
@@ -1786,17 +1811,63 @@ impl PasskeyChallengeRepository for PostgresPasskeyChallengeRepository {
             return Ok(PasskeyRegistrationChallengeConsumeState::Expired);
         }
 
-        let state: PasskeyRegistration = serde_json::from_value(challenge_state)
-            .map_err(|_| "invalid passkey registration challenge payload".to_string())?;
+        let (
+            state,
+            tenant_id,
+            request_channel,
+            requested_client_id,
+            rollout_cohort,
+            fallback_policy,
+        ) = if let Some(wrapper_state) = challenge_state.get("webauthn_state") {
+            (
+                serde_json::from_value(wrapper_state.clone())
+                    .map_err(|_| "invalid passkey registration challenge payload".to_string())?,
+                challenge_state
+                    .get("tenant_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                challenge_state
+                    .get("request_channel")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                challenge_state
+                    .get("requested_client_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                challenge_state
+                    .get("rollout_cohort")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                challenge_state
+                    .get("fallback_policy")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            )
+        } else {
+            (
+                serde_json::from_value(challenge_state)
+                    .map_err(|_| "invalid passkey registration challenge payload".to_string())?,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
 
-        Ok(PasskeyRegistrationChallengeConsumeState::Active(
+        Ok(PasskeyRegistrationChallengeConsumeState::Active(Box::new(
             PasskeyRegistrationChallengeRecord {
                 user_id,
                 state,
+                tenant_id,
+                request_channel,
+                requested_client_id,
+                rollout_cohort,
+                fallback_policy,
                 created_at,
                 expires_at,
             },
-        ))
+        )))
     }
 
     async fn issue_authentication(
@@ -1804,8 +1875,15 @@ impl PasskeyChallengeRepository for PostgresPasskeyChallengeRepository {
         flow_id: &str,
         challenge: PasskeyAuthenticationChallengeRecord,
     ) -> Result<(), String> {
-        let challenge_state = serde_json::to_value(&challenge.state)
-            .map_err(|_| "passkey authentication challenge serialization failed".to_string())?;
+        let challenge_state = serde_json::json!({
+            "webauthn_state": serde_json::to_value(&challenge.state)
+                .map_err(|_| "passkey authentication challenge serialization failed".to_string())?,
+            "tenant_id": challenge.tenant_id,
+            "request_channel": challenge.request_channel,
+            "requested_client_id": challenge.requested_client_id,
+            "rollout_cohort": challenge.rollout_cohort,
+            "fallback_policy": challenge.fallback_policy,
+        });
 
         let mut tx =
             self.pool.begin().await.map_err(|_| {
@@ -1877,16 +1955,62 @@ impl PasskeyChallengeRepository for PostgresPasskeyChallengeRepository {
             return Ok(PasskeyAuthenticationChallengeConsumeState::Expired);
         }
 
-        let state: PasskeyAuthentication = serde_json::from_value(challenge_state)
-            .map_err(|_| "invalid passkey authentication challenge payload".to_string())?;
+        let (
+            state,
+            tenant_id,
+            request_channel,
+            requested_client_id,
+            rollout_cohort,
+            fallback_policy,
+        ) = if let Some(wrapper_state) = challenge_state.get("webauthn_state") {
+            (
+                serde_json::from_value(wrapper_state.clone())
+                    .map_err(|_| "invalid passkey authentication challenge payload".to_string())?,
+                challenge_state
+                    .get("tenant_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                challenge_state
+                    .get("request_channel")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                challenge_state
+                    .get("requested_client_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                challenge_state
+                    .get("rollout_cohort")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                challenge_state
+                    .get("fallback_policy")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            )
+        } else {
+            (
+                serde_json::from_value(challenge_state)
+                    .map_err(|_| "invalid passkey authentication challenge payload".to_string())?,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
 
         Ok(PasskeyAuthenticationChallengeConsumeState::Active(
-            PasskeyAuthenticationChallengeRecord {
+            Box::new(PasskeyAuthenticationChallengeRecord {
                 user_id,
                 state,
+                tenant_id,
+                request_channel,
+                requested_client_id,
+                rollout_cohort,
+                fallback_policy,
                 created_at,
                 expires_at,
-            },
+            }),
         ))
     }
 
@@ -2370,14 +2494,17 @@ fn session_status_to_db(status: &SessionStatus) -> &'static str {
 mod tests {
     use chrono::{DateTime, Duration, Utc};
     use sqlx::{postgres::PgPoolOptions, PgPool};
+    use webauthn_rs::prelude::{PasskeyAuthentication, PasskeyRegistration};
 
+    use crate::modules::auth::domain::{AuthFlowKind, AuthFlowStatus};
+    use crate::modules::auth::ports::AuthFlowRepository;
     use crate::modules::tokens::{
         domain::RefreshTokenRecord,
         ports::{RefreshRotationState, RefreshTokenRepository},
     };
 
     use super::{
-        PostgresAccountRepository, PostgresPasskeyChallengeRepository,
+        PostgresAccountRepository, PostgresAuthFlowRepository, PostgresPasskeyChallengeRepository,
         PostgresRefreshTokenRepository, PostgresUserRepository,
     };
     use crate::modules::auth::ports::{
@@ -2624,6 +2751,126 @@ mod tests {
         assert_eq!(second_deleted, 0);
     }
 
+    #[tokio::test]
+    async fn postgres_auth_flow_lookup_preserves_legacy_rollout_rows() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresAuthFlowRepository { pool: pool.clone() };
+        let now = Utc::now();
+        let user_id = create_user(&pool).await;
+        let flow_id = format!("legacy-auth-flow-{}", uuid::Uuid::new_v4());
+
+        sqlx::query(
+            "INSERT INTO auth_flows (
+                flow_id, subject_user_id, subject_identifier_hash, flow_kind, protocol, state,
+                status, rollout_channel, fallback_policy, trace_id, issued_ip, issued_user_agent,
+                attempt_count, expires_at, consumed_at, created_at, updated_at
+             )
+             VALUES (
+                $1, $2, NULL, 'password_login', 'opaque_v1', $3::jsonb,
+                'pending', 'canary_web', 'eligible', 'legacy-trace', NULL, 'legacy-agent',
+                0, $4, NULL, $5, $5
+             )",
+        )
+        .bind(&flow_id)
+        .bind(user_id)
+        .bind(serde_json::json!({"client_id": "web"}))
+        .bind(now + Duration::seconds(300))
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("legacy auth flow should be inserted");
+
+        let flow = repo
+            .lookup(&flow_id)
+            .await
+            .expect("legacy auth flow lookup should succeed")
+            .expect("legacy auth flow should exist");
+
+        assert_eq!(flow.flow_kind, AuthFlowKind::PasswordLogin);
+        assert_eq!(flow.status, AuthFlowStatus::Pending);
+        assert_eq!(flow.rollout_tenant_id, None);
+        assert_eq!(flow.rollout_request_channel, None);
+        assert_eq!(flow.rollout_cohort.as_deref(), Some("canary_web"));
+        assert_eq!(flow.rollout_channel.as_deref(), Some("canary_web"));
+        assert_eq!(flow.fallback_policy.as_deref(), Some("eligible"));
+    }
+
+    #[tokio::test]
+    async fn postgres_passkey_challenge_reads_legacy_raw_payload_without_metadata() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let repo = PostgresPasskeyChallengeRepository { pool: pool.clone() };
+        let now = Utc::now();
+        let user_id = create_user(&pool).await;
+
+        let authentication_flow = format!("legacy-passkey-auth-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO passkey_challenges (flow_id, user_id, challenge_type, challenge_state, expires_at, created_at)
+             VALUES ($1, $2, 'authentication', $3::jsonb, $4, $5)",
+        )
+        .bind(&authentication_flow)
+        .bind(user_id)
+        .bind(dummy_passkey_authentication_state_value())
+        .bind(now + Duration::seconds(300))
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("legacy authentication challenge should be inserted");
+
+        let authentication = repo
+            .consume_authentication(&authentication_flow, now)
+            .await
+            .expect("legacy authentication challenge read should succeed");
+        let crate::modules::auth::ports::PasskeyAuthenticationChallengeConsumeState::Active(
+            authentication,
+        ) = authentication
+        else {
+            panic!("expected active authentication challenge");
+        };
+        let authentication = *authentication;
+        assert_eq!(authentication.user_id, user_id.to_string());
+        assert_eq!(authentication.tenant_id, None);
+        assert_eq!(authentication.request_channel, None);
+        assert_eq!(authentication.requested_client_id, None);
+        assert_eq!(authentication.rollout_cohort, None);
+        assert_eq!(authentication.fallback_policy, None);
+
+        let registration_flow = format!("legacy-passkey-register-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO passkey_challenges (flow_id, user_id, challenge_type, challenge_state, expires_at, created_at)
+             VALUES ($1, $2, 'registration', $3::jsonb, $4, $5)",
+        )
+        .bind(&registration_flow)
+        .bind(user_id)
+        .bind(dummy_passkey_registration_state_value())
+        .bind(now + Duration::seconds(300))
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("legacy registration challenge should be inserted");
+
+        let registration = repo
+            .consume_registration(&registration_flow, now)
+            .await
+            .expect("legacy registration challenge read should succeed");
+        let crate::modules::auth::ports::PasskeyRegistrationChallengeConsumeState::Active(
+            registration,
+        ) = registration
+        else {
+            panic!("expected active registration challenge");
+        };
+        let registration = *registration;
+        assert_eq!(registration.user_id, user_id.to_string());
+        assert_eq!(registration.tenant_id, None);
+        assert_eq!(registration.request_channel, None);
+        assert_eq!(registration.requested_client_id, None);
+        assert_eq!(registration.rollout_cohort, None);
+        assert_eq!(registration.fallback_policy, None);
+    }
+
     async fn test_pool() -> Option<PgPool> {
         if let Some(database_url) = non_empty_env("AUTH_TEST_DATABASE_URL") {
             return Some(
@@ -2728,5 +2975,48 @@ mod tests {
             replaced_by: None,
             created_at: now,
         }
+    }
+
+    fn dummy_passkey_authentication_state_value() -> serde_json::Value {
+        serde_json::to_value(dummy_passkey_authentication_state())
+            .expect("dummy passkey authentication state should serialize")
+    }
+
+    fn dummy_passkey_authentication_state() -> PasskeyAuthentication {
+        serde_json::from_str(
+            r#"{
+  "ast": {
+    "credentials": [],
+    "policy": "required",
+    "challenge": "",
+    "appid": null,
+    "allow_backup_eligible_upgrade": false
+  }
+}"#,
+        )
+        .expect("dummy passkey authentication state should deserialize")
+    }
+
+    fn dummy_passkey_registration_state_value() -> serde_json::Value {
+        serde_json::to_value(dummy_passkey_registration_state())
+            .expect("dummy passkey registration state should serialize")
+    }
+
+    fn dummy_passkey_registration_state() -> PasskeyRegistration {
+        serde_json::from_str(
+            r#"{
+  "rs": {
+    "policy": "required",
+    "exclude_credentials": [],
+    "challenge": "",
+    "credential_algorithms": ["EDDSA"],
+    "require_resident_key": false,
+    "authenticator_attachment": null,
+    "extensions": {},
+    "allow_synchronised_authenticators": true
+  }
+}"#,
+        )
+        .expect("dummy passkey registration state should deserialize")
     }
 }

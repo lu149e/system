@@ -154,8 +154,17 @@ pub struct AccountRecoveryDescriptor {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
+pub struct AuthMethodDiscoveryRolloutTarget {
+    pub tenant_id: Option<String>,
+    pub request_channel: Option<String>,
+    pub requested_client_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct AuthMethodDiscoveryRequest {
     pub identifier: String,
+    pub rollout_target: AuthMethodDiscoveryRolloutTarget,
     pub client_id: Option<String>,
     pub supports_passkeys: bool,
     pub supports_conditional_mediation: bool,
@@ -446,6 +455,11 @@ pub trait PasskeyCredentialRepository: Send + Sync {
 pub struct PasskeyRegistrationChallengeRecord {
     pub user_id: String,
     pub state: PasskeyRegistration,
+    pub tenant_id: Option<String>,
+    pub request_channel: Option<String>,
+    pub requested_client_id: Option<String>,
+    pub rollout_cohort: Option<String>,
+    pub fallback_policy: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -454,20 +468,25 @@ pub struct PasskeyRegistrationChallengeRecord {
 pub struct PasskeyAuthenticationChallengeRecord {
     pub user_id: String,
     pub state: PasskeyAuthentication,
+    pub tenant_id: Option<String>,
+    pub request_channel: Option<String>,
+    pub requested_client_id: Option<String>,
+    pub rollout_cohort: Option<String>,
+    pub fallback_policy: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
 pub enum PasskeyRegistrationChallengeConsumeState {
-    Active(PasskeyRegistrationChallengeRecord),
+    Active(Box<PasskeyRegistrationChallengeRecord>),
     NotFound,
     Expired,
 }
 
 #[derive(Clone, Debug)]
 pub enum PasskeyAuthenticationChallengeConsumeState {
-    Active(PasskeyAuthenticationChallengeRecord),
+    Active(Box<PasskeyAuthenticationChallengeRecord>),
     NotFound,
     Expired,
 }

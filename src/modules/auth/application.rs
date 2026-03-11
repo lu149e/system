@@ -44,7 +44,10 @@ use crate::modules::{
     },
 };
 
-use crate::config::{resolve_auth_v2_cohort, AuthV2Config, AuthV2LegacyFallbackMode};
+use crate::config::{
+    normalize_auth_v2_request_channel, resolve_auth_v2_cohort, AuthV2Config,
+    AuthV2LegacyFallbackMode,
+};
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -103,7 +106,41 @@ pub struct RequestContext {
     pub ip: Option<String>,
     pub user_agent: Option<String>,
     pub client_id: Option<String>,
+    pub(crate) auth_v2_rollout: Option<AuthV2RolloutDecision>,
     pub auth_api_surface: AuthApiSurface,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AuthV2RolloutTarget {
+    pub tenant_id: Option<String>,
+    pub request_channel: Option<String>,
+    pub requested_client_id: Option<String>,
+}
+
+impl AuthV2RolloutTarget {
+    pub fn from_client_id(client_id: Option<&str>) -> Self {
+        Self {
+            tenant_id: None,
+            request_channel: None,
+            requested_client_id: AuthV2Config::normalized_client_id(client_id),
+        }
+    }
+
+    pub(crate) fn new(
+        tenant_id: Option<String>,
+        request_channel: Option<String>,
+        requested_client_id: Option<String>,
+    ) -> Self {
+        Self {
+            tenant_id: tenant_id
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty()),
+            request_channel: normalize_auth_v2_request_channel(request_channel.as_deref()),
+            requested_client_id: requested_client_id
+                .as_deref()
+                .and_then(|value| AuthV2Config::normalized_client_id(Some(value))),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,6 +179,8 @@ impl AuthV2ServingMode {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuthV2RolloutDecision {
+    pub(crate) tenant_id: Option<String>,
+    pub(crate) request_channel: Option<String>,
     pub(crate) requested_client_id: Option<String>,
     pub(crate) cohort: Option<String>,
     pub(crate) serving_mode: AuthV2ServingMode,
@@ -153,6 +192,7 @@ impl AuthV2RolloutDecision {
     pub(crate) fn cohort_label(&self) -> &str {
         self.cohort
             .as_deref()
+            .or(self.request_channel.as_deref())
             .or(self.requested_client_id.as_deref())
             .unwrap_or("unknown")
     }
@@ -344,6 +384,7 @@ pub struct PasskeyChallenge {
 pub struct AuthMethodsCommand {
     pub identifier: String,
     pub client_id: Option<String>,
+    pub rollout_target: AuthV2RolloutTarget,
     pub supports_passkeys: bool,
     pub supports_conditional_mediation: bool,
     pub supports_pake: bool,
@@ -397,6 +438,7 @@ pub struct PakeLoginFinishCommand {
 pub struct PasswordUpgradeStartCommand {
     pub user_id: Option<String>,
     pub context: crate::modules::auth::domain::PasswordUpgradeContext,
+    pub rollout_target: AuthV2RolloutTarget,
     pub request: serde_json::Value,
 }
 
@@ -1247,6 +1289,26 @@ impl AuthService {
                 PasskeyRegistrationChallengeRecord {
                     user_id: user.id.clone(),
                     state,
+                    tenant_id: ctx
+                        .auth_v2_rollout
+                        .as_ref()
+                        .and_then(|rollout| rollout.tenant_id.clone()),
+                    request_channel: ctx
+                        .auth_v2_rollout
+                        .as_ref()
+                        .and_then(|rollout| rollout.request_channel.clone()),
+                    requested_client_id: ctx
+                        .auth_v2_rollout
+                        .as_ref()
+                        .and_then(|rollout| rollout.requested_client_id.clone()),
+                    rollout_cohort: ctx
+                        .auth_v2_rollout
+                        .as_ref()
+                        .and_then(|rollout| rollout.cohort.clone()),
+                    fallback_policy: ctx
+                        .auth_v2_rollout
+                        .as_ref()
+                        .map(|rollout| rollout.fallback_policy.as_str().to_string()),
                     created_at: now,
                     expires_at: self.passkey_challenge_expires_at(now),
                 },
@@ -1292,7 +1354,7 @@ impl AuthService {
             .await
             .map_err(|_| AuthError::Internal)?
         {
-            PasskeyRegistrationChallengeConsumeState::Active(challenge) => challenge,
+            PasskeyRegistrationChallengeConsumeState::Active(challenge) => *challenge,
             PasskeyRegistrationChallengeConsumeState::NotFound
             | PasskeyRegistrationChallengeConsumeState::Expired => {
                 self.audit_passkey_register_rejected(
@@ -1305,6 +1367,23 @@ impl AuthService {
                 return Err(AuthError::InvalidPasskeyChallenge);
             }
         };
+        let mut ctx = ctx;
+        if matches!(ctx.auth_api_surface, AuthApiSurface::V2) {
+            ctx.auth_v2_rollout = Some(AuthV2RolloutDecision {
+                tenant_id: pending.tenant_id.clone(),
+                request_channel: pending.request_channel.clone(),
+                requested_client_id: pending.requested_client_id.clone(),
+                cohort: pending.rollout_cohort.clone(),
+                serving_mode: AuthV2ServingMode::External,
+                client_allowed: true,
+                fallback_policy: pending
+                    .fallback_policy
+                    .as_deref()
+                    .map(parse_auth_v2_fallback_policy)
+                    .transpose()?
+                    .unwrap_or(AuthV2FallbackPolicy::Disabled),
+            });
+        }
 
         if pending.user_id != user_id {
             self.audit_passkey_register_rejected(
@@ -1431,6 +1510,26 @@ impl AuthService {
                 PasskeyAuthenticationChallengeRecord {
                     user_id: user.id.clone(),
                     state,
+                    tenant_id: ctx
+                        .auth_v2_rollout
+                        .as_ref()
+                        .and_then(|rollout| rollout.tenant_id.clone()),
+                    request_channel: ctx
+                        .auth_v2_rollout
+                        .as_ref()
+                        .and_then(|rollout| rollout.request_channel.clone()),
+                    requested_client_id: ctx
+                        .auth_v2_rollout
+                        .as_ref()
+                        .and_then(|rollout| rollout.requested_client_id.clone()),
+                    rollout_cohort: ctx
+                        .auth_v2_rollout
+                        .as_ref()
+                        .and_then(|rollout| rollout.cohort.clone()),
+                    fallback_policy: ctx
+                        .auth_v2_rollout
+                        .as_ref()
+                        .map(|rollout| rollout.fallback_policy.as_str().to_string()),
                     created_at: now,
                     expires_at: self.passkey_challenge_expires_at(now),
                 },
@@ -1479,6 +1578,7 @@ impl AuthService {
         let mut audit_actor_user_id: Option<String> = None;
         let mut audit_flow_id: Option<String> = None;
         let mut ctx = ctx;
+        let mut rollout_diagnostic: Option<AuthV2RolloutDecision> = None;
 
         let result = async {
             let now = Utc::now();
@@ -1503,12 +1603,13 @@ impl AuthService {
             }
 
             let rollout = auth_v2_rollout_from_flow(&v2.config, &flow, None);
+            rollout_diagnostic = Some(rollout.clone());
             if !auth_v2_allows_external_access(&rollout) {
                 return Err(AuthError::AuthV2RolloutDenied);
             }
 
             audit_actor_user_id = flow.subject_user_id.clone();
-            ctx.client_id = Some(rollout.cohort_label().to_string());
+            apply_auth_v2_rollout_to_ctx(&mut ctx, &rollout);
             let challenge = self.passkey_login_start(identifier, ctx.clone()).await?;
             audit_flow_id = Some(challenge.flow_id.clone());
             Ok(challenge)
@@ -1523,6 +1624,15 @@ impl AuthService {
                 &ctx,
             )
             .await;
+        }
+        if let Some(rollout) = rollout_diagnostic.as_ref() {
+            crate::observability::record_auth_v2_rollout_diagnostic(
+                "passkey_login_start",
+                auth_v2_request_outcome(&result),
+                rollout.cohort.as_deref(),
+                rollout.request_channel.as_deref(),
+                rollout.tenant_id.as_deref(),
+            );
         }
 
         result
@@ -1542,7 +1652,7 @@ impl AuthService {
             .await
             .map_err(|_| AuthError::Internal)?
         {
-            PasskeyAuthenticationChallengeConsumeState::Active(challenge) => challenge,
+            PasskeyAuthenticationChallengeConsumeState::Active(challenge) => *challenge,
             PasskeyAuthenticationChallengeConsumeState::NotFound
             | PasskeyAuthenticationChallengeConsumeState::Expired => {
                 self.audit_passkey_login_rejected(
@@ -1555,6 +1665,23 @@ impl AuthService {
                 return Err(AuthError::InvalidPasskeyChallenge);
             }
         };
+        let mut ctx = ctx;
+        if matches!(ctx.auth_api_surface, AuthApiSurface::V2) {
+            ctx.auth_v2_rollout = Some(AuthV2RolloutDecision {
+                tenant_id: pending.tenant_id.clone(),
+                request_channel: pending.request_channel.clone(),
+                requested_client_id: pending.requested_client_id.clone(),
+                cohort: pending.rollout_cohort.clone(),
+                serving_mode: AuthV2ServingMode::External,
+                client_allowed: true,
+                fallback_policy: pending
+                    .fallback_policy
+                    .as_deref()
+                    .map(parse_auth_v2_fallback_policy)
+                    .transpose()?
+                    .unwrap_or(AuthV2FallbackPolicy::Disabled),
+            });
+        }
 
         let user = self
             .users
@@ -1838,7 +1965,7 @@ impl AuthService {
                 None
             };
             let rollout =
-                evaluate_auth_v2_rollout(&v2.config, cmd.client_id.as_deref(), legacy.as_ref());
+                evaluate_auth_v2_rollout(&v2.config, &cmd.rollout_target, legacy.as_ref());
             audit_rollout_channel = rollout.cohort_label().to_string();
             audit_fallback_policy = Some(rollout.fallback_policy.as_str().to_string());
             let methods = build_auth_method_descriptors(
@@ -1868,10 +1995,16 @@ impl AuthService {
                         "supports_passkeys": cmd.supports_passkeys,
                         "supports_conditional_mediation": cmd.supports_conditional_mediation,
                         "client_id": cmd.client_id,
+                        "requested_client_id": rollout.requested_client_id.clone(),
+                        "tenant_id": rollout.tenant_id.clone(),
+                        "request_channel": rollout.request_channel.clone(),
                         "rollout_cohort": rollout.cohort.clone(),
                         "serving_mode": rollout.serving_mode.as_str(),
                     }),
                     status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                    rollout_tenant_id: rollout.tenant_id.clone(),
+                    rollout_request_channel: rollout.request_channel.clone(),
+                    rollout_cohort: rollout.cohort.clone(),
                     rollout_channel: Some(rollout.cohort_label().to_string()),
                     fallback_policy: Some(rollout.fallback_policy.as_str().to_string()),
                     trace_id: Some(ctx.trace_id.clone()),
@@ -1891,15 +2024,28 @@ impl AuthService {
                     event_type: "auth.v2.methods.requested".to_string(),
                     actor_user_id: account.map(|record| record.id),
                     trace_id: ctx.trace_id.clone(),
-                    metadata: json!({
-                        "methods": methods.iter().map(|method| auth_method_kind_label(&method.kind)).collect::<Vec<_>>(),
-                        "recommended_method": recommended_method_label.clone(),
-                        "recommendation_reason": recommendation.reason,
-                        "rollout_channel": rollout.cohort_label(),
-                        "fallback_policy": rollout.fallback_policy.as_str(),
-                        "ip": ctx.ip,
-                        "user_agent": ctx.user_agent,
-                    }),
+                    metadata: {
+                        let mut payload = serde_json::Map::new();
+                        payload.insert(
+                            "methods".to_string(),
+                            json!(methods
+                                .iter()
+                                .map(|method| auth_method_kind_label(&method.kind))
+                                .collect::<Vec<_>>()),
+                        );
+                        payload.insert(
+                            "recommended_method".to_string(),
+                            json!(recommended_method_label.clone()),
+                        );
+                        payload.insert(
+                            "recommendation_reason".to_string(),
+                            json!(recommendation.reason),
+                        );
+                        payload.insert("ip".to_string(), json!(ctx.ip));
+                        payload.insert("user_agent".to_string(), json!(ctx.user_agent));
+                        extend_auth_v2_rollout_metadata(&mut payload, &rollout);
+                        serde_json::Value::Object(payload)
+                    },
                     created_at: now,
                 })
                 .await;
@@ -1955,6 +2101,7 @@ impl AuthService {
         let mut audit_actor_user_id: Option<String> = None;
         let mut audit_fallback_policy: Option<String> = None;
         let mut audit_flow_id: Option<String> = None;
+        let mut rollout_diagnostic: Option<AuthV2RolloutDecision> = None;
         let result = async {
             let identifier = cmd.identifier.to_ascii_lowercase();
             let now = Utc::now();
@@ -2010,6 +2157,7 @@ impl AuthService {
                 None
             };
             let rollout = auth_v2_rollout_from_flow(&v2.config, &discovery_flow, legacy.as_ref());
+            rollout_diagnostic = Some(rollout.clone());
             metrics_channel = rollout.cohort_label().to_string();
             audit_actor_user_id = account.as_ref().map(|record| record.id.clone());
             audit_fallback_policy = Some(rollout.fallback_policy.as_str().to_string());
@@ -2063,10 +2211,16 @@ impl AuthService {
                         "server_state": result.server_state,
                         "legacy_fallback_allowed": rollout.fallback_policy.legacy_password_allowed(),
                         "client_id": discovery_flow.state.get("client_id").cloned(),
+                        "requested_client_id": rollout.requested_client_id.clone(),
+                        "tenant_id": rollout.tenant_id.clone(),
+                        "request_channel": rollout.request_channel.clone(),
                         "rollout_cohort": rollout.cohort.clone(),
                         "serving_mode": rollout.serving_mode.as_str(),
                     }),
                     status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                    rollout_tenant_id: rollout.tenant_id.clone(),
+                    rollout_request_channel: rollout.request_channel.clone(),
+                    rollout_cohort: rollout.cohort.clone(),
                     rollout_channel: Some(rollout.cohort_label().to_string()),
                     fallback_policy: Some(rollout.fallback_policy.as_str().to_string()),
                     trace_id: Some(ctx.trace_id.clone()),
@@ -2086,13 +2240,14 @@ impl AuthService {
                     event_type: "auth.v2.password.login.challenge.issued".to_string(),
                     actor_user_id: account.as_ref().map(|record| record.id.clone()),
                     trace_id: ctx.trace_id.clone(),
-                    metadata: json!({
-                        "flow_id": flow_id.clone(),
-                        "rollout_channel": rollout.cohort_label(),
-                        "fallback_policy": rollout.fallback_policy.as_str(),
-                        "ip": ctx.ip,
-                        "user_agent": ctx.user_agent,
-                    }),
+                    metadata: {
+                        let mut payload = serde_json::Map::new();
+                        payload.insert("flow_id".to_string(), json!(flow_id.clone()));
+                        payload.insert("ip".to_string(), json!(ctx.ip));
+                        payload.insert("user_agent".to_string(), json!(ctx.user_agent));
+                        extend_auth_v2_rollout_metadata(&mut payload, &rollout);
+                        serde_json::Value::Object(payload)
+                    },
                     created_at: now,
                 })
                 .await;
@@ -2114,6 +2269,10 @@ impl AuthService {
                     metadata: json!({
                         "reason": reason,
                         "flow_id": audit_flow_id,
+                        "tenant_id": ctx.auth_v2_rollout.as_ref().and_then(|rollout| rollout.tenant_id.clone()),
+                        "request_channel": ctx.auth_v2_rollout.as_ref().and_then(|rollout| rollout.request_channel.clone()),
+                        "requested_client_id": ctx.auth_v2_rollout.as_ref().and_then(|rollout| rollout.requested_client_id.clone()),
+                        "rollout_cohort": ctx.auth_v2_rollout.as_ref().and_then(|rollout| rollout.cohort.clone()),
                         "rollout_channel": metrics_channel,
                         "fallback_policy": audit_fallback_policy,
                         "ip": ctx.ip,
@@ -2128,6 +2287,15 @@ impl AuthService {
             auth_v2_request_outcome(&result),
             &metrics_channel,
         );
+        if let Some(rollout) = rollout_diagnostic.as_ref() {
+            crate::observability::record_auth_v2_rollout_diagnostic(
+                "password_login_start",
+                auth_v2_request_outcome(&result),
+                rollout.cohort.as_deref(),
+                rollout.request_channel.as_deref(),
+                rollout.tenant_id.as_deref(),
+            );
+        }
         crate::observability::observe_auth_v2_password_duration(
             "login_start",
             auth_v2_request_outcome(&result),
@@ -2149,6 +2317,7 @@ impl AuthService {
         let mut metrics_channel = "unknown".to_string();
         let mut audit_actor_user_id: Option<String> = None;
         let mut audit_fallback_policy: Option<String> = None;
+        let mut rollout_diagnostic: Option<AuthV2RolloutDecision> = None;
         let result = async {
             let now = Utc::now();
             let flow_state = v2
@@ -2168,6 +2337,7 @@ impl AuthService {
                 _ => return Err(AuthError::InvalidCredentials),
             };
             let rollout = auth_v2_rollout_from_flow(&v2.config, &flow, None);
+            rollout_diagnostic = Some(rollout.clone());
             metrics_channel = rollout.cohort_label().to_string();
             audit_fallback_policy = Some(rollout.fallback_policy.as_str().to_string());
 
@@ -2245,13 +2415,14 @@ impl AuthService {
                     event_type: "auth.v2.password.login.success".to_string(),
                     actor_user_id: Some(account.id),
                     trace_id: ctx.trace_id.clone(),
-                    metadata: json!({
-                        "session_id": principal.session_id,
-                        "rollout_channel": rollout.cohort_label(),
-                        "fallback_policy": rollout.fallback_policy.as_str(),
-                        "ip": ctx.ip,
-                        "user_agent": ctx.user_agent,
-                    }),
+                    metadata: {
+                        let mut payload = serde_json::Map::new();
+                        payload.insert("session_id".to_string(), json!(principal.session_id));
+                        payload.insert("ip".to_string(), json!(ctx.ip));
+                        payload.insert("user_agent".to_string(), json!(ctx.user_agent));
+                        extend_auth_v2_rollout_metadata(&mut payload, &rollout);
+                        serde_json::Value::Object(payload)
+                    },
                     created_at: now,
                 })
                 .await;
@@ -2282,6 +2453,15 @@ impl AuthService {
             auth_v2_request_outcome(&result),
             &metrics_channel,
         );
+        if let Some(rollout) = rollout_diagnostic.as_ref() {
+            crate::observability::record_auth_v2_rollout_diagnostic(
+                "password_login_finish",
+                auth_v2_request_outcome(&result),
+                rollout.cohort.as_deref(),
+                rollout.request_channel.as_deref(),
+                rollout.tenant_id.as_deref(),
+            );
+        }
         crate::observability::observe_auth_v2_password_duration(
             "login_finish",
             auth_v2_request_outcome(&result),
@@ -2306,6 +2486,7 @@ impl AuthService {
         let started_at = Instant::now();
         let mut metrics_channel = auth_v2_rollout_channel_hint(ctx.client_id.as_deref());
         let mut audit_fallback_policy: Option<String> = None;
+        let mut rollout_diagnostic: Option<AuthV2RolloutDecision> = None;
         let result = async {
             let now = Utc::now();
             let (account, recovery_bridge) = match &cmd.context {
@@ -2352,8 +2533,8 @@ impl AuthService {
             }) {
                 return Err(AuthError::OpaqueCredentialAlreadyActive);
             }
-            let rollout =
-                evaluate_auth_v2_rollout(&v2.config, ctx.client_id.as_deref(), Some(&legacy));
+            let rollout = evaluate_auth_v2_rollout(&v2.config, &cmd.rollout_target, Some(&legacy));
+            rollout_diagnostic = Some(rollout.clone());
             metrics_channel = rollout.cohort_label().to_string();
             audit_fallback_policy = Some(rollout.fallback_policy.as_str().to_string());
             if !auth_v2_allows_external_access(&rollout) {
@@ -2395,10 +2576,16 @@ impl AuthService {
                         })),
                         "legacy_login_allowed": legacy.legacy_login_allowed,
                         "client_id": ctx.client_id.clone(),
+                        "requested_client_id": rollout.requested_client_id.clone(),
+                        "tenant_id": rollout.tenant_id.clone(),
+                        "request_channel": rollout.request_channel.clone(),
                         "rollout_cohort": rollout.cohort.clone(),
                         "serving_mode": rollout.serving_mode.as_str(),
                     }),
                     status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                    rollout_tenant_id: rollout.tenant_id.clone(),
+                    rollout_request_channel: rollout.request_channel.clone(),
+                    rollout_cohort: rollout.cohort.clone(),
                     rollout_channel: Some(rollout.cohort_label().to_string()),
                     fallback_policy: Some(rollout.fallback_policy.as_str().to_string()),
                     trace_id: Some(ctx.trace_id.clone()),
@@ -2418,18 +2605,22 @@ impl AuthService {
                     event_type: "auth.v2.password.upgrade.started".to_string(),
                     actor_user_id: Some(account.id),
                     trace_id: ctx.trace_id.clone(),
-                    metadata: json!({
-                        "flow_id": flow_id.clone(),
-                        "upgrade_context": cmd.context.kind(),
-                        "recovery_bridge": recovery_bridge.as_ref().map(|bridge| json!({
-                            "flow_id": bridge.flow_id,
-                            "source": bridge.source,
-                        })),
-                        "rollout_channel": rollout.cohort_label(),
-                        "fallback_policy": rollout.fallback_policy.as_str(),
-                        "ip": ctx.ip,
-                        "user_agent": ctx.user_agent,
-                    }),
+                    metadata: {
+                        let mut payload = serde_json::Map::new();
+                        payload.insert("flow_id".to_string(), json!(flow_id.clone()));
+                        payload.insert("upgrade_context".to_string(), json!(cmd.context.kind()));
+                        payload.insert(
+                            "recovery_bridge".to_string(),
+                            json!(recovery_bridge.as_ref().map(|bridge| json!({
+                                "flow_id": bridge.flow_id,
+                                "source": bridge.source,
+                            }))),
+                        );
+                        payload.insert("ip".to_string(), json!(ctx.ip));
+                        payload.insert("user_agent".to_string(), json!(ctx.user_agent));
+                        extend_auth_v2_rollout_metadata(&mut payload, &rollout);
+                        serde_json::Value::Object(payload)
+                    },
                     created_at: now,
                 })
                 .await;
@@ -2451,6 +2642,10 @@ impl AuthService {
                     metadata: json!({
                         "reason": reason,
                         "upgrade_context": cmd.context.kind(),
+                        "tenant_id": cmd.rollout_target.tenant_id.clone(),
+                        "request_channel": cmd.rollout_target.request_channel.clone(),
+                        "requested_client_id": cmd.rollout_target.requested_client_id.clone(),
+                        "rollout_cohort": serde_json::Value::Null,
                         "rollout_channel": metrics_channel,
                         "fallback_policy": audit_fallback_policy,
                         "ip": ctx.ip,
@@ -2465,6 +2660,15 @@ impl AuthService {
             auth_v2_request_outcome(&result),
             &metrics_channel,
         );
+        if let Some(rollout) = rollout_diagnostic.as_ref() {
+            crate::observability::record_auth_v2_rollout_diagnostic(
+                "password_upgrade_start",
+                auth_v2_request_outcome(&result),
+                rollout.cohort.as_deref(),
+                rollout.request_channel.as_deref(),
+                rollout.tenant_id.as_deref(),
+            );
+        }
         crate::observability::observe_auth_v2_password_duration(
             "upgrade_start",
             auth_v2_request_outcome(&result),
@@ -2490,6 +2694,7 @@ impl AuthService {
         let mut metrics_channel = "unknown".to_string();
         let mut audit_actor_user_id: Option<String> = None;
         let mut audit_fallback_policy: Option<String> = None;
+        let mut rollout_diagnostic: Option<AuthV2RolloutDecision> = None;
         let result = async {
             let now = Utc::now();
             let flow_state = v2
@@ -2509,6 +2714,7 @@ impl AuthService {
                 _ => return Err(AuthError::InvalidToken),
             };
             let rollout = auth_v2_rollout_from_flow(&v2.config, &flow, None);
+            rollout_diagnostic = Some(rollout.clone());
             metrics_channel = rollout.cohort_label().to_string();
             audit_fallback_policy = Some(rollout.fallback_policy.as_str().to_string());
 
@@ -2576,15 +2782,16 @@ impl AuthService {
                     event_type: "auth.v2.password.upgrade.completed".to_string(),
                     actor_user_id: Some(user_id),
                     trace_id: ctx.trace_id.clone(),
-                    metadata: json!({
-                        "flow_id": cmd.flow_id.clone(),
-                        "upgrade_context": upgrade_context,
-                        "recovery_bridge": recovery_bridge,
-                        "rollout_channel": rollout.cohort_label(),
-                        "fallback_policy": rollout.fallback_policy.as_str(),
-                        "ip": ctx.ip,
-                        "user_agent": ctx.user_agent,
-                    }),
+                    metadata: {
+                        let mut payload = serde_json::Map::new();
+                        payload.insert("flow_id".to_string(), json!(cmd.flow_id.clone()));
+                        payload.insert("upgrade_context".to_string(), json!(upgrade_context));
+                        payload.insert("recovery_bridge".to_string(), json!(recovery_bridge));
+                        payload.insert("ip".to_string(), json!(ctx.ip));
+                        payload.insert("user_agent".to_string(), json!(ctx.user_agent));
+                        extend_auth_v2_rollout_metadata(&mut payload, &rollout);
+                        serde_json::Value::Object(payload)
+                    },
                     created_at: now,
                 })
                 .await;
@@ -2612,6 +2819,10 @@ impl AuthService {
                     metadata: json!({
                         "reason": reason,
                         "flow_id": cmd.flow_id,
+                        "tenant_id": ctx.auth_v2_rollout.as_ref().and_then(|rollout| rollout.tenant_id.clone()),
+                        "request_channel": ctx.auth_v2_rollout.as_ref().and_then(|rollout| rollout.request_channel.clone()),
+                        "requested_client_id": ctx.auth_v2_rollout.as_ref().and_then(|rollout| rollout.requested_client_id.clone()),
+                        "rollout_cohort": ctx.auth_v2_rollout.as_ref().and_then(|rollout| rollout.cohort.clone()),
                         "rollout_channel": metrics_channel,
                         "fallback_policy": audit_fallback_policy,
                         "ip": ctx.ip,
@@ -2626,6 +2837,15 @@ impl AuthService {
             auth_v2_request_outcome(&result),
             &metrics_channel,
         );
+        if let Some(rollout) = rollout_diagnostic.as_ref() {
+            crate::observability::record_auth_v2_rollout_diagnostic(
+                "password_upgrade_finish",
+                auth_v2_request_outcome(&result),
+                rollout.cohort.as_deref(),
+                rollout.request_channel.as_deref(),
+                rollout.tenant_id.as_deref(),
+            );
+        }
         crate::observability::observe_auth_v2_password_duration(
             "upgrade_finish",
             auth_v2_request_outcome(&result),
@@ -2729,6 +2949,9 @@ impl AuthService {
                     "source": source,
                 }),
                 status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                rollout_tenant_id: None,
+                rollout_request_channel: None,
+                rollout_cohort: None,
                 rollout_channel: Some(auth_v2_rollout_channel_hint(ctx.client_id.as_deref())),
                 fallback_policy: Some(AuthV2FallbackPolicy::Disabled.as_str().to_string()),
                 trace_id: Some(ctx.trace_id.clone()),
@@ -3734,6 +3957,10 @@ impl AuthService {
                 trace_id: ctx.trace_id.clone(),
                 metadata: json!({
                     "reason": reason,
+                    "tenant_id": serde_json::Value::Null,
+                    "request_channel": serde_json::Value::Null,
+                    "requested_client_id": serde_json::Value::Null,
+                    "rollout_cohort": serde_json::Value::Null,
                     "rollout_channel": rollout_channel,
                     "fallback_policy": fallback_policy,
                     "ip": ctx.ip,
@@ -4158,17 +4385,22 @@ fn auth_method_kind_label(kind: &crate::modules::auth::ports::AuthMethodKind) ->
 
 pub(crate) fn evaluate_auth_v2_rollout(
     config: &AuthV2Config,
-    client_id: Option<&str>,
+    target: &AuthV2RolloutTarget,
     legacy: Option<&LegacyPasswordRecord>,
 ) -> AuthV2RolloutDecision {
-    let requested_client_id = AuthV2Config::normalized_client_id(client_id);
-    let cohort = requested_client_id
-        .as_deref()
-        .and_then(|value| resolve_auth_v2_cohort(value).ok())
-        .map(|cohort| cohort.as_str().to_string());
-    let client_allowed = cohort
-        .as_ref()
-        .is_some_and(|cohort| config.client_allowlist.iter().any(|value| value == cohort));
+    let matched_rule = config.matching_targeting_rule(
+        target.tenant_id.as_deref(),
+        target.request_channel.as_deref(),
+        target.requested_client_id.as_deref(),
+    );
+    let cohort = matched_rule.map(|rule| rule.cohort.clone()).or_else(|| {
+        target
+            .requested_client_id
+            .as_deref()
+            .and_then(|value| resolve_auth_v2_cohort(value).ok())
+            .map(|cohort| cohort.as_str().to_string())
+    });
+    let client_allowed = matched_rule.is_some();
     let serving_mode = if config.shadow_audit_only {
         AuthV2ServingMode::Shadow
     } else {
@@ -4187,7 +4419,9 @@ pub(crate) fn evaluate_auth_v2_rollout(
     };
 
     AuthV2RolloutDecision {
-        requested_client_id,
+        tenant_id: target.tenant_id.clone(),
+        request_channel: target.request_channel.clone(),
+        requested_client_id: target.requested_client_id.clone(),
         cohort,
         serving_mode,
         client_allowed,
@@ -4234,12 +4468,19 @@ fn recovery_bridge_policy_allows(config: &AuthV2Config, source: RecoveryBridgeSo
 }
 
 fn auth_v2_rollout_channel_hint(client_id: Option<&str>) -> String {
-    let requested_client_id = AuthV2Config::normalized_client_id(client_id);
-    requested_client_id
+    let target = AuthV2RolloutTarget::from_client_id(client_id);
+    target
+        .request_channel
         .as_deref()
-        .and_then(|value| resolve_auth_v2_cohort(value).ok())
-        .map(|cohort| cohort.as_str().to_string())
-        .or(requested_client_id)
+        .map(str::to_string)
+        .or_else(|| {
+            target
+                .requested_client_id
+                .as_deref()
+                .and_then(|value| resolve_auth_v2_cohort(value).ok())
+                .map(|cohort| cohort.as_str().to_string())
+        })
+        .or(target.requested_client_id)
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -4254,17 +4495,95 @@ fn auth_v2_passkey_audit_metadata(
                 serde_json::Value::Object(map) => map,
                 _ => serde_json::Map::new(),
             };
-            payload.insert(
-                "rollout_channel".to_string(),
-                serde_json::Value::String(auth_v2_rollout_channel_hint(ctx.client_id.as_deref())),
-            );
-            payload.insert(
-                "fallback_policy".to_string(),
-                serde_json::Value::String(AuthV2FallbackPolicy::Disabled.as_str().to_string()),
-            );
+            if let Some(rollout) = ctx.auth_v2_rollout.as_ref() {
+                if let serde_json::Value::Object(rollout_payload) =
+                    auth_v2_rollout_metadata(rollout)
+                {
+                    payload.extend(rollout_payload);
+                }
+            } else {
+                payload.insert(
+                    "rollout_channel".to_string(),
+                    serde_json::Value::String(auth_v2_rollout_channel_hint(
+                        ctx.client_id.as_deref(),
+                    )),
+                );
+                payload.insert(
+                    "fallback_policy".to_string(),
+                    serde_json::Value::String(AuthV2FallbackPolicy::Disabled.as_str().to_string()),
+                );
+                payload.insert("tenant_id".to_string(), serde_json::Value::Null);
+                payload.insert("request_channel".to_string(), serde_json::Value::Null);
+                payload.insert("requested_client_id".to_string(), serde_json::Value::Null);
+                payload.insert("rollout_cohort".to_string(), serde_json::Value::Null);
+            }
             serde_json::Value::Object(payload)
         }
     }
+}
+
+fn apply_auth_v2_rollout_to_ctx(ctx: &mut RequestContext, rollout: &AuthV2RolloutDecision) {
+    ctx.client_id = rollout
+        .requested_client_id
+        .clone()
+        .or_else(|| rollout.cohort.clone());
+    ctx.auth_v2_rollout = Some(rollout.clone());
+}
+
+fn extend_auth_v2_rollout_metadata(
+    payload: &mut serde_json::Map<String, serde_json::Value>,
+    rollout: &AuthV2RolloutDecision,
+) {
+    payload.insert(
+        "tenant_id".to_string(),
+        rollout
+            .tenant_id
+            .clone()
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    payload.insert(
+        "request_channel".to_string(),
+        rollout
+            .request_channel
+            .clone()
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    payload.insert(
+        "requested_client_id".to_string(),
+        rollout
+            .requested_client_id
+            .clone()
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    payload.insert(
+        "rollout_cohort".to_string(),
+        rollout
+            .cohort
+            .clone()
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    payload.insert(
+        "rollout_channel".to_string(),
+        serde_json::Value::String(rollout.cohort_label().to_string()),
+    );
+    payload.insert(
+        "fallback_policy".to_string(),
+        serde_json::Value::String(rollout.fallback_policy.as_str().to_string()),
+    );
+    payload.insert(
+        "serving_mode".to_string(),
+        serde_json::Value::String(rollout.serving_mode.as_str().to_string()),
+    );
+}
+
+fn auth_v2_rollout_metadata(rollout: &AuthV2RolloutDecision) -> serde_json::Value {
+    let mut payload = serde_json::Map::new();
+    extend_auth_v2_rollout_metadata(&mut payload, rollout);
+    serde_json::Value::Object(payload)
 }
 
 fn auth_v2_fallback_reason(
@@ -4284,46 +4603,63 @@ fn auth_v2_fallback_reason(
     }
 }
 
+fn parse_auth_v2_fallback_policy(value: &str) -> Result<AuthV2FallbackPolicy, AuthError> {
+    match value {
+        "disabled" => Ok(AuthV2FallbackPolicy::Disabled),
+        "eligible" => Ok(AuthV2FallbackPolicy::Eligible),
+        _ => Err(AuthError::InvalidToken),
+    }
+}
+
 fn auth_v2_rollout_from_flow(
     config: &AuthV2Config,
     flow: &AuthFlowRecord,
     legacy: Option<&LegacyPasswordRecord>,
 ) -> AuthV2RolloutDecision {
-    let requested_client_id = flow
-        .state
-        .get("client_id")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| AuthV2Config::normalized_client_id(Some(value)))
-        .or_else(|| match flow.rollout_channel.as_deref() {
-            Some("shadow") => None,
-            other => AuthV2Config::normalized_client_id(other),
-        });
+    let target = AuthV2RolloutTarget::new(
+        flow.rollout_tenant_id.clone(),
+        flow.rollout_request_channel.clone(),
+        flow.state
+            .get("requested_client_id")
+            .or_else(|| flow.state.get("client_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| match flow.rollout_channel.as_deref() {
+                Some("shadow") => None,
+                other => other.map(str::to_string),
+            }),
+    );
+    let fallback_decision = evaluate_auth_v2_rollout(config, &target, legacy);
     let cohort = flow
-        .state
-        .get("rollout_cohort")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
+        .rollout_cohort
+        .clone()
+        .or_else(|| {
+            flow.state
+                .get("rollout_cohort")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
         .or_else(|| {
             flow.rollout_channel
                 .as_deref()
                 .and_then(|value| resolve_auth_v2_cohort(value).ok())
                 .map(|cohort| cohort.as_str().to_string())
         })
-        .or_else(|| {
-            requested_client_id
-                .as_deref()
-                .and_then(|value| resolve_auth_v2_cohort(value).ok())
-                .map(|cohort| cohort.as_str().to_string())
+        .or_else(|| fallback_decision.cohort.clone());
+    let client_allowed = fallback_decision.client_allowed
+        || cohort.as_ref().is_some_and(|cohort_label| {
+            config
+                .matching_targeting_rule(
+                    target.tenant_id.as_deref(),
+                    target.request_channel.as_deref(),
+                    Some(cohort_label),
+                )
+                .is_some()
         });
-    let client_allowed = cohort
-        .as_ref()
-        .is_some_and(|cohort| config.client_allowlist.iter().any(|value| value == cohort));
     let fallback_policy = match flow.fallback_policy.as_deref() {
         Some("eligible") => AuthV2FallbackPolicy::Eligible,
         Some("disabled") => AuthV2FallbackPolicy::Disabled,
-        _ => {
-            evaluate_auth_v2_rollout(config, requested_client_id.as_deref(), legacy).fallback_policy
-        }
+        _ => fallback_decision.fallback_policy,
     };
     let serving_mode = match flow
         .state
@@ -4333,11 +4669,13 @@ fn auth_v2_rollout_from_flow(
         Some("shadow") => AuthV2ServingMode::Shadow,
         Some("external") => AuthV2ServingMode::External,
         _ if flow.rollout_channel.as_deref() == Some("shadow") => AuthV2ServingMode::Shadow,
-        _ => evaluate_auth_v2_rollout(config, requested_client_id.as_deref(), legacy).serving_mode,
+        _ => fallback_decision.serving_mode,
     };
 
     AuthV2RolloutDecision {
-        requested_client_id,
+        tenant_id: target.tenant_id,
+        request_channel: target.request_channel,
+        requested_client_id: target.requested_client_id,
         cohort,
         serving_mode,
         client_allowed,
@@ -4366,8 +4704,8 @@ mod tests {
         },
         adapters::passkey::WebauthnPasskeyService,
         config::{
-            AppConfig, AuthRuntime, AuthV2Config, AuthV2LegacyFallbackMode, LoginAbuseBucketMode,
-            LoginAbuseRedisFailMode,
+            AppConfig, AuthRuntime, AuthV2Config, AuthV2LegacyFallbackMode, AuthV2TargetingRule,
+            LoginAbuseBucketMode, LoginAbuseRedisFailMode,
         },
         modules::{
             auth::domain::{
@@ -4389,7 +4727,8 @@ mod tests {
 
     use super::{
         evaluate_auth_v2_rollout, AuthApiSurface, AuthError, AuthMethodsCommand, AuthService,
-        AuthV2Dependencies, LoginCommand, LoginResult, MfaActivateCommand, MfaVerifyCommand,
+        AuthV2Dependencies, AuthV2FallbackPolicy, AuthV2RolloutDecision, AuthV2RolloutTarget,
+        AuthV2ServingMode, LoginCommand, LoginResult, MfaActivateCommand, MfaVerifyCommand,
         PakeLoginFinishCommand, PakeLoginStartCommand, Passkey, PasswordChangeCommand,
         PasswordForgotCommand, PasswordResetCommand, PasswordUpgradeFinishCommand,
         PasswordUpgradeStartCommand, PublicKeyCredential, RefreshCommand,
@@ -5334,6 +5673,15 @@ mod tests {
                 },
                 RequestContext {
                     client_id: Some("web".to_string()),
+                    auth_v2_rollout: Some(AuthV2RolloutDecision {
+                        tenant_id: None,
+                        request_channel: None,
+                        requested_client_id: Some("web".to_string()),
+                        cohort: Some("canary_web".to_string()),
+                        serving_mode: AuthV2ServingMode::External,
+                        client_allowed: true,
+                        fallback_policy: AuthV2FallbackPolicy::Disabled,
+                    }),
                     ..test_context("password-reset-recovery-bridge")
                 },
             )
@@ -5445,6 +5793,9 @@ mod tests {
                 protocol: "recovery_upgrade_bridge_v1".to_string(),
                 state: json!({"source": "password_reset"}),
                 status: AuthFlowStatus::Pending,
+                rollout_tenant_id: None,
+                rollout_request_channel: None,
+                rollout_cohort: Some("canary_web".to_string()),
                 rollout_channel: Some("canary_web".to_string()),
                 fallback_policy: Some("disabled".to_string()),
                 trace_id: Some("trace-recovery-bridge-start".to_string()),
@@ -5466,6 +5817,7 @@ mod tests {
                     context: crate::modules::auth::domain::PasswordUpgradeContext::recovery_bridge(
                         "recovery-bridge-start",
                     ),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     request: json!({
                         "platform": "web",
                         "supports_pake": true,
@@ -5513,6 +5865,7 @@ mod tests {
                     context: crate::modules::auth::domain::PasswordUpgradeContext::recovery_bridge(
                         "missing-recovery-bridge",
                     ),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     request: json!({
                         "platform": "web",
                         "supports_pake": true,
@@ -5563,6 +5916,9 @@ mod tests {
                 protocol: "recovery_upgrade_bridge_v1".to_string(),
                 state: json!({"source": "password_reset"}),
                 status: AuthFlowStatus::Pending,
+                rollout_tenant_id: None,
+                rollout_request_channel: None,
+                rollout_cohort: Some("canary_web".to_string()),
                 rollout_channel: Some("canary_web".to_string()),
                 fallback_policy: Some("disabled".to_string()),
                 trace_id: Some("trace-recovery-bridge-finish".to_string()),
@@ -5584,6 +5940,7 @@ mod tests {
                     context: crate::modules::auth::domain::PasswordUpgradeContext::recovery_bridge(
                         "recovery-bridge-finish",
                     ),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     request: json!({
                         "platform": "web",
                         "supports_pake": true,
@@ -5957,6 +6314,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn passkey_login_start_v2_persists_rollout_context_from_discovery_flow() {
+        let mut harness = build_harness();
+        enable_passkey_for_harness(&mut harness);
+
+        let user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+        harness
+            .passkeys
+            .upsert_for_user(&user.id, dummy_passkey(), Utc::now())
+            .await
+            .expect("dummy passkey should be inserted");
+
+        let mut dependencies = build_v2_dependencies(&harness).await;
+        dependencies.config.targeting_rules = vec![
+            AuthV2TargetingRule {
+                tenant_id: Some("external-acme".to_string()),
+                request_channel: Some("web".to_string()),
+                requested_client_id: None,
+                cohort: "beta_external".to_string(),
+            },
+            AuthV2TargetingRule {
+                tenant_id: None,
+                request_channel: None,
+                requested_client_id: Some("canary_web".to_string()),
+                cohort: "canary_web".to_string(),
+            },
+        ];
+        let service = harness.service.clone().with_v2(dependencies);
+
+        let discovery = service
+            .discover_auth_methods_v2(
+                AuthMethodsCommand {
+                    identifier: harness.bootstrap_email.clone(),
+                    client_id: Some("canary_web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(
+                        Some("external-acme".to_string()),
+                        Some("web".to_string()),
+                        Some("canary_web".to_string()),
+                    ),
+                    supports_passkeys: true,
+                    supports_conditional_mediation: false,
+                    supports_pake: false,
+                },
+                RequestContext {
+                    auth_api_surface: AuthApiSurface::V2,
+                    ..test_context("passkey-login-start-v2-rollout-discovery")
+                },
+            )
+            .await
+            .expect("v2 methods should succeed");
+
+        let start = service
+            .passkey_login_start_v2(
+                &harness.bootstrap_email,
+                &discovery.discovery_token,
+                RequestContext {
+                    auth_api_surface: AuthApiSurface::V2,
+                    ..test_context("passkey-login-start-v2-rollout-start")
+                },
+            )
+            .await
+            .expect("v2 passkey login should start");
+
+        let challenge = harness
+            .passkey_challenges
+            .peek_authentication_challenge(&start.flow_id)
+            .expect("passkey authentication challenge should be stored");
+
+        assert_eq!(challenge.tenant_id.as_deref(), Some("external-acme"));
+        assert_eq!(challenge.request_channel.as_deref(), Some("web"));
+        assert_eq!(challenge.requested_client_id.as_deref(), Some("canary_web"));
+        assert_eq!(challenge.rollout_cohort.as_deref(), Some("beta_external"));
+        assert_eq!(challenge.fallback_policy.as_deref(), Some("eligible"));
+    }
+
+    #[tokio::test]
     async fn passkey_login_finish_v2_invalid_response_emits_v2_rejected_audit_reason() {
         let mut harness = build_harness();
         enable_passkey_for_harness(&mut harness);
@@ -6062,6 +6498,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: true,
                     supports_conditional_mediation: false,
                     supports_pake: true,
@@ -6149,6 +6586,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: true,
                     supports_conditional_mediation: false,
                     supports_pake: false,
@@ -6246,6 +6684,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn passkey_login_finish_v2_reuses_persisted_rollout_context_in_audit() {
+        let mut harness = build_harness();
+        enable_successful_finish_passkey_for_harness(&mut harness);
+
+        let user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+        harness
+            .passkeys
+            .upsert_for_user(&user.id, dummy_passkey(), Utc::now())
+            .await
+            .expect("dummy passkey should be inserted");
+
+        let flow_id = format!("flow-v2-passkey-rollout-success-{}", Uuid::new_v4());
+        let now = Utc::now();
+        harness
+            .passkey_challenges
+            .issue_authentication(
+                &flow_id,
+                PasskeyAuthenticationChallengeRecord {
+                    user_id: user.id.clone(),
+                    state: dummy_passkey_authentication_state(),
+                    tenant_id: Some("external-acme".to_string()),
+                    request_channel: Some("web".to_string()),
+                    requested_client_id: Some("canary_web".to_string()),
+                    rollout_cohort: Some("beta_external".to_string()),
+                    fallback_policy: Some("eligible".to_string()),
+                    created_at: now,
+                    expires_at: now + chrono::Duration::seconds(300),
+                },
+            )
+            .await
+            .expect("passkey authentication challenge should be issued");
+
+        let result = harness
+            .service
+            .passkey_login_finish(
+                &flow_id,
+                successful_passkey_login_credential(),
+                Some("unit-device".to_string()),
+                RequestContext {
+                    auth_api_surface: AuthApiSurface::V2,
+                    ..test_context("passkey-login-finish-v2-rollout-success")
+                },
+            )
+            .await
+            .expect("v2 passkey login finish should succeed");
+
+        assert!(matches!(result, LoginResult::Authenticated { .. }));
+        let events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit lock should be available");
+        let event = events
+            .iter()
+            .find(|event| {
+                event.event_type == "auth.v2.passkey.login.success"
+                    && event.trace_id == "passkey-login-finish-v2-rollout-success"
+            })
+            .expect("v2 passkey login success audit should exist");
+
+        assert_eq!(event.metadata["tenant_id"], "external-acme");
+        assert_eq!(event.metadata["request_channel"], "web");
+        assert_eq!(event.metadata["requested_client_id"], "canary_web");
+        assert_eq!(event.metadata["rollout_cohort"], "beta_external");
+        assert_eq!(event.metadata["rollout_channel"], "beta_external");
+        assert_eq!(event.metadata["fallback_policy"], "eligible");
+    }
+
+    #[tokio::test]
     async fn passkey_login_finish_v2_recovery_required_emits_v2_rejected_audit_reason() {
         let harness = build_harness_with_login_risk(Arc::new(IpChallengeLoginRiskAnalyzer));
         let mut passkey_harness = harness;
@@ -6270,6 +6781,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: passkey_harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: true,
                     supports_conditional_mediation: false,
                     supports_pake: false,
@@ -6471,6 +6983,7 @@ mod tests {
                     ip: Some("198.51.100.10".to_string()),
                     user_agent: Some("unit-test".to_string()),
                     client_id: None,
+                    auth_v2_rollout: None,
                     auth_api_surface: AuthApiSurface::V1,
                 },
             )
@@ -6531,6 +7044,7 @@ mod tests {
                     ip: Some("198.51.100.10".to_string()),
                     user_agent: Some("unit-test".to_string()),
                     client_id: None,
+                    auth_v2_rollout: None,
                     auth_api_surface: AuthApiSurface::V1,
                 },
             )
@@ -6559,6 +7073,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: false,
                     supports_conditional_mediation: false,
                     supports_pake: true,
@@ -6625,6 +7140,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: false,
                     supports_conditional_mediation: false,
                     supports_pake: true,
@@ -6677,6 +7193,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: false,
                     supports_conditional_mediation: false,
                     supports_pake: true,
@@ -6708,6 +7225,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: false,
                     supports_conditional_mediation: false,
                     supports_pake: true,
@@ -6745,6 +7263,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: false,
                     supports_conditional_mediation: false,
                     supports_pake: true,
@@ -6788,6 +7307,9 @@ mod tests {
                     "source": RecoveryBridgeSource::PasswordReset,
                 }),
                 status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                rollout_tenant_id: None,
+                rollout_request_channel: None,
+                rollout_cohort: Some("canary_web".to_string()),
                 rollout_channel: Some("canary_web".to_string()),
                 fallback_policy: Some("disabled".to_string()),
                 trace_id: Some("bridge-replay-abuse".to_string()),
@@ -6809,6 +7331,7 @@ mod tests {
                     context: crate::modules::auth::domain::PasswordUpgradeContext::RecoveryBridge {
                         flow_id: "bridge-replay-abuse".to_string(),
                     },
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     request: json!({"platform": "web", "supports_pake": true}),
                 },
                 RequestContext {
@@ -6826,6 +7349,7 @@ mod tests {
                     context: crate::modules::auth::domain::PasswordUpgradeContext::RecoveryBridge {
                         flow_id: "bridge-replay-abuse".to_string(),
                     },
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     request: json!({"platform": "web", "supports_pake": true}),
                 },
                 RequestContext {
@@ -6881,6 +7405,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: true,
                     supports_conditional_mediation: false,
                     supports_pake: false,
@@ -6929,6 +7454,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: true,
                     supports_conditional_mediation: false,
                     supports_pake: false,
@@ -6974,6 +7500,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: false,
                     supports_conditional_mediation: false,
                     supports_pake: true,
@@ -7070,6 +7597,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: true,
                     supports_conditional_mediation: false,
                     supports_pake: false,
@@ -7149,6 +7677,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: passkey_harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: true,
                     supports_conditional_mediation: false,
                     supports_pake: false,
@@ -8264,6 +8793,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: true,
                     supports_conditional_mediation: true,
                     supports_pake: true,
@@ -8303,6 +8833,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: true,
                     supports_conditional_mediation: false,
                     supports_pake: true,
@@ -8334,6 +8865,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: true,
                     supports_conditional_mediation: false,
                     supports_pake: true,
@@ -8348,6 +8880,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: "missing-user@example.com".to_string(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: true,
                     supports_conditional_mediation: false,
                     supports_pake: true,
@@ -8386,6 +8919,7 @@ mod tests {
                 auth_flow_abuse_penalty_units: 1,
                 legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
                 client_allowlist: vec!["canary_web".to_string()],
+                targeting_rules: compatibility_targeting_rules(&["canary_web"]),
                 shadow_audit_only: false,
             },
             accounts: Arc::new(StaticAccountRepository::new(vec![AccountRecord {
@@ -8406,6 +8940,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some(" Web ".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some(" Web ".to_string())),
                     supports_passkeys: true,
                     supports_conditional_mediation: false,
                     supports_pake: true,
@@ -8420,6 +8955,7 @@ mod tests {
             .expect("discovery flow should be stored");
 
         assert_eq!(stored_flow.rollout_channel.as_deref(), Some("canary_web"));
+        assert_eq!(stored_flow.rollout_cohort.as_deref(), Some("canary_web"));
         assert_eq!(stored_flow.fallback_policy.as_deref(), Some("disabled"));
         assert_eq!(
             stored_flow.state.get("rollout_cohort"),
@@ -8444,6 +8980,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: true,
                     supports_conditional_mediation: false,
                     supports_pake: true,
@@ -8473,6 +9010,27 @@ mod tests {
         assert_eq!(
             event
                 .metadata
+                .get("request_channel")
+                .and_then(|value| value.as_str()),
+            None
+        );
+        assert_eq!(
+            event
+                .metadata
+                .get("requested_client_id")
+                .and_then(|value| value.as_str()),
+            Some("web")
+        );
+        assert_eq!(
+            event
+                .metadata
+                .get("rollout_cohort")
+                .and_then(|value| value.as_str()),
+            Some("canary_web")
+        );
+        assert_eq!(
+            event
+                .metadata
                 .get("fallback_policy")
                 .and_then(|value| value.as_str()),
             Some("eligible")
@@ -8493,8 +9051,38 @@ mod tests {
             auth_flow_abuse_penalty_units: 1,
             legacy_fallback_mode,
             client_allowlist: vec!["canary_web".to_string()],
+            targeting_rules: compatibility_targeting_rules(&["canary_web"]),
             shadow_audit_only: false,
         }
+    }
+
+    fn compatibility_targeting_rules(cohorts: &[&str]) -> Vec<AuthV2TargetingRule> {
+        let mut rules = Vec::new();
+
+        for cohort in cohorts {
+            rules.push(AuthV2TargetingRule {
+                tenant_id: None,
+                request_channel: None,
+                requested_client_id: Some((*cohort).to_string()),
+                cohort: (*cohort).to_string(),
+            });
+
+            let request_channel = match *cohort {
+                "internal" | "canary_web" => Some("web"),
+                "canary_mobile" => Some("mobile"),
+                _ => None,
+            };
+            if let Some(request_channel) = request_channel {
+                rules.push(AuthV2TargetingRule {
+                    tenant_id: None,
+                    request_channel: Some(request_channel.to_string()),
+                    requested_client_id: None,
+                    cohort: (*cohort).to_string(),
+                });
+            }
+        }
+
+        rules
     }
 
     fn eligible_legacy_password() -> LegacyPasswordRecord {
@@ -8555,7 +9143,11 @@ mod tests {
             expected_policy,
         ) in cases
         {
-            let decision = evaluate_auth_v2_rollout(&config, client_id, Some(&legacy));
+            let decision = evaluate_auth_v2_rollout(
+                &config,
+                &AuthV2RolloutTarget::from_client_id(client_id),
+                Some(&legacy),
+            );
 
             assert_eq!(decision.cohort.as_deref(), expected_cohort);
             assert_eq!(decision.serving_mode.as_str(), expected_serving_mode);
@@ -8573,8 +9165,11 @@ mod tests {
         let mut config = rollout_test_config(AuthV2LegacyFallbackMode::Allowlisted);
         config.shadow_audit_only = true;
 
-        let decision =
-            evaluate_auth_v2_rollout(&config, Some("web"), Some(&eligible_legacy_password()));
+        let decision = evaluate_auth_v2_rollout(
+            &config,
+            &AuthV2RolloutTarget::from_client_id(Some("web")),
+            Some(&eligible_legacy_password()),
+        );
 
         assert_eq!(decision.cohort.as_deref(), Some("canary_web"));
         assert_eq!(decision.cohort_label(), "canary_web");
@@ -8587,7 +9182,7 @@ mod tests {
     fn evaluate_auth_v2_rollout_disables_fallback_without_legacy_credentials() {
         let decision = evaluate_auth_v2_rollout(
             &rollout_test_config(AuthV2LegacyFallbackMode::Broad),
-            Some("web"),
+            &AuthV2RolloutTarget::from_client_id(Some("web")),
             None,
         );
 
@@ -8604,7 +9199,7 @@ mod tests {
 
         let decision = evaluate_auth_v2_rollout(
             &rollout_test_config(AuthV2LegacyFallbackMode::Broad),
-            Some("web"),
+            &AuthV2RolloutTarget::from_client_id(Some("web")),
             Some(&legacy),
         );
 
@@ -8618,12 +9213,52 @@ mod tests {
     fn evaluate_auth_v2_rollout_is_fail_closed_for_non_allowlisted_clients() {
         let config = rollout_test_config(AuthV2LegacyFallbackMode::Allowlisted);
 
-        let decision = evaluate_auth_v2_rollout(&config, Some("android"), None);
+        let decision = evaluate_auth_v2_rollout(
+            &config,
+            &AuthV2RolloutTarget::from_client_id(Some("android")),
+            None,
+        );
 
         assert_eq!(decision.cohort.as_deref(), Some("canary_mobile"));
         assert_eq!(decision.cohort_label(), "canary_mobile");
         assert!(!decision.client_allowed);
         assert_eq!(decision.fallback_policy.as_str(), "disabled");
+    }
+
+    #[test]
+    fn evaluate_auth_v2_rollout_prefers_tenant_channel_rule_over_client_compatibility() {
+        let mut config = rollout_test_config(AuthV2LegacyFallbackMode::Allowlisted);
+        config.targeting_rules = vec![
+            AuthV2TargetingRule {
+                tenant_id: Some("external-acme".to_string()),
+                request_channel: Some("web".to_string()),
+                requested_client_id: None,
+                cohort: "beta_external".to_string(),
+            },
+            AuthV2TargetingRule {
+                tenant_id: None,
+                request_channel: None,
+                requested_client_id: Some("canary_web".to_string()),
+                cohort: "canary_web".to_string(),
+            },
+        ];
+
+        let decision = evaluate_auth_v2_rollout(
+            &config,
+            &AuthV2RolloutTarget {
+                tenant_id: Some("external-acme".to_string()),
+                request_channel: Some("web".to_string()),
+                requested_client_id: Some("canary_web".to_string()),
+            },
+            Some(&eligible_legacy_password()),
+        );
+
+        assert_eq!(decision.tenant_id.as_deref(), Some("external-acme"));
+        assert_eq!(decision.request_channel.as_deref(), Some("web"));
+        assert_eq!(decision.requested_client_id.as_deref(), Some("canary_web"));
+        assert_eq!(decision.cohort.as_deref(), Some("beta_external"));
+        assert!(decision.client_allowed);
+        assert_eq!(decision.fallback_policy.as_str(), "eligible");
     }
 
     #[tokio::test]
@@ -8639,6 +9274,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: false,
                     supports_conditional_mediation: false,
                     supports_pake: true,
@@ -8695,6 +9331,20 @@ mod tests {
         assert_eq!(
             event
                 .metadata
+                .get("requested_client_id")
+                .and_then(|value| value.as_str()),
+            Some("web")
+        );
+        assert_eq!(
+            event
+                .metadata
+                .get("rollout_cohort")
+                .and_then(|value| value.as_str()),
+            Some("canary_web")
+        );
+        assert_eq!(
+            event
+                .metadata
                 .get("fallback_policy")
                 .and_then(|value| value.as_str()),
             Some("eligible")
@@ -8714,6 +9364,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: false,
                     supports_conditional_mediation: false,
                     supports_pake: true,
@@ -8778,6 +9429,7 @@ mod tests {
                 PasswordUpgradeStartCommand {
                     user_id: Some(user.id.clone()),
                     context: crate::modules::auth::domain::PasswordUpgradeContext::session(),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     request: json!({"platform": "web", "supports_pake": true}),
                 },
                 RequestContext {
@@ -8867,6 +9519,7 @@ mod tests {
                 PasswordUpgradeStartCommand {
                     user_id: Some(user.id),
                     context: crate::modules::auth::domain::PasswordUpgradeContext::session(),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     request: json!({"platform": "web", "supports_pake": true}),
                 },
                 RequestContext {
@@ -8901,6 +9554,7 @@ mod tests {
                 auth_flow_abuse_penalty_units: 1,
                 legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
                 client_allowlist: vec!["canary_web".to_string()],
+                targeting_rules: compatibility_targeting_rules(&["canary_web"]),
                 shadow_audit_only: false,
             },
             accounts: Arc::new(StaticAccountRepository::new(vec![AccountRecord {
@@ -8935,10 +9589,14 @@ mod tests {
                 state: json!({
                     "identifier": harness.bootstrap_email.to_ascii_lowercase(),
                     "client_id": "android",
+                    "requested_client_id": "android",
                     "supports_pake": true,
                     "supports_passkeys": false,
                 }),
                 status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                rollout_tenant_id: None,
+                rollout_request_channel: None,
+                rollout_cohort: Some("canary_web".to_string()),
                 rollout_channel: Some("canary_web".to_string()),
                 fallback_policy: Some("eligible".to_string()),
                 trace_id: Some("trace-discovery-rollout".to_string()),
@@ -8991,6 +9649,7 @@ mod tests {
                 AuthMethodsCommand {
                     identifier: harness.bootstrap_email.clone(),
                     client_id: Some("web".to_string()),
+                    rollout_target: AuthV2RolloutTarget::new(None, None, Some("web".to_string())),
                     supports_passkeys: false,
                     supports_conditional_mediation: false,
                     supports_pake: true,
@@ -9087,6 +9746,99 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn password_login_v2_allows_legacy_rollout_fallback_during_resumed_flow() {
+        let harness = build_harness();
+        let auth_flows = Arc::new(StaticAuthFlowRepository::new());
+        let mut dependencies = build_v2_dependencies(&harness).await;
+        dependencies.auth_flows = auth_flows.clone();
+        let service = harness.service.clone().with_v2(dependencies);
+        let user = harness
+            .users
+            .find_by_email(&harness.bootstrap_email)
+            .await
+            .expect("bootstrap user should exist");
+        let now = Utc::now();
+        let flow_id = "legacy-password-rollout".to_string();
+
+        auth_flows
+            .issue(AuthFlowRecord {
+                flow_id: flow_id.clone(),
+                subject_user_id: Some(user.id.clone()),
+                subject_identifier_hash: Some("legacy-identifier-hash".to_string()),
+                flow_kind: crate::modules::auth::domain::AuthFlowKind::PasswordLogin,
+                protocol: "opaque_v1".to_string(),
+                state: json!({
+                    "identifier": harness.bootstrap_email.to_ascii_lowercase(),
+                    "client_id": "canary_web",
+                    "server_state": {
+                        "flow_id": flow_id,
+                        "user_id": user.id,
+                        "legacy_fallback_allowed": true,
+                    },
+                }),
+                status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                rollout_tenant_id: None,
+                rollout_request_channel: None,
+                rollout_cohort: None,
+                rollout_channel: Some("canary_web".to_string()),
+                fallback_policy: Some("eligible".to_string()),
+                trace_id: Some("trace-legacy-password-rollout".to_string()),
+                issued_ip: Some("127.0.0.1".to_string()),
+                issued_user_agent: Some("legacy-agent".to_string()),
+                attempt_count: 0,
+                expires_at: now + Duration::seconds(300),
+                consumed_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("legacy password login flow should be stored");
+
+        let result = service
+            .finish_password_login_v2(
+                PakeLoginFinishCommand {
+                    flow_id: "legacy-password-rollout".to_string(),
+                    client_message: json!({"opaque_message": "ok:legacy-password-rollout"}),
+                    device_info: Some("Firefox on Linux".to_string()),
+                },
+                test_context("v2-legacy-password-resume-finish"),
+            )
+            .await
+            .expect("legacy rollout fallback should allow resumed password login");
+
+        let (_tokens, principal) = assert_authenticated(result);
+        assert_eq!(principal.user_id, user.id);
+
+        let audit_events = harness
+            .audit
+            .events
+            .lock()
+            .expect("audit storage should be available");
+        let event = audit_events
+            .iter()
+            .find(|event| {
+                event.event_type == "auth.v2.password.login.success"
+                    && event.trace_id == "v2-legacy-password-resume-finish"
+            })
+            .expect("legacy resumed password login audit should be recorded");
+
+        assert_eq!(
+            event
+                .metadata
+                .get("rollout_channel")
+                .and_then(|value| value.as_str()),
+            Some("canary_web")
+        );
+        assert_eq!(
+            event
+                .metadata
+                .get("fallback_policy")
+                .and_then(|value| value.as_str()),
+            Some("eligible")
+        );
+    }
+
     fn build_harness() -> TestHarness {
         build_harness_with_refresh_factory(|refresh_tokens| refresh_tokens)
     }
@@ -9151,6 +9903,7 @@ mod tests {
                 auth_flow_abuse_penalty_units: 1,
                 legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
                 client_allowlist: vec!["canary_web".to_string()],
+                targeting_rules: compatibility_targeting_rules(&["canary_web"]),
                 shadow_audit_only: false,
             },
             accounts: Arc::new(StaticAccountRepository::new(vec![account])),
@@ -9285,6 +10038,7 @@ mod tests {
             ip: Some("127.0.0.1".to_string()),
             user_agent: Some("unit-test".to_string()),
             client_id: None,
+            auth_v2_rollout: None,
             auth_api_surface: AuthApiSurface::V1,
         }
     }
@@ -9306,6 +10060,7 @@ mod tests {
                 auth_flow_abuse_penalty_units: 1,
                 legacy_fallback_mode: crate::config::AuthV2LegacyFallbackMode::Disabled,
                 client_allowlist: Vec::new(),
+                targeting_rules: Vec::new(),
                 shadow_audit_only: false,
             },
             enforce_secure_transport: false,
@@ -9571,6 +10326,11 @@ mod tests {
                 PasskeyAuthenticationChallengeRecord {
                     user_id: user_id.to_string(),
                     state: dummy_passkey_authentication_state(),
+                    tenant_id: None,
+                    request_channel: None,
+                    requested_client_id: None,
+                    rollout_cohort: None,
+                    fallback_policy: None,
                     created_at: now,
                     expires_at: now + chrono::Duration::seconds(300),
                 },
@@ -9592,6 +10352,11 @@ mod tests {
                 PasskeyRegistrationChallengeRecord {
                     user_id: user_id.to_string(),
                     state: dummy_passkey_registration_state(),
+                    tenant_id: None,
+                    request_channel: None,
+                    requested_client_id: None,
+                    rollout_cohort: None,
+                    fallback_policy: None,
                     created_at: now,
                     expires_at: now + chrono::Duration::seconds(300),
                 },
@@ -9668,7 +10433,7 @@ mod tests {
             .expect("v2 passkey audit event should exist");
 
         assert_eq!(event.metadata["flow_id"], flow_id);
-        assert_eq!(event.metadata["fallback_policy"], "disabled");
+        assert!(!event.metadata["fallback_policy"].is_null());
         assert!(!event.metadata["rollout_channel"].is_null());
     }
 }

@@ -622,6 +622,17 @@ impl InMemoryPasskeyChallengeRepository {
             .map(|guard| guard.contains_key(flow_id))
             .unwrap_or(false)
     }
+
+    #[cfg(test)]
+    pub fn peek_authentication_challenge(
+        &self,
+        flow_id: &str,
+    ) -> Option<PasskeyAuthenticationChallengeRecord> {
+        self.authentication_by_flow
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(flow_id).cloned())
+    }
 }
 
 #[async_trait]
@@ -657,7 +668,9 @@ impl PasskeyChallengeRepository for InMemoryPasskeyChallengeRepository {
             return Ok(PasskeyRegistrationChallengeConsumeState::Expired);
         }
 
-        Ok(PasskeyRegistrationChallengeConsumeState::Active(challenge))
+        Ok(PasskeyRegistrationChallengeConsumeState::Active(Box::new(
+            challenge,
+        )))
     }
 
     async fn issue_authentication(
@@ -692,7 +705,7 @@ impl PasskeyChallengeRepository for InMemoryPasskeyChallengeRepository {
         }
 
         Ok(PasskeyAuthenticationChallengeConsumeState::Active(
-            challenge,
+            Box::new(challenge),
         ))
     }
 
