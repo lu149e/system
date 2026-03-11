@@ -5,6 +5,7 @@ use redis::AsyncCommands;
 use crate::{
     config::{LoginAbuseBucketMode, LoginAbuseRedisFailMode},
     modules::auth::ports::{LoginAbuseProtector, LoginGateDecision},
+    observability,
 };
 
 #[derive(Clone)]
@@ -129,6 +130,13 @@ impl RedisLoginAbuseProtector {
         self.fail_mode == LoginAbuseRedisFailMode::FailClosed
     }
 
+    fn fail_mode_label(&self) -> &'static str {
+        match self.fail_mode {
+            LoginAbuseRedisFailMode::FailClosed => "fail_closed",
+            LoginAbuseRedisFailMode::FailOpen => "fail_open",
+        }
+    }
+
     fn lockout_seconds_for_strikes(&self, strikes: u32) -> i64 {
         let mut seconds = self.lockout_base_seconds.max(1);
 
@@ -163,12 +171,21 @@ impl LoginAbuseProtector for RedisLoginAbuseProtector {
         let mut conn = match self.client.get_multiplexed_async_connection().await {
             Ok(conn) => conn,
             Err(error) => {
+                observability::record_login_abuse_redis_incident(
+                    "check_connect",
+                    self.fail_mode_label(),
+                );
                 if self.should_fail_closed() {
-                    tracing::error!(?error, "redis unavailable during login abuse check");
+                    tracing::error!(
+                        ?error,
+                        login_abuse_redis_fail_mode = self.fail_mode_label(),
+                        "redis unavailable during login abuse check"
+                    );
                     return self.fail_closed_decision(now);
                 }
                 tracing::warn!(
                     ?error,
+                    login_abuse_redis_fail_mode = self.fail_mode_label(),
                     "redis unavailable during login abuse check, fail-open active"
                 );
                 return LoginGateDecision::Allowed;
@@ -181,12 +198,21 @@ impl LoginAbuseProtector for RedisLoginAbuseProtector {
             let locked_until_ts = match conn.get::<_, Option<i64>>(lock_key).await {
                 Ok(value) => value,
                 Err(error) => {
+                    observability::record_login_abuse_redis_incident(
+                        "check_read",
+                        self.fail_mode_label(),
+                    );
                     if self.should_fail_closed() {
-                        tracing::error!(?error, "redis read failed during login abuse check");
+                        tracing::error!(
+                            ?error,
+                            login_abuse_redis_fail_mode = self.fail_mode_label(),
+                            "redis read failed during login abuse check"
+                        );
                         return self.fail_closed_decision(now);
                     }
                     tracing::warn!(
                         ?error,
+                        login_abuse_redis_fail_mode = self.fail_mode_label(),
                         "redis read failed during login abuse check, fail-open active"
                     );
                     return LoginGateDecision::Allowed;
@@ -226,16 +252,22 @@ impl LoginAbuseProtector for RedisLoginAbuseProtector {
         let mut conn = match self.client.get_multiplexed_async_connection().await {
             Ok(conn) => conn,
             Err(error) => {
+                observability::record_login_abuse_redis_incident(
+                    "register_failure_connect",
+                    self.fail_mode_label(),
+                );
                 if self.should_fail_closed() {
                     let until = self.fail_closed_until(now);
                     tracing::error!(
                         ?error,
+                        login_abuse_redis_fail_mode = self.fail_mode_label(),
                         "redis unavailable during login abuse register failure"
                     );
                     return Some(until);
                 }
                 tracing::warn!(
                     ?error,
+                    login_abuse_redis_fail_mode = self.fail_mode_label(),
                     "redis unavailable during login abuse register failure, fail-open active"
                 );
                 return None;
@@ -260,16 +292,22 @@ impl LoginAbuseProtector for RedisLoginAbuseProtector {
             {
                 Ok((attempts, _)) => attempts,
                 Err(error) => {
+                    observability::record_login_abuse_redis_incident(
+                        "register_failure_attempt_write",
+                        self.fail_mode_label(),
+                    );
                     if self.should_fail_closed() {
                         let until = self.fail_closed_until(now);
                         tracing::error!(
                             ?error,
+                            login_abuse_redis_fail_mode = self.fail_mode_label(),
                             "redis write failed during login abuse register failure"
                         );
                         return Some(until);
                     }
                     tracing::warn!(
                         ?error,
+                        login_abuse_redis_fail_mode = self.fail_mode_label(),
                         "redis write failed during login abuse register failure, fail-open active"
                     );
                     continue;
@@ -291,16 +329,22 @@ impl LoginAbuseProtector for RedisLoginAbuseProtector {
             {
                 Ok((strikes, _)) => strikes,
                 Err(error) => {
+                    observability::record_login_abuse_redis_incident(
+                        "register_failure_strike_write",
+                        self.fail_mode_label(),
+                    );
                     if self.should_fail_closed() {
                         let until = self.fail_closed_until(now);
                         tracing::error!(
                             ?error,
+                            login_abuse_redis_fail_mode = self.fail_mode_label(),
                             "redis write failed while incrementing lockout strikes"
                         );
                         return Some(until);
                     }
                     tracing::warn!(
                         ?error,
+                        login_abuse_redis_fail_mode = self.fail_mode_label(),
                         "redis write failed while incrementing lockout strikes, fail-open active"
                     );
                     continue;
@@ -323,13 +367,22 @@ impl LoginAbuseProtector for RedisLoginAbuseProtector {
                 .await;
 
             if let Err(error) = set_result {
+                observability::record_login_abuse_redis_incident(
+                    "register_failure_lock_write",
+                    self.fail_mode_label(),
+                );
                 if self.should_fail_closed() {
                     let fallback_until = self.fail_closed_until(now);
-                    tracing::error!(?error, "redis write failed while setting login lockout");
+                    tracing::error!(
+                        ?error,
+                        login_abuse_redis_fail_mode = self.fail_mode_label(),
+                        "redis write failed while setting login lockout"
+                    );
                     return Some(fallback_until);
                 }
                 tracing::warn!(
                     ?error,
+                    login_abuse_redis_fail_mode = self.fail_mode_label(),
                     "redis write failed while setting login lockout, fail-open active"
                 );
                 continue;
@@ -349,8 +402,13 @@ impl LoginAbuseProtector for RedisLoginAbuseProtector {
         let mut conn = match self.client.get_multiplexed_async_connection().await {
             Ok(conn) => conn,
             Err(error) => {
+                observability::record_login_abuse_redis_incident(
+                    "register_success_connect",
+                    self.fail_mode_label(),
+                );
                 tracing::error!(
                     ?error,
+                    login_abuse_redis_fail_mode = self.fail_mode_label(),
                     "redis unavailable during login abuse register success"
                 );
                 return;
@@ -369,8 +427,13 @@ impl LoginAbuseProtector for RedisLoginAbuseProtector {
                 .query_async::<()>(&mut conn)
                 .await
             {
+                observability::record_login_abuse_redis_incident(
+                    "register_success_clear",
+                    self.fail_mode_label(),
+                );
                 tracing::error!(
                     ?error,
+                    login_abuse_redis_fail_mode = self.fail_mode_label(),
                     "redis write failed during login abuse register success"
                 );
             }
@@ -504,5 +567,38 @@ mod tests {
         .expect("redis protector should initialize");
 
         assert_eq!(protector.strikes_ttl_seconds(), 300);
+    }
+
+    #[test]
+    fn redis_fail_mode_label_matches_configuration() {
+        let fail_closed = RedisLoginAbuseProtector::new(
+            "redis://127.0.0.1:1",
+            5,
+            300,
+            900,
+            7200,
+            "test:attempts".to_string(),
+            "test:lock".to_string(),
+            "test:strikes".to_string(),
+            LoginAbuseRedisFailMode::FailClosed,
+            LoginAbuseBucketMode::EmailAndIp,
+        )
+        .expect("redis protector should initialize");
+        let fail_open = RedisLoginAbuseProtector::new(
+            "redis://127.0.0.1:1",
+            5,
+            300,
+            900,
+            7200,
+            "test:attempts".to_string(),
+            "test:lock".to_string(),
+            "test:strikes".to_string(),
+            LoginAbuseRedisFailMode::FailOpen,
+            LoginAbuseBucketMode::EmailAndIp,
+        )
+        .expect("redis protector should initialize");
+
+        assert_eq!(fail_closed.fail_mode_label(), "fail_closed");
+        assert_eq!(fail_open.fail_mode_label(), "fail_open");
     }
 }

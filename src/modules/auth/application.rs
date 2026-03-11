@@ -5197,9 +5197,80 @@ mod tests {
             })
         }
 
-        async fn prune_expired(&self, _now: DateTime<Utc>) -> Result<u64, String> {
-            Ok(0)
+        async fn prune_expired(&self, now: DateTime<Utc>) -> Result<u64, String> {
+            let mut guard = self
+                .flows
+                .lock()
+                .map_err(|_| "flow lock unavailable".to_string())?;
+            let mut expired = 0_u64;
+            for flow in guard.values_mut() {
+                if flow.status == AuthFlowStatus::Pending && flow.expires_at <= now {
+                    flow.status = AuthFlowStatus::Expired;
+                    flow.updated_at = now;
+                    expired += 1;
+                }
+            }
+            Ok(expired)
         }
+    }
+
+    #[tokio::test]
+    async fn static_auth_flow_repository_clears_expired_backlog_after_prune() {
+        let repository = StaticAuthFlowRepository::new();
+        let now = Utc::now();
+
+        repository
+            .issue(AuthFlowRecord {
+                flow_id: "expired-flow".to_string(),
+                subject_user_id: Some("account-1".to_string()),
+                subject_identifier_hash: Some("identifier-hash".to_string()),
+                flow_kind: crate::modules::auth::domain::AuthFlowKind::PasswordLogin,
+                protocol: "auth_v2_password_v1".to_string(),
+                state: json!({"step": "start"}),
+                status: AuthFlowStatus::Pending,
+                rollout_tenant_id: None,
+                rollout_request_channel: Some("web".to_string()),
+                rollout_cohort: Some("canary_web".to_string()),
+                rollout_channel: Some("canary_web".to_string()),
+                fallback_policy: Some("eligible".to_string()),
+                trace_id: Some("trace-expired-flow".to_string()),
+                issued_ip: Some("127.0.0.1".to_string()),
+                issued_user_agent: Some("unit-test".to_string()),
+                attempt_count: 0,
+                expires_at: now - Duration::seconds(120),
+                consumed_at: None,
+                created_at: now - Duration::seconds(300),
+                updated_at: now - Duration::seconds(300),
+            })
+            .await
+            .expect("expired flow should be stored");
+
+        let before = repository
+            .metrics_snapshot(now)
+            .await
+            .expect("backlog metrics should be available before prune");
+        assert_eq!(before.expired_pending_total, 1);
+        assert_eq!(before.oldest_expired_pending_age_seconds, 120);
+
+        let pruned = repository
+            .prune_expired(now)
+            .await
+            .expect("expired flow should be pruned");
+        assert_eq!(pruned, 1);
+
+        let after = repository
+            .metrics_snapshot(now)
+            .await
+            .expect("backlog metrics should be available after prune");
+        assert_eq!(after.expired_pending_total, 0);
+        assert_eq!(after.oldest_expired_pending_age_seconds, 0);
+        assert_eq!(
+            repository
+                .peek("expired-flow")
+                .expect("expired flow should remain queryable")
+                .status,
+            AuthFlowStatus::Expired
+        );
     }
 
     struct DeterministicPakeService;
@@ -10069,6 +10140,7 @@ mod tests {
             passkey_rp_origin: None,
             passkey_challenge_prune_interval_seconds: 60,
             auth_v2_auth_flow_prune_interval_seconds: 60,
+            shutdown_grace_period_seconds: 25,
             jwt_keys: vec![crate::config::JwtKeyConfig {
                 kid: "auth-tests-ed25519-v1".to_string(),
                 private_key_pem: Some(TEST_PRIVATE_KEY_PEM.to_string()),

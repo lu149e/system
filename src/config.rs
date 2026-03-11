@@ -13,6 +13,7 @@ pub struct AppConfig {
     pub passkey_rp_origin: Option<String>,
     pub passkey_challenge_prune_interval_seconds: u64,
     pub auth_v2_auth_flow_prune_interval_seconds: u64,
+    pub shutdown_grace_period_seconds: u64,
     pub metrics_bearer_token: Option<String>,
     pub metrics_allowed_cidrs: Vec<IpNet>,
     pub trust_x_forwarded_for: bool,
@@ -377,6 +378,11 @@ impl AppConfig {
             60,
             "AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS",
         )?;
+        let shutdown_grace_period_seconds = parse_positive_u64_with_default(
+            std::env::var("AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS").ok(),
+            25,
+            "AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS",
+        )?;
         let trusted_proxy_ips =
             parse_trusted_proxy_ips(std::env::var("TRUSTED_PROXY_IPS").unwrap_or_default())?;
         let trusted_proxy_cidrs =
@@ -673,6 +679,7 @@ impl AppConfig {
             passkey_rp_origin,
             passkey_challenge_prune_interval_seconds,
             auth_v2_auth_flow_prune_interval_seconds,
+            shutdown_grace_period_seconds,
             metrics_bearer_token,
             metrics_allowed_cidrs,
             trust_x_forwarded_for,
@@ -1798,6 +1805,7 @@ mod tests {
                 ),
                 ("AUTH_V2_SHADOW_AUDIT_ONLY", Some("true")),
                 ("AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS", Some("90")),
+                ("AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS", Some("45")),
             ],
             || {
                 let config = AppConfig::from_env().expect("auth v2 env should parse");
@@ -1836,6 +1844,49 @@ mod tests {
                 );
                 assert!(config.auth_v2.shadow_audit_only);
                 assert_eq!(config.auth_v2_auth_flow_prune_interval_seconds, 90);
+                assert_eq!(config.shutdown_grace_period_seconds, 45);
+            },
+        );
+    }
+
+    #[test]
+    fn app_config_from_env_rejects_non_positive_shutdown_grace_period() {
+        let _guard = env_lock();
+        let private_key_path = write_temp_secret_file(TEST_PRIVATE_KEY_PEM);
+        let public_key_path = write_temp_secret_file(TEST_PUBLIC_KEY_PEM);
+        let keyset = format!(
+            "primary|{}|{}",
+            private_key_path.to_string_lossy(),
+            public_key_path.to_string_lossy()
+        );
+
+        with_env_vars(
+            &[
+                ("REFRESH_TOKEN_PEPPER", Some("test-refresh-pepper")),
+                (
+                    "MFA_ENCRYPTION_KEY_BASE64",
+                    Some("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
+                ),
+                (
+                    "DATABASE_URL",
+                    Some("postgres://auth:auth@127.0.0.1:5432/auth"),
+                ),
+                ("REDIS_URL", Some("redis://127.0.0.1:6379")),
+                ("JWT_PRIMARY_KID", None),
+                ("JWT_PRIVATE_KEY_PEM", None),
+                ("JWT_PUBLIC_KEY_PEM", None),
+                ("JWT_KEY_ID", None),
+                ("JWT_KEYSET", Some(keyset.as_str())),
+                ("AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS", Some("0")),
+            ],
+            || {
+                let error = AppConfig::from_env()
+                    .err()
+                    .expect("non-positive shutdown grace period should fail");
+
+                assert!(error
+                    .to_string()
+                    .contains("AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS must be greater than 0"));
             },
         );
     }

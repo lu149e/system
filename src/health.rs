@@ -17,6 +17,59 @@ pub struct ComponentState {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct RuntimeLifecycleSnapshot {
+    draining: bool,
+    shutdown_reason: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct RuntimeLifecycleState {
+    snapshot: Mutex<RuntimeLifecycleSnapshot>,
+}
+
+impl RuntimeLifecycleState {
+    pub fn begin_shutdown(&self, reason: &str) {
+        if let Ok(mut snapshot) = self.snapshot.lock() {
+            snapshot.draining = true;
+            snapshot.shutdown_reason = Some(reason.trim().to_string());
+        }
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.snapshot
+            .lock()
+            .map(|snapshot| snapshot.draining)
+            .unwrap_or(true)
+    }
+
+    pub fn shutdown_reason(&self) -> Option<String> {
+        self.snapshot
+            .lock()
+            .ok()
+            .and_then(|snapshot| snapshot.shutdown_reason.clone())
+    }
+
+    pub fn readiness_component(&self) -> ComponentState {
+        let Ok(snapshot) = self.snapshot.lock() else {
+            return ComponentState::degraded("runtime lifecycle state is unavailable".to_string());
+        };
+
+        if snapshot.draining {
+            return ComponentState {
+                status: "draining".to_string(),
+                detail: snapshot
+                    .shutdown_reason
+                    .clone()
+                    .filter(|reason| !reason.is_empty())
+                    .map(|reason| format!("shutdown_reason={reason}")),
+            };
+        }
+
+        ComponentState::ok()
+    }
+}
+
 impl ComponentState {
     fn ok() -> Self {
         Self {
@@ -330,12 +383,14 @@ pub struct RuntimeReadinessChecker {
     runtime: AuthRuntime,
     timeout: Duration,
     dependencies: Vec<Arc<dyn DependencyProbe>>,
+    lifecycle_state: Arc<RuntimeLifecycleState>,
     passkey_challenge_janitor_health: Arc<PasskeyChallengeJanitorHealth>,
     auth_flow_janitor_health: Arc<AuthFlowJanitorHealth>,
 }
 
 impl RuntimeReadinessChecker {
     pub fn inmemory(
+        lifecycle_state: Arc<RuntimeLifecycleState>,
         passkey_challenge_janitor_health: Arc<PasskeyChallengeJanitorHealth>,
         auth_flow_janitor_health: Arc<AuthFlowJanitorHealth>,
     ) -> Arc<dyn ReadinessChecker> {
@@ -343,6 +398,7 @@ impl RuntimeReadinessChecker {
             runtime: AuthRuntime::InMemory,
             timeout: Duration::from_secs(1),
             dependencies: Vec::new(),
+            lifecycle_state,
             passkey_challenge_janitor_health,
             auth_flow_janitor_health,
         })
@@ -352,6 +408,7 @@ impl RuntimeReadinessChecker {
         pool: PgPool,
         redis_client: Option<redis::Client>,
         timeout: Duration,
+        lifecycle_state: Arc<RuntimeLifecycleState>,
         passkey_challenge_janitor_health: Arc<PasskeyChallengeJanitorHealth>,
         auth_flow_janitor_health: Arc<AuthFlowJanitorHealth>,
     ) -> Arc<dyn ReadinessChecker> {
@@ -366,6 +423,7 @@ impl RuntimeReadinessChecker {
             runtime: AuthRuntime::PostgresRedis,
             timeout,
             dependencies,
+            lifecycle_state,
             passkey_challenge_janitor_health,
             auth_flow_janitor_health,
         })
@@ -376,13 +434,13 @@ impl RuntimeReadinessChecker {
 impl ReadinessChecker for RuntimeReadinessChecker {
     async fn check(&self) -> ReadinessReport {
         let mut components = ReadinessComponents {
-            app: ComponentState::ok(),
+            app: self.lifecycle_state.readiness_component(),
             database: ComponentState::not_configured(),
             redis: ComponentState::not_configured(),
             passkey_challenge_janitor: ComponentState::not_configured(),
             auth_flow_janitor: ComponentState::not_configured(),
         };
-        let mut is_ready = true;
+        let mut is_ready = !self.lifecycle_state.is_draining();
 
         for dependency in &self.dependencies {
             let state = match tokio::time::timeout(self.timeout, dependency.ping()).await {
@@ -438,7 +496,10 @@ fn component_state_blocks_readiness(state: &ComponentState) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthFlowJanitorHealth, PasskeyChallengeJanitorHealth, RuntimeReadinessChecker};
+    use super::{
+        AuthFlowJanitorHealth, PasskeyChallengeJanitorHealth, RuntimeLifecycleState,
+        RuntimeReadinessChecker,
+    };
     use chrono::{Duration, Utc};
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
@@ -473,6 +534,7 @@ mod tests {
     #[tokio::test]
     async fn readiness_payload_includes_passkey_janitor_component() {
         let checker = RuntimeReadinessChecker::inmemory(
+            Arc::new(RuntimeLifecycleState::default()),
             Arc::new(PasskeyChallengeJanitorHealth::new(
                 true,
                 StdDuration::from_secs(60),
@@ -504,6 +566,7 @@ mod tests {
         auth_flow_health.record_success(now - Duration::seconds(120));
 
         let checker = RuntimeReadinessChecker::inmemory(
+            Arc::new(RuntimeLifecycleState::default()),
             Arc::new(PasskeyChallengeJanitorHealth::new(
                 false,
                 StdDuration::from_secs(60),
@@ -535,5 +598,33 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("stale_for_seconds="));
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_not_ready_when_runtime_is_draining() {
+        let lifecycle_state = Arc::new(RuntimeLifecycleState::default());
+        lifecycle_state.begin_shutdown("sigterm");
+
+        let checker = RuntimeReadinessChecker::inmemory(
+            Arc::clone(&lifecycle_state),
+            Arc::new(PasskeyChallengeJanitorHealth::new(
+                false,
+                StdDuration::from_secs(60),
+            )),
+            Arc::new(AuthFlowJanitorHealth::new(
+                false,
+                StdDuration::from_secs(60),
+            )),
+        );
+
+        let report = checker.check().await;
+
+        assert!(!report.is_ready);
+        assert_eq!(report.payload.status, "error");
+        assert_eq!(report.payload.components.app.status, "draining");
+        assert_eq!(
+            report.payload.components.app.detail.as_deref(),
+            Some("shutdown_reason=sigterm")
+        );
     }
 }

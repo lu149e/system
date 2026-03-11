@@ -41,7 +41,7 @@ Optional variables (included only when set):
 - `VERIFY_EMAIL_URL_BASE`
 - `PASSWORD_RESET_URL_BASE`
 
-Login risk controls (`LOGIN_RISK_MODE`, `LOGIN_RISK_BLOCKED_*`, `LOGIN_RISK_CHALLENGE_*`), passkey runtime flags (`PASSKEY_ENABLED`, `PASSKEY_RP_ID`, `PASSKEY_RP_ORIGIN`, `PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS`), and auth v2 rollout knobs (`AUTH_V2_ENABLED`, `AUTH_V2_METHODS_ENABLED`, `AUTH_V2_PASSWORD_PAKE_ENABLED`, `AUTH_V2_PASSWORD_UPGRADE_ENABLED`, `AUTH_V2_PASSKEY_NAMESPACE_ENABLED`, `AUTH_V2_AUTH_FLOWS_ENABLED`, `AUTH_V2_LEGACY_FALLBACK_MODE`, `AUTH_V2_CLIENT_ALLOWLIST`, `AUTH_V2_SHADOW_AUDIT_ONLY`, `AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS`) are non-secret settings and should be managed through ConfigMap/overlay values, not secret manifests.
+Login risk controls (`LOGIN_RISK_MODE`, `LOGIN_RISK_BLOCKED_*`, `LOGIN_RISK_CHALLENGE_*`), passkey runtime flags (`PASSKEY_ENABLED`, `PASSKEY_RP_ID`, `PASSKEY_RP_ORIGIN`, `PASSKEY_CHALLENGE_PRUNE_INTERVAL_SECONDS`), and auth v2 rollout knobs (`AUTH_V2_ENABLED`, `AUTH_V2_METHODS_ENABLED`, `AUTH_V2_PASSWORD_PAKE_ENABLED`, `AUTH_V2_PASSWORD_UPGRADE_ENABLED`, `AUTH_V2_PASSKEY_NAMESPACE_ENABLED`, `AUTH_V2_AUTH_FLOWS_ENABLED`, `AUTH_V2_LEGACY_FALLBACK_MODE`, `AUTH_V2_CLIENT_ALLOWLIST`, `AUTH_V2_SHADOW_AUDIT_ONLY`, `AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS`, `AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS`) are non-secret settings and should be managed through ConfigMap/overlay values, not secret manifests.
 
 Quick generation helpers:
 
@@ -164,7 +164,25 @@ LOGIN_RISK_MODE='baseline' \
 STRICT_DEPLOY_VALIDATION=true ./scripts/validate-deploy-readiness.sh
 ```
 
-4. Prefer the unified manual governance workflow in dry-run mode before any cluster mutation:
+   - This now enforces the runtime drain contract, including `AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS` and a safety margin against Kubernetes `terminationGracePeriodSeconds`.
+
+4. Rehearse the auth v2 DR drill before production promotion or broadening cohorts:
+
+```bash
+./scripts/test-auth-v2-dr-chaos.sh \
+  --drain-readyz artifacts/drills/auth-v2/drain-readyz.json \
+  --drain-metrics artifacts/drills/auth-v2/drain-metrics.prom \
+  --brownout-readyz artifacts/drills/auth-v2/brownout-readyz.json \
+  --pre-recovery-metrics artifacts/drills/auth-v2/pre-recovery.prom \
+  --post-recovery-metrics artifacts/drills/auth-v2/post-recovery.prom
+```
+
+    - Feed the script captured `/readyz` and `/metrics` artifacts from a controlled drill.
+    - If the drill overlaps JWT rollback, also pass `--jwt-rollback-restore-jwks`, `--jwt-rollback-restore-check`, `--jwt-rollback-retire-jwks`, and `--jwt-rollback-retire-check` artifacts so key recovery is proven with the same PASS/FAIL run.
+    - The script writes PASS/FAIL reports plus `operator-notes.txt` under `artifacts/auth-v2-dr-chaos/`.
+    - Do NOT call the rollout resilient if you cannot produce those artifacts. Dejate de joder with unverifiable claims.
+
+5. Prefer the unified manual governance workflow in dry-run mode before any cluster mutation:
 
 ```bash
 # GitHub Actions -> production-deploy-manual
@@ -209,7 +227,7 @@ STRICT_DEPLOY_VALIDATION=true ./scripts/validate-deploy-readiness.sh
    - Manifest gate: renders `kustomize build` output, runs `kubeconform -strict`, and performs `kubectl apply --dry-run=server`.
    - Always uploads execution evidence even in dry-run mode.
 
-5. Generate concrete secret manifest for production deployment:
+6. Generate concrete secret manifest for production deployment:
 
 ```bash
 DATABASE_URL='postgres://auth_user:...' \
@@ -224,7 +242,7 @@ JWT_PUBLIC_KEY_PEM="$(cat /path/to/v2-public.pem)" \
 ./scripts/generate-k8s-jwt-key-secret.sh
 ```
 
-6. Execute controlled deployment workflow (dry-run by default, apply only when explicit):
+7. Execute controlled deployment workflow (dry-run by default, apply only when explicit):
 
 ```bash
 # GitHub Actions -> production-deploy-manual
@@ -257,7 +275,7 @@ JWT_PUBLIC_KEY_PEM="$(cat /path/to/v2-public.pem)" \
    - Post-apply smoke checks (only in apply mode): rollout status, endpoint readiness, `/healthz` and `/readyz` via service port-forward.
    - Always uploads execution evidence: `production-deploy-manual-<run_id>`.
 
-7. If you are not using the controlled workflow, apply generated production overlay only after validation passes:
+8. If you are not using the controlled workflow, apply generated production overlay only after validation passes:
 
 ```bash
 kubectl apply -f artifacts/production-secrets/auth-api-secrets.yaml
@@ -339,6 +357,10 @@ After applying `deployment.yaml`, `service.yaml`, and `ingress.yaml`:
 - Validate auth v2 janitor readiness when `AUTH_V2_AUTH_FLOWS_ENABLED=true`:
   - `/readyz` should keep the auth-flow janitor component healthy
   - `/metrics` should expose `auth_v2_auth_flow_janitor_enabled`, `auth_v2_auth_flow_prune_runs_total`, `auth_v2_auth_flows_expired_pending_total`, and `auth_v2_auth_flows_oldest_expired_pending_age_seconds`
+- Validate drain contract explicitly before calling the rollout safe:
+  - `GET /readyz` during shutdown should report `components.app.status=draining`
+  - `/metrics` should expose `auth_runtime_draining 1` and increment `auth_runtime_shutdowns_total{reason="sigterm"}` during the drill
+  - Redis incident drills should surface explicit posture through `/readyz` plus `auth_login_abuse_redis_incidents_total{posture="fail_open|fail_closed"}`
 
 ## Rollback Strategy
 
@@ -349,6 +371,8 @@ After applying `deployment.yaml`, `service.yaml`, and `ingress.yaml`:
   - keep `AUTH_V2_METHODS_ENABLED` on only if it can safely recommend passkeys or legacy fallback
   - set `AUTH_V2_LEGACY_FALLBACK_MODE=allowlisted` or `broad` only as a short-lived break-glass
   - set `AUTH_V2_AUTH_FLOWS_ENABLED=false` if janitor backlog or flow-store health is degraded
+- If shutdown or drain behavior is suspect, freeze promotion until `scripts/validate-deploy-readiness.sh` and `scripts/test-auth-v2-dr-chaos.sh` both pass with fresh artifacts.
+- If JWT rotation is involved in the rollback, follow `docs/jwt-key-rotation-runbook.md` and capture the same deployment/drill evidence before declaring recovery complete.
 - If release included DB changes, use forward-fix migrations rather than destructive down migrations.
 - Re-run smoke checks after rollback and verify auth/login/refresh baseline behavior.
 

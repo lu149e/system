@@ -41,6 +41,7 @@
 - `AUTH_V2_LEGACY_FALLBACK_MODE` - `disabled | allowlisted | broad`
 - `AUTH_V2_CLIENT_ALLOWLIST` - CSV of canonical cohorts (`internal`, `canary_web`, `canary_mobile`, `beta_external`, `broad_general`, `legacy_holdout`); runtime and deploy tooling also normalize documented aliases like `internal-web` and `ios-beta`
 - `AUTH_V2_SHADOW_AUDIT_ONLY` - compute v2 eligibility without serving v2 externally
+- `AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS` - bounded runtime drain budget that must stay aligned with Kubernetes termination grace
 
 ### Flag rules
 
@@ -163,6 +164,7 @@ Shipped repo assets now cover the baseline rollout views:
 - `docs/grafana/auth-refresh-runtime-prometheus.json` includes auth v2 success/error ratio, password latency, fallback pressure, and auth-flow janitor/backlog panels.
 - `docs/alerts/auth-refresh-alert-rules.yaml` includes the matching recording and alert rules for password finish error ratio, fallback ratio, and auth-flow prune/backlog degradation.
 - `scripts/validate-observability-artifacts.sh` validates the Grafana JSON and Prometheus rules before anyone calls the assets production-ready.
+- `scripts/test-auth-v2-dr-chaos.sh` validates captured drill evidence for drain withdrawal, brownout posture, and backlog recovery.
 
 ## Alerts
 
@@ -242,6 +244,7 @@ Current shipped alerts and records live in `docs/alerts/auth-refresh-alert-rules
 4. If impact is material, disable `AUTH_V2_PASSWORD_PAKE_ENABLED` for affected channels.
 5. Keep `AUTH_V2_METHODS_ENABLED` on only if it can safely recommend passkeys or v1 fallback.
 6. Capture sample traces via `trace_id` and audit rows before changing more flags.
+7. If rollout safety is in doubt, rerun `scripts/test-auth-v2-dr-chaos.sh` with fresh evidence before reopening the cohort.
 
 ## Runbook: auth flow store degradation
 
@@ -249,6 +252,7 @@ Current shipped alerts and records live in `docs/alerts/auth-refresh-alert-rules
 2. If `auth_flows` writes or consumes fail, disable `AUTH_V2_PASSWORD_PAKE_ENABLED` and `AUTH_V2_PASSWORD_UPGRADE_ENABLED`.
 3. Keep existing passkey path on `passkey_challenges` only if it is isolated and healthy.
 4. Do not leave partially working shared flow storage enabled.
+5. Treat failed drain/backlog drill evidence as a release blocker, not as a docs problem.
 
 ## Runbook: fallback explosion
 
@@ -271,6 +275,7 @@ Current shipped alerts and records live in `docs/alerts/auth-refresh-alert-rules
 - Set `AUTH_V2_LEGACY_FALLBACK_MODE=allowlisted` or `broad` only as a time-bounded emergency measure.
 - If janitor backlog is growing, also turn off `AUTH_V2_AUTH_FLOWS_ENABLED` and confirm `auth_v2_auth_flow_janitor_enabled` drops to `0` after rollout.
 - Re-run the smoke and observability checks from `docs/deployment-production-checklist.md` before calling the rollback complete.
+- Re-run `scripts/validate-deploy-readiness.sh` and `scripts/test-auth-v2-dr-chaos.sh` so rollback evidence includes drain posture, Redis incident posture, and backlog recovery instead of hand-wavy "se arreglo" nonsense.
 
 ### What rollback does not mean
 
@@ -333,6 +338,7 @@ These are mandatory before claiming real readiness:
 - support playbooks for expired flows, passkey opt-in, and legacy fallback
 - security sign-off on threat model and logging redaction
 - game day covering PAKE outage and broad rollback
+- deterministic DR drill artifacts captured with `scripts/test-auth-v2-dr-chaos.sh`
 
 ## Recommended implementation order
 
