@@ -4030,7 +4030,8 @@ mod tests {
             "https://example.com/problems/auth-v2-rollout-denied"
         );
 
-        let metrics_payload = metrics_payload(&harness, "handler-v2-start-rollout-denied-metrics").await;
+        let metrics_payload =
+            metrics_payload(&harness, "handler-v2-start-rollout-denied-metrics").await;
         assert!(metrics_payload.contains("auth_v2_rollout_diagnostics_total"));
         assert!(metrics_payload.contains("operation=\"password_login_start\""));
         assert!(metrics_payload.contains("outcome=\"error\""));

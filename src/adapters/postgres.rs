@@ -2507,7 +2507,9 @@ mod tests {
         PostgresAccountRepository, PostgresAuthFlowRepository, PostgresPasskeyChallengeRepository,
         PostgresRefreshTokenRepository, PostgresUserRepository,
     };
-    use crate::modules::auth::ports::{AccountRepository, PasskeyChallengeRepository, UserRepository};
+    use crate::modules::auth::ports::{
+        AccountRepository, PasskeyChallengeRepository, UserRepository,
+    };
 
     #[tokio::test]
     async fn postgres_account_lookup_is_decoupled_from_legacy_credentials() {
@@ -2822,7 +2824,10 @@ mod tests {
             .consume_authentication(&authentication_flow, now)
             .await
             .expect("legacy authentication challenge read should succeed");
-        let crate::modules::auth::ports::PasskeyAuthenticationChallengeConsumeState::Active(authentication) = authentication else {
+        let crate::modules::auth::ports::PasskeyAuthenticationChallengeConsumeState::Active(
+            authentication,
+        ) = authentication
+        else {
             panic!("expected active authentication challenge");
         };
         assert_eq!(authentication.user_id, user_id.to_string());
@@ -2850,7 +2855,10 @@ mod tests {
             .consume_registration(&registration_flow, now)
             .await
             .expect("legacy registration challenge read should succeed");
-        let crate::modules::auth::ports::PasskeyRegistrationChallengeConsumeState::Active(registration) = registration else {
+        let crate::modules::auth::ports::PasskeyRegistrationChallengeConsumeState::Active(
+            registration,
+        ) = registration
+        else {
             panic!("expected active registration challenge");
         };
         assert_eq!(registration.user_id, user_id.to_string());
