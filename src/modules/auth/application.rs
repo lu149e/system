@@ -1354,7 +1354,7 @@ impl AuthService {
             .await
             .map_err(|_| AuthError::Internal)?
         {
-            PasskeyRegistrationChallengeConsumeState::Active(challenge) => challenge,
+            PasskeyRegistrationChallengeConsumeState::Active(challenge) => *challenge,
             PasskeyRegistrationChallengeConsumeState::NotFound
             | PasskeyRegistrationChallengeConsumeState::Expired => {
                 self.audit_passkey_register_rejected(
@@ -1652,7 +1652,7 @@ impl AuthService {
             .await
             .map_err(|_| AuthError::Internal)?
         {
-            PasskeyAuthenticationChallengeConsumeState::Active(challenge) => challenge,
+            PasskeyAuthenticationChallengeConsumeState::Active(challenge) => *challenge,
             PasskeyAuthenticationChallengeConsumeState::NotFound
             | PasskeyAuthenticationChallengeConsumeState::Expired => {
                 self.audit_passkey_login_rejected(

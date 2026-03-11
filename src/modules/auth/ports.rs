@@ -479,14 +479,14 @@ pub struct PasskeyAuthenticationChallengeRecord {
 
 #[derive(Clone, Debug)]
 pub enum PasskeyRegistrationChallengeConsumeState {
-    Active(PasskeyRegistrationChallengeRecord),
+    Active(Box<PasskeyRegistrationChallengeRecord>),
     NotFound,
     Expired,
 }
 
 #[derive(Clone, Debug)]
 pub enum PasskeyAuthenticationChallengeConsumeState {
-    Active(PasskeyAuthenticationChallengeRecord),
+    Active(Box<PasskeyAuthenticationChallengeRecord>),
     NotFound,
     Expired,
 }

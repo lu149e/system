@@ -668,7 +668,9 @@ impl PasskeyChallengeRepository for InMemoryPasskeyChallengeRepository {
             return Ok(PasskeyRegistrationChallengeConsumeState::Expired);
         }
 
-        Ok(PasskeyRegistrationChallengeConsumeState::Active(challenge))
+        Ok(PasskeyRegistrationChallengeConsumeState::Active(Box::new(
+            challenge,
+        )))
     }
 
     async fn issue_authentication(
@@ -703,7 +705,7 @@ impl PasskeyChallengeRepository for InMemoryPasskeyChallengeRepository {
         }
 
         Ok(PasskeyAuthenticationChallengeConsumeState::Active(
-            challenge,
+            Box::new(challenge),
         ))
     }
 

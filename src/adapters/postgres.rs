@@ -1855,7 +1855,7 @@ impl PasskeyChallengeRepository for PostgresPasskeyChallengeRepository {
             )
         };
 
-        Ok(PasskeyRegistrationChallengeConsumeState::Active(
+        Ok(PasskeyRegistrationChallengeConsumeState::Active(Box::new(
             PasskeyRegistrationChallengeRecord {
                 user_id,
                 state,
@@ -1867,7 +1867,7 @@ impl PasskeyChallengeRepository for PostgresPasskeyChallengeRepository {
                 created_at,
                 expires_at,
             },
-        ))
+        )))
     }
 
     async fn issue_authentication(
@@ -2000,7 +2000,7 @@ impl PasskeyChallengeRepository for PostgresPasskeyChallengeRepository {
         };
 
         Ok(PasskeyAuthenticationChallengeConsumeState::Active(
-            PasskeyAuthenticationChallengeRecord {
+            Box::new(PasskeyAuthenticationChallengeRecord {
                 user_id,
                 state,
                 tenant_id,
@@ -2010,7 +2010,7 @@ impl PasskeyChallengeRepository for PostgresPasskeyChallengeRepository {
                 fallback_policy,
                 created_at,
                 expires_at,
-            },
+            }),
         ))
     }
 
@@ -2830,6 +2830,7 @@ mod tests {
         else {
             panic!("expected active authentication challenge");
         };
+        let authentication = *authentication;
         assert_eq!(authentication.user_id, user_id.to_string());
         assert_eq!(authentication.tenant_id, None);
         assert_eq!(authentication.request_channel, None);
@@ -2861,6 +2862,7 @@ mod tests {
         else {
             panic!("expected active registration challenge");
         };
+        let registration = *registration;
         assert_eq!(registration.user_id, user_id.to_string());
         assert_eq!(registration.tenant_id, None);
         assert_eq!(registration.request_channel, None);
