@@ -53,6 +53,10 @@ Si hay incidente tras cambiar primaria o retirar clave vieja:
 - Re-deploy y confirmar:
   - JWKS vuelve a publicar la clave de rollback.
   - Los tokens afectados vuelven a validar.
+- Si el incidente ocurre durante rollout de auth v2, correr tambien el gate de despliegue y el drill deterministico antes de decir "listo":
+  - `./scripts/validate-deploy-readiness.sh`
+  - `./scripts/test-auth-v2-dr-chaos.sh --drain-readyz ... --drain-metrics ... --brownout-readyz ... --pre-recovery-metrics ... --post-recovery-metrics ... --jwt-rollback-restore-jwks ... --jwt-rollback-restore-check ... --jwt-rollback-retire-jwks ... --jwt-rollback-retire-check ...`
+- Validar que `/readyz` siga reflejando postura real durante rollback (`components.app`, `components.redis`, `components.auth_flow_janitor`) y que la rotacion JWT no tape un problema de drain/failover mas grande.
 - Abrir RCA antes de reintentar retiro definitivo.
 
 ## Checklist de validacion operativa
@@ -62,3 +66,10 @@ Si hay incidente tras cambiar primaria o retirar clave vieja:
 - [ ] Durante convivencia, un token firmado con `kid` viejo valida correctamente.
 - [ ] Tras retiro, token firmado con `kid` viejo falla validacion (`invalid jwt kid`).
 - [ ] No hay incremento anormal sostenido de `401` post-deploy.
+- [ ] Si la rotacion convivio con rollout auth v2 o rollback operativo, se guardaron artifacts del drill (`readyz`, `metrics`, readiness gate) junto con esta validacion.
+
+## Relacion con auth v2 DR
+
+- La rotacion JWT NO reemplaza la verificacion de resiliencia del runtime. Son capas distintas, boludo.
+- Si hay rollback de claves durante un incidente auth v2, primero restauras validacion/emision y despues probas que el servicio sigue drenando y saliendo de rotacion correctamente.
+- El criterio de cierre no es solo "el JWKS se ve bien"; tambien tiene que pasar el contrato de despliegue y failover documentado en `docs/deployment-production-checklist.md`.

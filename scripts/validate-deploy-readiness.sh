@@ -18,6 +18,7 @@ AUTH_V2_LEGACY_FALLBACK_MODE="${AUTH_V2_LEGACY_FALLBACK_MODE:-disabled}"
 AUTH_V2_CLIENT_ALLOWLIST="${AUTH_V2_CLIENT_ALLOWLIST:-}"
 AUTH_V2_SHADOW_AUDIT_ONLY="${AUTH_V2_SHADOW_AUDIT_ONLY:-false}"
 AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS="${AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS:-60}"
+AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS="${AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS:-25}"
 
 failures=0
 warnings=0
@@ -273,7 +274,8 @@ check_auth_v2_rollout_contract() {
     "AUTH_V2_LEGACY_FALLBACK_MODE=${AUTH_V2_LEGACY_FALLBACK_MODE}" \
     "AUTH_V2_CLIENT_ALLOWLIST=${AUTH_V2_CLIENT_ALLOWLIST}" \
     "AUTH_V2_SHADOW_AUDIT_ONLY=${AUTH_V2_SHADOW_AUDIT_ONLY}" \
-    "AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS=${AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS}" <<'PY'
+    "AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS=${AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS}" \
+    "AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS=${AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS}" <<'PY'
 import pathlib
 import re
 import sys
@@ -322,6 +324,75 @@ PY
   info "Auth v2 rollout contract check passed"
 }
 
+check_runtime_drain_contract() {
+  info "Checking runtime drain contract for auth v2 rollout"
+
+  local deployment_file="${ROOT_DIR}/deploy/k8s/deployment.yaml"
+  local report_file="${ARTIFACT_DIR}/production-runtime-drain-contract.txt"
+
+  if [[ ! -f "${deployment_file}" ]]; then
+    fail "missing deployment manifest: ${deployment_file}"
+    return
+  fi
+
+  if [[ ! "${AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS}" =~ ^[0-9]+$ ]] || [[ "${AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS}" == "0" ]]; then
+    fail "AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS must be a positive integer for runtime drain validation"
+    return
+  fi
+
+  if ! python3 - "${deployment_file}" "${report_file}" "${AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS}" <<'PY'
+import pathlib
+import re
+import sys
+
+deployment_path = pathlib.Path(sys.argv[1])
+report_path = pathlib.Path(sys.argv[2])
+shutdown_grace = int(sys.argv[3])
+required_margin = 5
+
+content = deployment_path.read_text(encoding="utf-8")
+errors = []
+lines = [f"Validated runtime drain contract in {deployment_path}."]
+
+termination_match = re.search(r"^\s*terminationGracePeriodSeconds:\s*(\d+)\s*$", content, re.MULTILINE)
+if termination_match is None:
+    errors.append("missing terminationGracePeriodSeconds in deployment manifest")
+else:
+    termination_grace = int(termination_match.group(1))
+    lines.append(f"OK terminationGracePeriodSeconds={termination_grace}")
+    minimum_required = shutdown_grace + required_margin
+    if termination_grace < minimum_required:
+        errors.append(
+            f"terminationGracePeriodSeconds={termination_grace} must be at least AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS + {required_margin} ({minimum_required})"
+        )
+
+readiness_match = re.search(r"readinessProbe:\n(?:.*\n)*?\s*path:\s*/readyz\s*$", content, re.MULTILINE)
+if readiness_match is None:
+    errors.append("deployment readinessProbe must target /readyz for drain withdrawal")
+else:
+    lines.append("OK readinessProbe path=/readyz")
+
+report_lines = list(lines)
+if errors:
+    report_lines.append("")
+    report_lines.append("Errors:")
+    report_lines.extend(f"- {error}" for error in errors)
+
+report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+
+if errors:
+    for error in errors:
+        print(f"ERROR: {error}", file=sys.stderr)
+    sys.exit(1)
+PY
+  then
+    fail "runtime drain contract validation failed (see ${report_file})"
+    return
+  fi
+
+  info "Runtime drain contract check passed"
+}
+
 run_generate_overlay_for_self_test() {
   GENERATED_DIR="${PRODUCTION_OVERLAY_GENERATED_DIR}" "${GENERATE_PRODUCTION_OVERLAY_SCRIPT}" >/dev/null
 }
@@ -362,6 +433,7 @@ self_test() {
   AUTH_V2_CLIENT_ALLOWLIST="internal,canary_mobile"
   AUTH_V2_SHADOW_AUDIT_ONLY="false"
   AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS="300"
+  AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS="25"
 
   export IMAGE_DIGEST INGRESS_HOST TLS_SECRET_NAME POSTGRES_CIDR REDIS_CIDR
   export ENFORCE_DATABASE_TLS ENFORCE_REDIS_TLS ENFORCE_SECURE_TRANSPORT
@@ -373,6 +445,7 @@ self_test() {
   export AUTH_V2_PASSWORD_UPGRADE_ENABLED AUTH_V2_PASSKEY_NAMESPACE_ENABLED
   export AUTH_V2_AUTH_FLOWS_ENABLED AUTH_V2_LEGACY_FALLBACK_MODE AUTH_V2_CLIENT_ALLOWLIST
   export AUTH_V2_SHADOW_AUDIT_ONLY AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS
+  export AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS
 
   mkdir -p "${ARTIFACT_DIR}"
   run_generate_overlay_for_self_test
@@ -445,6 +518,7 @@ main() {
   render_production_overlay_if_available
   check_production_images_digest_pinned
   check_auth_v2_rollout_contract
+  check_runtime_drain_contract
 
   if [[ ${failures} -gt 0 ]]; then
     echo ""

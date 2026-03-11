@@ -33,6 +33,9 @@ struct MetricsRegistry {
     passkey_register_rejected_total: IntCounterVec,
     password_forgot_accepted_total: IntCounterVec,
     password_reset_rejected_total: IntCounterVec,
+    runtime_draining: IntGauge,
+    runtime_shutdowns_total: IntCounterVec,
+    login_abuse_redis_incidents_total: IntCounterVec,
     passkey_challenge_janitor_enabled: IntGauge,
     passkey_challenge_prune_interval_seconds: IntGauge,
     passkey_challenge_prune_runs_total: IntCounterVec,
@@ -259,6 +262,30 @@ impl MetricsRegistry {
             &["reason"],
         )
         .expect("password reset rejected metric should initialize");
+
+        let runtime_draining = IntGauge::new(
+            "auth_runtime_draining",
+            "Whether the auth runtime is currently draining for shutdown (1=true, 0=false)",
+        )
+        .expect("runtime draining metric should initialize");
+
+        let runtime_shutdowns_total = IntCounterVec::new(
+            Opts::new(
+                "auth_runtime_shutdowns_total",
+                "Total runtime shutdown transitions partitioned by reason",
+            ),
+            &["reason"],
+        )
+        .expect("runtime shutdown counter should initialize");
+
+        let login_abuse_redis_incidents_total = IntCounterVec::new(
+            Opts::new(
+                "auth_login_abuse_redis_incidents_total",
+                "Total Redis login abuse incidents partitioned by operation and fail posture",
+            ),
+            &["operation", "posture"],
+        )
+        .expect("redis incident counter should initialize");
 
         let passkey_challenge_janitor_enabled = IntGauge::new(
             "auth_passkey_challenge_janitor_enabled",
@@ -544,6 +571,15 @@ impl MetricsRegistry {
             .register(Box::new(password_reset_rejected_total.clone()))
             .expect("password reset rejected metric should register");
         registry
+            .register(Box::new(runtime_draining.clone()))
+            .expect("runtime draining metric should register");
+        registry
+            .register(Box::new(runtime_shutdowns_total.clone()))
+            .expect("runtime shutdown counter should register");
+        registry
+            .register(Box::new(login_abuse_redis_incidents_total.clone()))
+            .expect("redis incident counter should register");
+        registry
             .register(Box::new(passkey_challenge_janitor_enabled.clone()))
             .expect("passkey challenge janitor enabled metric should register");
         registry
@@ -672,6 +708,9 @@ impl MetricsRegistry {
             passkey_register_rejected_total,
             password_forgot_accepted_total,
             password_reset_rejected_total,
+            runtime_draining,
+            runtime_shutdowns_total,
+            login_abuse_redis_incidents_total,
             passkey_challenge_janitor_enabled,
             passkey_challenge_prune_interval_seconds,
             passkey_challenge_prune_runs_total,
@@ -901,6 +940,27 @@ pub fn record_password_reset_rejected(reason: &str) {
     metrics()
         .password_reset_rejected_total
         .with_label_values(&[normalize_password_reset_rejection_reason(reason)])
+        .inc();
+}
+
+pub fn set_runtime_draining(draining: bool) {
+    metrics().runtime_draining.set(if draining { 1 } else { 0 });
+}
+
+pub fn record_runtime_shutdown(reason: &str) {
+    metrics()
+        .runtime_shutdowns_total
+        .with_label_values(&[normalize_runtime_shutdown_reason(reason)])
+        .inc();
+}
+
+pub fn record_login_abuse_redis_incident(operation: &str, posture: &str) {
+    metrics()
+        .login_abuse_redis_incidents_total
+        .with_label_values(&[
+            normalize_login_abuse_redis_operation(operation),
+            normalize_login_abuse_redis_posture(posture),
+        ])
         .inc();
 }
 
@@ -1213,6 +1273,36 @@ fn normalize_password_reset_rejection_reason(reason: &str) -> &'static str {
     }
 }
 
+fn normalize_runtime_shutdown_reason(reason: &str) -> &'static str {
+    match reason {
+        "sigterm" => "sigterm",
+        "sigint" => "sigint",
+        _ => "other",
+    }
+}
+
+fn normalize_login_abuse_redis_operation(operation: &str) -> &'static str {
+    match operation {
+        "check_connect" => "check_connect",
+        "check_read" => "check_read",
+        "register_failure_connect" => "register_failure_connect",
+        "register_failure_attempt_write" => "register_failure_attempt_write",
+        "register_failure_strike_write" => "register_failure_strike_write",
+        "register_failure_lock_write" => "register_failure_lock_write",
+        "register_success_connect" => "register_success_connect",
+        "register_success_clear" => "register_success_clear",
+        _ => "other",
+    }
+}
+
+fn normalize_login_abuse_redis_posture(posture: &str) -> &'static str {
+    match posture {
+        "fail_closed" => "fail_closed",
+        "fail_open" => "fail_open",
+        _ => "other",
+    }
+}
+
 fn normalize_auth_v2_rollout_channel(channel: &str) -> &str {
     match channel {
         "unknown" => "unknown",
@@ -1368,12 +1458,13 @@ mod tests {
         record_auth_v2_password_rejected, record_auth_v2_password_request,
         record_auth_v2_rollout_diagnostic, record_email_delivery,
         record_email_outbox_claim_failure, record_email_outbox_claim_poll,
-        record_email_outbox_dispatch, record_email_retry_intensity, record_login_risk_decision,
-        record_login_risk_penalty, record_passkey_challenge_prune_error,
-        record_passkey_challenge_prune_run, record_passkey_challenge_pruned,
-        record_passkey_login_rejected, record_passkey_register_rejected, record_passkey_request,
-        record_password_forgot_accepted, record_password_reset_rejected, record_problem_response,
-        record_refresh_error, record_refresh_success, render_prometheus,
+        record_email_outbox_dispatch, record_email_retry_intensity,
+        record_login_abuse_redis_incident, record_login_risk_decision, record_login_risk_penalty,
+        record_passkey_challenge_prune_error, record_passkey_challenge_prune_run,
+        record_passkey_challenge_pruned, record_passkey_login_rejected,
+        record_passkey_register_rejected, record_passkey_request, record_password_forgot_accepted,
+        record_password_reset_rejected, record_problem_response, record_refresh_error,
+        record_refresh_success, record_runtime_shutdown, render_prometheus,
         set_auth_v2_auth_flow_janitor_enabled, set_auth_v2_auth_flow_metrics,
         set_auth_v2_auth_flow_prune_interval_seconds,
         set_auth_v2_auth_flow_prune_last_failure_unixtime,
@@ -1381,7 +1472,7 @@ mod tests {
         set_email_outbox_oldest_pending_age_seconds, set_email_outbox_queue_depth,
         set_passkey_challenge_janitor_enabled, set_passkey_challenge_prune_interval_seconds,
         set_passkey_challenge_prune_last_failure_unixtime,
-        set_passkey_challenge_prune_last_success_unixtime,
+        set_passkey_challenge_prune_last_success_unixtime, set_runtime_draining,
     };
     use crate::modules::auth::application::AuthError;
     use crate::modules::auth::{
@@ -1450,6 +1541,11 @@ mod tests {
         record_password_forgot_accepted("future_outcome_value");
         record_password_reset_rejected("account_not_active");
         record_password_reset_rejected("future_rejection_reason");
+        set_runtime_draining(true);
+        record_runtime_shutdown("sigterm");
+        record_runtime_shutdown("future-reason");
+        record_login_abuse_redis_incident("check_connect", "fail_closed");
+        record_login_abuse_redis_incident("register_failure_lock_write", "fail_open");
         set_passkey_challenge_janitor_enabled(true);
         set_passkey_challenge_prune_interval_seconds(60);
         record_passkey_challenge_prune_run("success");
@@ -1509,6 +1605,9 @@ mod tests {
         assert!(payload.contains("auth_passkey_register_rejected_total"));
         assert!(payload.contains("auth_password_forgot_accepted_total"));
         assert!(payload.contains("auth_password_reset_rejected_total"));
+        assert!(payload.contains("auth_runtime_draining"));
+        assert!(payload.contains("auth_runtime_shutdowns_total"));
+        assert!(payload.contains("auth_login_abuse_redis_incidents_total"));
         assert!(payload.contains("auth_passkey_challenge_janitor_enabled"));
         assert!(payload.contains("auth_passkey_challenge_prune_interval_seconds"));
         assert!(payload.contains("auth_passkey_challenge_prune_runs_total"));
@@ -1580,5 +1679,11 @@ mod tests {
         assert!(payload.contains("flow_kind=\"password_login\""));
         assert!(payload.contains("reason=\"allowlisted\""));
         assert!(payload.contains("reason=\"client_not_allowlisted\""));
+        assert!(payload.contains("reason=\"sigterm\""));
+        assert!(payload.contains("reason=\"other\""));
+        assert!(payload.contains("operation=\"check_connect\""));
+        assert!(payload.contains("operation=\"register_failure_lock_write\""));
+        assert!(payload.contains("posture=\"fail_closed\""));
+        assert!(payload.contains("posture=\"fail_open\""));
     }
 }

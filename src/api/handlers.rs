@@ -2223,6 +2223,10 @@ mod tests {
 
     struct FailingReadinessChecker;
 
+    struct DrainingReadinessChecker;
+
+    struct JanitorDegradedReadinessChecker;
+
     #[async_trait]
     impl crate::health::ReadinessChecker for FailingReadinessChecker {
         async fn check(&self) -> crate::health::ReadinessReport {
@@ -2251,6 +2255,78 @@ mod tests {
                         auth_flow_janitor: crate::health::ComponentState {
                             status: "not_configured".to_string(),
                             detail: None,
+                        },
+                    },
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::health::ReadinessChecker for DrainingReadinessChecker {
+        async fn check(&self) -> crate::health::ReadinessReport {
+            crate::health::ReadinessReport {
+                is_ready: false,
+                payload: crate::health::ReadinessPayload {
+                    status: "error".to_string(),
+                    runtime: "postgres_redis".to_string(),
+                    components: crate::health::ReadinessComponents {
+                        app: crate::health::ComponentState {
+                            status: "draining".to_string(),
+                            detail: Some("shutdown_reason=sigterm".to_string()),
+                        },
+                        database: crate::health::ComponentState {
+                            status: "ok".to_string(),
+                            detail: None,
+                        },
+                        redis: crate::health::ComponentState {
+                            status: "error".to_string(),
+                            detail: Some("redis connect failed: connection refused".to_string()),
+                        },
+                        passkey_challenge_janitor: crate::health::ComponentState {
+                            status: "not_configured".to_string(),
+                            detail: None,
+                        },
+                        auth_flow_janitor: crate::health::ComponentState {
+                            status: "starting".to_string(),
+                            detail: Some(
+                                "waiting for first auth flow janitor execution".to_string(),
+                            ),
+                        },
+                    },
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::health::ReadinessChecker for JanitorDegradedReadinessChecker {
+        async fn check(&self) -> crate::health::ReadinessReport {
+            crate::health::ReadinessReport {
+                is_ready: false,
+                payload: crate::health::ReadinessPayload {
+                    status: "error".to_string(),
+                    runtime: "postgres_redis".to_string(),
+                    components: crate::health::ReadinessComponents {
+                        app: crate::health::ComponentState {
+                            status: "ok".to_string(),
+                            detail: None,
+                        },
+                        database: crate::health::ComponentState {
+                            status: "ok".to_string(),
+                            detail: None,
+                        },
+                        redis: crate::health::ComponentState {
+                            status: "ok".to_string(),
+                            detail: None,
+                        },
+                        passkey_challenge_janitor: crate::health::ComponentState {
+                            status: "not_configured".to_string(),
+                            detail: None,
+                        },
+                        auth_flow_janitor: crate::health::ComponentState {
+                            status: "degraded".to_string(),
+                            detail: Some("last_success_at=2026-03-11T13:00:00Z; last_failure_at=2026-03-11T13:01:00Z; last_failure_detail=db timeout".to_string()),
                         },
                     },
                 },
@@ -2296,6 +2372,43 @@ mod tests {
         assert_eq!(body.0.status, "error");
         assert_eq!(body.0.components.database.status, "error");
         assert!(body.0.components.database.detail.is_some());
+    }
+
+    #[tokio::test]
+    async fn readyz_handler_surfaces_draining_and_redis_failure_details() {
+        let mut harness = build_harness();
+        harness.state.readiness_checker = Arc::new(DrainingReadinessChecker);
+
+        let (status, body) = super::readyz(State(harness.state.clone())).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0.components.app.status, "draining");
+        assert_eq!(
+            body.0.components.app.detail.as_deref(),
+            Some("shutdown_reason=sigterm")
+        );
+        assert_eq!(body.0.components.redis.status, "error");
+        assert!(body.0.components.redis.detail.is_some());
+    }
+
+    #[tokio::test]
+    async fn readyz_handler_surfaces_auth_flow_janitor_degradation_details() {
+        let mut harness = build_harness();
+        harness.state.readiness_checker = Arc::new(JanitorDegradedReadinessChecker);
+
+        let (status, body) = super::readyz(State(harness.state.clone())).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0.components.auth_flow_janitor.status, "degraded");
+        assert!(body.0.components.auth_flow_janitor.detail.is_some());
+        assert!(body
+            .0
+            .components
+            .auth_flow_janitor
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("last_failure_detail=db timeout"));
     }
 
     #[tokio::test]
@@ -5224,6 +5337,7 @@ mod tests {
                 )
                 .expect("jwks document should be built"),
                 readiness_checker: crate::health::RuntimeReadinessChecker::inmemory(
+                    Arc::new(crate::health::RuntimeLifecycleState::default()),
                     Arc::new(crate::health::PasskeyChallengeJanitorHealth::new(
                         false,
                         std::time::Duration::from_secs(60),
@@ -5975,6 +6089,7 @@ mod tests {
                 )
                 .expect("jwks document should be built"),
                 readiness_checker: crate::health::RuntimeReadinessChecker::inmemory(
+                    Arc::new(crate::health::RuntimeLifecycleState::default()),
                     Arc::new(crate::health::PasskeyChallengeJanitorHealth::new(
                         false,
                         std::time::Duration::from_secs(60),
@@ -6093,6 +6208,7 @@ mod tests {
             adapters.pool.clone(),
             None,
             std::time::Duration::from_millis(500),
+            Arc::new(crate::health::RuntimeLifecycleState::default()),
             Arc::new(crate::health::PasskeyChallengeJanitorHealth::new(
                 false,
                 std::time::Duration::from_secs(60),
@@ -6217,6 +6333,7 @@ mod tests {
             passkey_rp_origin: None,
             passkey_challenge_prune_interval_seconds: 60,
             auth_v2_auth_flow_prune_interval_seconds: 60,
+            shutdown_grace_period_seconds: 25,
             jwt_keys: vec![crate::config::JwtKeyConfig {
                 kid: "handler-tests-ed25519-v1".to_string(),
                 private_key_pem: Some(TEST_PRIVATE_KEY_PEM.to_string()),

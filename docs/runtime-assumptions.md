@@ -46,7 +46,7 @@
 
 ### Health Endpoints
 - `/healthz` - Basic liveness (process is up)
-- `/readyz` - Readiness (inmemory: immediate ok; postgres_redis: validates DB ping and Redis ping when adapter is present)
+- `/readyz` - Readiness (inmemory: immediate ok; postgres_redis: validates DB ping and Redis ping when adapter is present, plus auth-owned janitor posture)
 
 ### Metrics
 - Endpoint: `/metrics`
@@ -54,9 +54,10 @@
 - Protection: Optional bearer token via `METRICS_BEARER_TOKEN`
 
 ### Graceful Shutdown
-- Catches SIGTERM, stops accepting new connections
-- Waits for in-flight requests (default: query timeout)
-- Closes database connections
+- Catches `SIGTERM` and `SIGINT`, flips runtime state to `draining`, and withdraws readiness before exit
+- Stops accepting new connections while allowing in-flight requests to finish within `AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS`
+- Broadcasts shutdown to auth-owned background loops (outbox dispatcher, passkey janitor, auth-flow janitor) so idle workers do not wait for a full poll interval
+- Requires Kubernetes `terminationGracePeriodSeconds` to exceed the app shutdown budget; the production baseline now uses `AUTH_SHUTDOWN_GRACE_PERIOD_SECONDS=25` with `terminationGracePeriodSeconds=40`
 
 ## Email
 
@@ -95,6 +96,19 @@ When `EMAIL_DELIVERY_MODE=outbox`:
 - Login attempt counters
 - Token issuance counters
 - Email delivery metrics
+- Runtime drain and shutdown metrics: `auth_runtime_draining`, `auth_runtime_shutdowns_total{reason}`
+- Redis incident posture metric: `auth_login_abuse_redis_incidents_total{operation,posture}`
+- Auth-flow backlog recovery metrics: `auth_v2_auth_flows_expired_pending_total`, `auth_v2_auth_flows_oldest_expired_pending_age_seconds`, `auth_v2_auth_flow_prune_runs_total`, `auth_v2_auth_flow_pruned_total`
+
+### Readiness Failure Semantics
+- `components.app=status=draining` means the pod is intentionally leaving rotation and should not receive new traffic
+- `components.database` and `components.redis` report dependency posture explicitly and fail readiness closed for auth-v2-critical incidents
+- `components.auth_flow_janitor=status=degraded` means the shared auth-flow cleanup contract is no longer trustworthy; treat that as rollout-blocking until recovery is verified
+
+### Drill Contract
+- Use `scripts/test-auth-v2-dr-chaos.sh` to validate captured `/readyz` and `/metrics` evidence for drain withdrawal, dependency brownout signaling, and backlog recovery
+- When auth-v2 recovery overlaps JWT key rollback, include the drill script's `--jwt-rollback-restore-jwks`, `--jwt-rollback-restore-check`, `--jwt-rollback-retire-jwks`, and `--jwt-rollback-retire-check` artifacts so rollback proof is executable instead of operator folklore
+- Use `scripts/validate-deploy-readiness.sh` to enforce that rollout assets still match the shutdown budget and drain contract before promotion
 
 ### Tracing
 - OpenTelemetry not currently integrated

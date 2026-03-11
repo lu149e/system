@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
+use tokio::sync::watch;
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -410,10 +411,18 @@ impl OutboxDispatcher {
         }
     }
 
-    pub async fn run_forever(self) {
+    pub async fn run_until_shutdown(self, mut shutdown: watch::Receiver<bool>) {
         loop {
             self.dispatch_once().await;
-            sleep(self.config.poll_interval).await;
+
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = sleep(self.config.poll_interval) => {}
+            }
         }
     }
 

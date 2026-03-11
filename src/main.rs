@@ -32,8 +32,9 @@ use ipnet::IpNet;
 use modules::auth::application::{AuthService, AuthV2Dependencies};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tower_http::{request_id::MakeRequestUuid, trace::TraceLayer};
-use tracing::info;
+use tracing::{info, warn};
 use webauthn_rs::prelude::{Url, Webauthn, WebauthnBuilder};
 
 #[derive(Clone)]
@@ -93,6 +94,78 @@ fn ensure_migrations_supported(auth_runtime: AuthRuntime) -> anyhow::Result<()> 
     }
 
     Ok(())
+}
+
+async fn run_server_until_shutdown<Server, Shutdown>(
+    server: Server,
+    shutdown_signal: Shutdown,
+    lifecycle_state: Arc<health::RuntimeLifecycleState>,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_grace_period: Duration,
+) -> anyhow::Result<()>
+where
+    Server: std::future::Future<Output = std::io::Result<()>>,
+    Shutdown: std::future::Future<Output = &'static str>,
+{
+    tokio::pin!(server);
+    tokio::pin!(shutdown_signal);
+
+    tokio::select! {
+        result = &mut server => return result.map_err(anyhow::Error::from),
+        reason = &mut shutdown_signal => {
+            lifecycle_state.begin_shutdown(reason);
+            observability::set_runtime_draining(true);
+            observability::record_runtime_shutdown(reason);
+            let _ = shutdown_tx.send(true);
+        }
+    }
+
+    match tokio::time::timeout(shutdown_grace_period, &mut server).await {
+        Ok(result) => result.map_err(anyhow::Error::from),
+        Err(_) => anyhow::bail!(
+            "graceful shutdown exceeded configured budget of {}s",
+            shutdown_grace_period.as_secs()
+        ),
+    }
+}
+
+async fn wait_for_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => "sigint",
+                    _ = terminate.recv() => "sigterm",
+                }
+            }
+            Err(error) => {
+                warn!(error = %error, "failed to install SIGTERM handler, falling back to ctrl_c only");
+                let _ = tokio::signal::ctrl_c().await;
+                "sigint"
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "sigint"
+    }
+}
+
+async fn wait_for_janitor_tick_or_shutdown(
+    shutdown: &mut watch::Receiver<bool>,
+    ticker: &mut tokio::time::Interval,
+) -> bool {
+    if *shutdown.borrow() {
+        return false;
+    }
+
+    tokio::select! {
+        changed = shutdown.changed() => changed.is_ok() && !*shutdown.borrow(),
+        _ = ticker.tick() => true,
+    }
 }
 
 async fn run_migration_mode() -> anyhow::Result<()> {
@@ -265,6 +338,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cfg = AppConfig::from_env()?;
+    observability::set_runtime_draining(false);
     observability::configure_email_metrics(cfg.email_metrics_latency_enabled);
     observability::set_passkey_challenge_janitor_enabled(cfg.passkey_enabled);
     observability::set_passkey_challenge_prune_interval_seconds(
@@ -310,6 +384,9 @@ async fn main() -> anyhow::Result<()> {
     };
     let passkey_challenge_janitor_interval =
         Duration::from_secs(cfg.passkey_challenge_prune_interval_seconds);
+    let shutdown_grace_period = Duration::from_secs(cfg.shutdown_grace_period_seconds);
+    let lifecycle_state = Arc::new(health::RuntimeLifecycleState::default());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let passkey_challenge_janitor_health = Arc::new(health::PasskeyChallengeJanitorHealth::new(
         cfg.passkey_enabled,
         passkey_challenge_janitor_interval
@@ -366,6 +443,7 @@ async fn main() -> anyhow::Result<()> {
                 pg.pool.clone(),
                 Some(redis.health_client()),
                 std::time::Duration::from_secs(2),
+                Arc::clone(&lifecycle_state),
                 Arc::clone(&passkey_challenge_janitor_health),
                 Arc::clone(&auth_flow_janitor_health),
             );
@@ -432,6 +510,7 @@ async fn main() -> anyhow::Result<()> {
         AuthRuntime::InMemory => {
             let adapters = InMemoryAdapters::bootstrap(&cfg)?;
             let readiness_checker = health::RuntimeReadinessChecker::inmemory(
+                Arc::clone(&lifecycle_state),
                 Arc::clone(&passkey_challenge_janitor_health),
                 Arc::clone(&auth_flow_janitor_health),
             );
@@ -556,19 +635,23 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if let Some(dispatcher) = dispatcher {
+        let dispatcher_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
-            dispatcher.run_forever().await;
+            dispatcher.run_until_shutdown(dispatcher_shutdown).await;
         });
         tracing::info!("email outbox dispatcher started");
     }
 
     if cfg.passkey_enabled {
+        let mut janitor_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(passkey_challenge_janitor_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
-                ticker.tick().await;
+                if !wait_for_janitor_tick_or_shutdown(&mut janitor_shutdown, &mut ticker).await {
+                    break;
+                }
 
                 let now = chrono::Utc::now();
                 match passkey_challenge_janitor_repository
@@ -598,6 +681,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+
+            tracing::info!("passkey challenge janitor stopped");
         });
         tracing::info!(
             interval_seconds = passkey_challenge_janitor_interval.as_secs(),
@@ -606,12 +691,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(auth_flow_janitor_repository) = auth_flow_janitor_repository {
+        let mut janitor_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(auth_flow_janitor_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
-                ticker.tick().await;
+                if !wait_for_janitor_tick_or_shutdown(&mut janitor_shutdown, &mut ticker).await {
+                    break;
+                }
 
                 let now = chrono::Utc::now();
                 match auth_flow_janitor_repository.prune_expired(now).await {
@@ -647,6 +735,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+
+            tracing::info!("auth v2 auth flow janitor stopped");
         });
         tracing::info!(
             interval_seconds = auth_flow_janitor_interval.as_secs(),
@@ -659,9 +749,32 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = bind_addr.parse().context("invalid APP_ADDR")?;
     let listener = TcpListener::bind(addr).await?;
     info!(address = %addr, "auth api listening");
-    axum::serve(
+
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown({
+        let mut server_shutdown = shutdown_rx.clone();
+        async move {
+            loop {
+                if *server_shutdown.borrow() {
+                    break;
+                }
+
+                if server_shutdown.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    run_server_until_shutdown(
+        async move { server.await },
+        wait_for_shutdown_signal(),
+        lifecycle_state,
+        shutdown_tx,
+        shutdown_grace_period,
     )
     .await?;
 
@@ -693,8 +806,13 @@ fn build_passkey_webauthn(cfg: &AppConfig) -> anyhow::Result<Option<Webauthn>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_migrations_supported, parse_run_mode, RunMode};
-    use crate::config::AuthRuntime;
+    use super::{
+        ensure_migrations_supported, parse_run_mode, run_server_until_shutdown,
+        wait_for_janitor_tick_or_shutdown, RunMode,
+    };
+    use crate::{config::AuthRuntime, health};
+    use std::{io, sync::Arc, time::Duration};
+    use tokio::sync::watch;
 
     #[test]
     fn run_mode_defaults_to_server() {
@@ -751,5 +869,102 @@ mod tests {
     fn migrations_are_supported_for_postgres_runtime() {
         ensure_migrations_supported(AuthRuntime::PostgresRedis)
             .expect("postgres runtime should support migrations");
+    }
+
+    #[tokio::test]
+    async fn run_server_until_shutdown_finishes_within_budget() {
+        let lifecycle_state = Arc::new(health::RuntimeLifecycleState::default());
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let result = run_server_until_shutdown(
+            async move {
+                while !*shutdown_rx.borrow() {
+                    if shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok::<(), io::Error>(())
+            },
+            async { "sigterm" },
+            Arc::clone(&lifecycle_state),
+            shutdown_tx,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(lifecycle_state.is_draining());
+        assert_eq!(
+            lifecycle_state.readiness_component().detail.as_deref(),
+            Some("shutdown_reason=sigterm")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_server_until_shutdown_times_out_when_budget_is_exceeded() {
+        let lifecycle_state = Arc::new(health::RuntimeLifecycleState::default());
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let error = run_server_until_shutdown(
+            async move {
+                while !*shutdown_rx.borrow() {
+                    if shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                Ok::<(), io::Error>(())
+            },
+            async { "sigterm" },
+            lifecycle_state,
+            shutdown_tx,
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("shutdown budget should be enforced");
+
+        assert!(error
+            .to_string()
+            .contains("graceful shutdown exceeded configured budget"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_janitor_tick_or_shutdown_returns_false_when_shutdown_arrives_while_idle() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        ticker.tick().await;
+
+        let wait = wait_for_janitor_tick_or_shutdown(&mut shutdown_rx, &mut ticker);
+        tokio::pin!(wait);
+
+        tokio::task::yield_now().await;
+        shutdown_tx
+            .send(true)
+            .expect("shutdown signal should be delivered");
+
+        let should_continue = tokio::time::timeout(Duration::from_millis(20), wait)
+            .await
+            .expect("idle janitor should stop without waiting for next interval");
+
+        assert!(!should_continue);
+    }
+
+    #[tokio::test]
+    async fn wait_for_janitor_tick_or_shutdown_returns_true_when_next_tick_arrives() {
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let mut ticker = tokio::time::interval(Duration::from_millis(5));
+        ticker.tick().await;
+
+        let should_continue = tokio::time::timeout(
+            Duration::from_millis(50),
+            wait_for_janitor_tick_or_shutdown(&mut shutdown_rx, &mut ticker),
+        )
+        .await
+        .expect("janitor should keep running when the next tick arrives");
+
+        assert!(should_continue);
     }
 }
