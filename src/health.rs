@@ -43,13 +43,6 @@ impl RuntimeLifecycleState {
             .unwrap_or(true)
     }
 
-    pub fn shutdown_reason(&self) -> Option<String> {
-        self.snapshot
-            .lock()
-            .ok()
-            .and_then(|snapshot| snapshot.shutdown_reason.clone())
-    }
-
     pub fn readiness_component(&self) -> ComponentState {
         let Ok(snapshot) = self.snapshot.lock() else {
             return ComponentState::degraded("runtime lifecycle state is unavailable".to_string());

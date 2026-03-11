@@ -897,8 +897,8 @@ mod tests {
         assert!(result.is_ok());
         assert!(lifecycle_state.is_draining());
         assert_eq!(
-            lifecycle_state.shutdown_reason().as_deref(),
-            Some("sigterm")
+            lifecycle_state.readiness_component().detail.as_deref(),
+            Some("shutdown_reason=sigterm")
         );
     }
 
