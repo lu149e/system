@@ -27,6 +27,7 @@ struct MetricsRegistry {
     auth_v2_password_upgrade_duration_seconds: HistogramVec,
     auth_v2_password_rejected_total: IntCounterVec,
     auth_v2_legacy_fallback_total: IntCounterVec,
+    auth_v2_rollout_diagnostics_total: IntCounterVec,
     passkey_requests_total: IntCounterVec,
     passkey_login_rejected_total: IntCounterVec,
     passkey_register_rejected_total: IntCounterVec,
@@ -204,6 +205,15 @@ impl MetricsRegistry {
             &["reason", "channel"],
         )
         .expect("auth v2 legacy fallback metric should initialize");
+
+        let auth_v2_rollout_diagnostics_total = IntCounterVec::new(
+            Opts::new(
+                "auth_v2_rollout_diagnostics_total",
+                "Total auth v2 rollout decisions partitioned by operation, outcome, canonical cohort, request channel, and tenant context presence",
+            ),
+            &["operation", "outcome", "cohort", "request_channel", "tenant_context"],
+        )
+        .expect("auth v2 rollout diagnostics metric should initialize");
 
         let passkey_requests_total = IntCounterVec::new(
             Opts::new(
@@ -516,6 +526,9 @@ impl MetricsRegistry {
             .register(Box::new(auth_v2_legacy_fallback_total.clone()))
             .expect("auth v2 legacy fallback metric should register");
         registry
+            .register(Box::new(auth_v2_rollout_diagnostics_total.clone()))
+            .expect("auth v2 rollout diagnostics metric should register");
+        registry
             .register(Box::new(passkey_requests_total.clone()))
             .expect("passkey requests metric should register");
         registry
@@ -653,6 +666,7 @@ impl MetricsRegistry {
             auth_v2_password_upgrade_duration_seconds,
             auth_v2_password_rejected_total,
             auth_v2_legacy_fallback_total,
+            auth_v2_rollout_diagnostics_total,
             passkey_requests_total,
             passkey_login_rejected_total,
             passkey_register_rejected_total,
@@ -821,6 +835,29 @@ pub fn record_auth_v2_legacy_fallback(reason: &str, channel: &str) {
         .with_label_values(&[
             normalize_auth_v2_fallback_reason(reason),
             normalize_auth_v2_rollout_channel(channel),
+        ])
+        .inc();
+}
+
+pub fn record_auth_v2_rollout_diagnostic(
+    operation: &str,
+    outcome: &str,
+    cohort: Option<&str>,
+    request_channel: Option<&str>,
+    tenant_id: Option<&str>,
+) {
+    metrics()
+        .auth_v2_rollout_diagnostics_total
+        .with_label_values(&[
+            normalize_auth_v2_rollout_operation(operation),
+            normalize_auth_v2_request_outcome(outcome),
+            normalize_auth_v2_rollout_channel(cohort.unwrap_or("unknown")),
+            normalize_auth_v2_request_channel_label(request_channel.unwrap_or("unknown")),
+            if tenant_id.is_some() {
+                "present"
+            } else {
+                "absent"
+            },
         ])
         .inc();
 }
@@ -1192,6 +1229,34 @@ fn normalize_auth_v2_rollout_channel(channel: &str) -> &str {
     }
 }
 
+fn normalize_auth_v2_request_channel_label(channel: &str) -> &str {
+    match channel {
+        "unknown" => "unknown",
+        "web" => "web",
+        "mobile" => "mobile",
+        value => match value.to_ascii_lowercase().as_str() {
+            "canary_web" | "internal-web" | "staff" | "qa" => "web",
+            "canary_mobile" | "ios" | "android" | "ios-beta" | "android-beta" => "mobile",
+            _ => "other",
+        },
+    }
+}
+
+fn normalize_auth_v2_rollout_operation(operation: &str) -> &str {
+    match operation {
+        "methods" => "methods",
+        "password_login_start" => "password_login_start",
+        "password_login_finish" => "password_login_finish",
+        "password_upgrade_start" => "password_upgrade_start",
+        "password_upgrade_finish" => "password_upgrade_finish",
+        "passkey_login_start" => "passkey_login_start",
+        "passkey_login_finish" => "passkey_login_finish",
+        "passkey_register_start" => "passkey_register_start",
+        "passkey_register_finish" => "passkey_register_finish",
+        _ => "other",
+    }
+}
+
 fn normalize_auth_v2_request_outcome(outcome: &str) -> &'static str {
     match outcome {
         "success" => "success",
@@ -1300,7 +1365,8 @@ mod tests {
         record_auth_v2_auth_flow_prune_run, record_auth_v2_auth_flow_pruned,
         record_auth_v2_legacy_fallback, record_auth_v2_methods_recommendation,
         record_auth_v2_methods_rejected, record_auth_v2_methods_request,
-        record_auth_v2_password_rejected, record_auth_v2_password_request, record_email_delivery,
+        record_auth_v2_password_rejected, record_auth_v2_password_request,
+        record_auth_v2_rollout_diagnostic, record_email_delivery,
         record_email_outbox_claim_failure, record_email_outbox_claim_poll,
         record_email_outbox_dispatch, record_email_retry_intensity, record_login_risk_decision,
         record_login_risk_penalty, record_passkey_challenge_prune_error,
@@ -1343,6 +1409,13 @@ mod tests {
         record_auth_v2_password_request("login_finish", "error", "android");
         record_auth_v2_password_request("upgrade_start", "success", "ios");
         record_auth_v2_password_request("upgrade_finish", "error", "ios");
+        record_auth_v2_rollout_diagnostic(
+            "passkey_login_start",
+            "success",
+            Some("beta_external"),
+            Some("web"),
+            Some("tenant-1"),
+        );
         record_auth_v2_password_rejected("https://example.com/problems/recovery-required");
         record_auth_v2_password_rejected("https://example.com/problems/invalid-recovery-bridge");
         observe_auth_v2_password_duration(
@@ -1452,6 +1525,7 @@ mod tests {
         assert!(payload.contains("auth_v2_password_upgrade_duration_seconds"));
         assert!(!payload.contains("auth_v2_password_requests_total"));
         assert!(payload.contains("auth_v2_legacy_fallback_total"));
+        assert!(payload.contains("auth_v2_rollout_diagnostics_total"));
         assert!(payload.contains("auth_v2_auth_flow_prune_interval_seconds"));
         assert!(payload.contains("auth_v2_auth_flow_prune_runs_total"));
         assert!(payload.contains("auth_v2_auth_flow_prune_last_success_unixtime"));
@@ -1494,6 +1568,9 @@ mod tests {
         assert!(payload.contains("reason=\"account_not_active\""));
         assert!(payload.contains("reason=\"recovery_required\""));
         assert!(payload.contains("reason=\"invalid_recovery_bridge\""));
+        assert!(payload.contains("operation=\"passkey_login_start\""));
+        assert!(payload.contains("request_channel=\"web\""));
+        assert!(payload.contains("tenant_context=\"present\""));
         assert!(payload.contains("outcome=\"existing_not_active\""));
         assert!(payload.contains("channel=\"canary_web\""));
         assert!(payload.contains("channel=\"canary_mobile\""));

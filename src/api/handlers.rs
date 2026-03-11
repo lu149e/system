@@ -18,12 +18,13 @@ use crate::{
     health::ComponentState,
     modules::auth::application::{
         auth_v2_allows_external_access, evaluate_auth_v2_rollout, AuthError, AuthMethodsCommand,
-        AuthMethodsResponse, AuthV2RolloutDecision, LoginCommand, LoginResult, LogoutCommand,
-        MfaActivateCommand, MfaDisableCommand, MfaVerifyCommand, PakeLoginFinishCommand,
-        PakeLoginStartCommand, PakeLoginStartResponse, PasskeyChallenge, PasswordChangeCommand,
-        PasswordForgotCommand, PasswordResetCommand, PasswordUpgradeFinishCommand,
-        PasswordUpgradeFinishResponse, PasswordUpgradeStartCommand, PasswordUpgradeStartResponse,
-        Principal, RefreshCommand, RegisterCommand, RequestContext, VerifyEmailCommand,
+        AuthMethodsResponse, AuthV2RolloutDecision, AuthV2RolloutTarget, LoginCommand, LoginResult,
+        LogoutCommand, MfaActivateCommand, MfaDisableCommand, MfaVerifyCommand,
+        PakeLoginFinishCommand, PakeLoginStartCommand, PakeLoginStartResponse, PasskeyChallenge,
+        PasswordChangeCommand, PasswordForgotCommand, PasswordResetCommand,
+        PasswordUpgradeFinishCommand, PasswordUpgradeFinishResponse, PasswordUpgradeStartCommand,
+        PasswordUpgradeStartResponse, Principal, RefreshCommand, RegisterCommand, RequestContext,
+        VerifyEmailCommand,
     },
     observability, AppState,
 };
@@ -894,16 +895,24 @@ pub async fn auth_methods_v2(
 ) -> Result<NoStoreJson<AuthMethodsContractResponse>, ApiProblem> {
     let started_at = Instant::now();
     let trace_id = trace_id(&headers);
-    let client_id = payload
-        .channel
-        .clone()
-        .or_else(|| payload.client.platform.clone());
-    let rollout = auth_v2_rollout_for_request(&state, client_id.as_deref(), &trace_id)
+    let rollout_target = auth_v2_rollout_target(
+        &headers,
+        payload.channel.clone(),
+        payload.client.platform.clone(),
+    );
+    let rollout = auth_v2_rollout_for_request(&state, &rollout_target, &trace_id)
         .map_err(|problem| *problem)?;
     let cohort_label = rollout.cohort_label().to_string();
     if !auth_v2_allows_external_access(&rollout) {
         let rejection_reason = auth_v2_gate_rejection_reason(&state);
         observability::record_auth_v2_methods_request(&cohort_label, rejection_reason);
+        observability::record_auth_v2_rollout_diagnostic(
+            "methods",
+            rejection_reason,
+            rollout.cohort.as_deref(),
+            rollout.request_channel.as_deref(),
+            rollout.tenant_id.as_deref(),
+        );
         observability::observe_auth_v2_methods_duration(rejection_reason, started_at.elapsed());
         observability::record_auth_v2_methods_rejected(rejection_reason);
         return Err(from_auth_error(AuthError::AuthV2RolloutDenied, trace_id));
@@ -922,7 +931,8 @@ pub async fn auth_methods_v2(
         .discover_auth_methods_v2(
             AuthMethodsCommand {
                 identifier: payload.identifier,
-                client_id,
+                client_id: rollout_target.requested_client_id.clone(),
+                rollout_target,
                 supports_passkeys: payload.client.supports_passkeys,
                 supports_conditional_mediation: payload
                     .client
@@ -937,6 +947,13 @@ pub async fn auth_methods_v2(
     match response {
         Ok(response) => {
             observability::record_auth_v2_methods_request(&cohort_label, "success");
+            observability::record_auth_v2_rollout_diagnostic(
+                "methods",
+                "success",
+                rollout.cohort.as_deref(),
+                rollout.request_channel.as_deref(),
+                rollout.tenant_id.as_deref(),
+            );
             observability::observe_auth_v2_methods_duration("success", started_at.elapsed());
 
             Ok(NoStoreJson(auth_methods_contract_response(
@@ -946,6 +963,13 @@ pub async fn auth_methods_v2(
         Err(err) => {
             let problem = from_auth_error(err, trace_id.clone());
             observability::record_auth_v2_methods_request(&cohort_label, "error");
+            observability::record_auth_v2_rollout_diagnostic(
+                "methods",
+                "error",
+                rollout.cohort.as_deref(),
+                rollout.request_channel.as_deref(),
+                rollout.tenant_id.as_deref(),
+            );
             observability::observe_auth_v2_methods_duration("error", started_at.elapsed());
             observability::record_auth_v2_methods_rejected(&problem.body.type_url);
             Err(problem)
@@ -1096,8 +1120,8 @@ pub async fn password_upgrade_start_v2(
         _ => return Err(from_auth_error(AuthError::InvalidRequest, trace_id)),
     };
 
-    let client_id = payload.client.platform.clone();
-    let rollout = auth_v2_rollout_for_request(&state, client_id.as_deref(), &trace_id)
+    let rollout_target = auth_v2_rollout_target(&headers, None, payload.client.platform.clone());
+    let rollout = auth_v2_rollout_for_request(&state, &rollout_target, &trace_id)
         .map_err(|problem| *problem)?;
     let rollout_cohort_label = rollout.cohort_label().to_string();
     if !auth_v2_allows_external_access(&rollout) {
@@ -1106,6 +1130,13 @@ pub async fn password_upgrade_start_v2(
             "upgrade_start",
             rejection_reason,
             &rollout_cohort_label,
+        );
+        observability::record_auth_v2_rollout_diagnostic(
+            "password_upgrade_start",
+            rejection_reason,
+            rollout.cohort.as_deref(),
+            rollout.request_channel.as_deref(),
+            rollout.tenant_id.as_deref(),
         );
         observability::observe_auth_v2_password_duration(
             "upgrade_start",
@@ -1123,7 +1154,7 @@ pub async fn password_upgrade_start_v2(
         &state.trusted_proxy_cidrs,
         Some(connect_addr),
     );
-    ctx.client_id = client_id;
+    ctx.client_id = rollout_target.requested_client_id.clone();
 
     let response = state
         .auth_service
@@ -1131,6 +1162,7 @@ pub async fn password_upgrade_start_v2(
             PasswordUpgradeStartCommand {
                 user_id,
                 context: upgrade_context,
+                rollout_target,
                 request: merge_pake_start_request(
                     payload.client_message,
                     serde_json::json!({
@@ -1148,6 +1180,14 @@ pub async fn password_upgrade_start_v2(
             observability::record_auth_v2_password_rejected(&problem.body.type_url);
             problem
         })?;
+
+    observability::record_auth_v2_rollout_diagnostic(
+        "password_upgrade_start",
+        "success",
+        rollout.cohort.as_deref(),
+        rollout.request_channel.as_deref(),
+        rollout.tenant_id.as_deref(),
+    );
 
     Ok(NoStoreJson(password_upgrade_start_contract_response(
         response,
@@ -1896,13 +1936,14 @@ fn request_context(
             .and_then(|v| v.to_str().ok())
             .map(|v| v.to_string()),
         client_id: None,
+        auth_v2_rollout: None,
         auth_api_surface: crate::modules::auth::application::AuthApiSurface::V1,
     }
 }
 
 fn auth_v2_rollout_for_request(
     state: &AppState,
-    client_id: Option<&str>,
+    target: &AuthV2RolloutTarget,
     trace_id: &str,
 ) -> Result<AuthV2RolloutDecision, Box<ApiProblem>> {
     let Some(config) = state.auth_service.auth_v2_config() else {
@@ -1912,7 +1953,28 @@ fn auth_v2_rollout_for_request(
         )));
     };
 
-    Ok(evaluate_auth_v2_rollout(&config, client_id, None))
+    Ok(evaluate_auth_v2_rollout(&config, target, None))
+}
+
+fn trusted_auth_v2_tenant_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-auth-tenant-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn auth_v2_rollout_target(
+    headers: &HeaderMap,
+    request_channel: Option<String>,
+    requested_client_id: Option<String>,
+) -> AuthV2RolloutTarget {
+    AuthV2RolloutTarget::new(
+        trusted_auth_v2_tenant_id(headers),
+        request_channel,
+        requested_client_id,
+    )
 }
 
 fn auth_v2_gate_rejection_reason(state: &AppState) -> &'static str {
@@ -3770,6 +3832,28 @@ mod tests {
         assert!(metrics_payload.contains("outcome=\"shadow_hidden\""));
     }
 
+    #[test]
+    fn auth_v2_rollout_target_uses_trusted_tenant_header_and_normalized_channel() {
+        let mut headers = headers_with_trace("handler-v2-rollout-target");
+        headers.insert(
+            "x-auth-tenant-id",
+            HeaderValue::from_static("External-Acme"),
+        );
+
+        let rollout_target = super::auth_v2_rollout_target(
+            &headers,
+            Some(" Web ".to_string()),
+            Some("Canary_Web".to_string()),
+        );
+
+        assert_eq!(rollout_target.tenant_id.as_deref(), Some("external-acme"));
+        assert_eq!(rollout_target.request_channel.as_deref(), Some("web"));
+        assert_eq!(
+            rollout_target.requested_client_id.as_deref(),
+            Some("canary_web")
+        );
+    }
+
     #[tokio::test]
     async fn auth_methods_v2_handler_returns_login_locked_problem_contract() {
         let harness = build_v2_harness().await;
@@ -3872,6 +3956,87 @@ mod tests {
         assert!(finish.access_token.is_some());
         assert!(finish.refresh_token.is_some());
         assert!(!finish.upgrade_required);
+
+        let metrics_payload = metrics_payload(&harness, "handler-v2-finish-metrics").await;
+        assert!(metrics_payload.contains("auth_v2_rollout_diagnostics_total"));
+        assert!(metrics_payload.contains("operation=\"password_login_finish\""));
+        assert!(metrics_payload.contains("outcome=\"success\""));
+        assert!(metrics_payload.contains("cohort=\"canary_web\""));
+        assert!(metrics_payload.contains("request_channel=\"web\""));
+        assert!(metrics_payload.contains("tenant_context=\"absent\""));
+    }
+
+    #[tokio::test]
+    async fn password_login_start_v2_handler_emits_rollout_diagnostics_for_denied_flow() {
+        let harness = build_v2_harness_with_client_allowlist(&["canary_web"]).await;
+        let now = Utc::now();
+
+        harness
+            .auth_flows
+            .issue(crate::modules::auth::domain::AuthFlowRecord {
+                flow_id: "denied-discovery-flow".to_string(),
+                subject_user_id: None,
+                subject_identifier_hash: Some("identifier-hash".to_string()),
+                flow_kind: crate::modules::auth::domain::AuthFlowKind::MethodsDiscovery,
+                protocol: "auth_v2_methods_v1".to_string(),
+                state: serde_json::json!({
+                    "identifier": harness.bootstrap_email.to_ascii_lowercase(),
+                    "supports_pake": true,
+                    "supports_passkeys": false,
+                    "supports_conditional_mediation": false,
+                    "client_id": "android",
+                    "requested_client_id": "android",
+                    "rollout_cohort": "canary_mobile",
+                    "serving_mode": "external",
+                }),
+                status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                rollout_tenant_id: None,
+                rollout_request_channel: Some("mobile".to_string()),
+                rollout_cohort: Some("canary_mobile".to_string()),
+                rollout_channel: Some("canary_mobile".to_string()),
+                fallback_policy: Some("client_not_allowlisted".to_string()),
+                trace_id: Some("handler-v2-start-rollout-denied".to_string()),
+                issued_ip: Some("127.0.0.1".to_string()),
+                issued_user_agent: Some("unit-test".to_string()),
+                attempt_count: 0,
+                expires_at: now + chrono::Duration::seconds(300),
+                consumed_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("manual denied discovery flow should be stored");
+
+        let problem = super::password_login_start_v2(
+            State(harness.state.clone()),
+            connect_info(),
+            headers_with_trace("handler-v2-start-rollout-denied"),
+            Json(PasswordLoginStartRequest {
+                identifier: harness.bootstrap_email.clone(),
+                discovery_token: "denied-discovery-flow".to_string(),
+                client_message: None,
+                client: super::PasswordLoginStartClientRequest {
+                    supports_pake: true,
+                    platform: Some("android".to_string()),
+                },
+            }),
+        )
+        .await
+        .expect_err("rollout-denied discovery flow should be rejected");
+
+        assert_eq!(problem.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            problem.body.type_url,
+            "https://example.com/problems/auth-v2-rollout-denied"
+        );
+
+        let metrics_payload = metrics_payload(&harness, "handler-v2-start-rollout-denied-metrics").await;
+        assert!(metrics_payload.contains("auth_v2_rollout_diagnostics_total"));
+        assert!(metrics_payload.contains("operation=\"password_login_start\""));
+        assert!(metrics_payload.contains("outcome=\"error\""));
+        assert!(metrics_payload.contains("cohort=\"canary_mobile\""));
+        assert!(metrics_payload.contains("request_channel=\"mobile\""));
+        assert!(metrics_payload.contains("tenant_context=\"absent\""));
     }
 
     #[tokio::test]
@@ -4194,6 +4359,9 @@ mod tests {
                 protocol: "recovery_upgrade_bridge_v1".to_string(),
                 state: serde_json::json!({"source": "password_reset"}),
                 status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                rollout_tenant_id: None,
+                rollout_request_channel: None,
+                rollout_cohort: Some("canary_web".to_string()),
                 rollout_channel: Some("canary_web".to_string()),
                 fallback_policy: Some("disabled".to_string()),
                 trace_id: Some("handler-v2-recovery-bridge-trace".to_string()),
@@ -4257,6 +4425,9 @@ mod tests {
                 protocol: "recovery_upgrade_bridge_v1".to_string(),
                 state: serde_json::json!({"source": "password_reset"}),
                 status: crate::modules::auth::domain::AuthFlowStatus::Pending,
+                rollout_tenant_id: None,
+                rollout_request_channel: None,
+                rollout_cohort: Some("canary_web".to_string()),
                 rollout_channel: Some("canary_web".to_string()),
                 fallback_policy: Some("disabled".to_string()),
                 trace_id: Some("handler-v2-recovery-bridge-finish-trace".to_string()),
@@ -5107,6 +5278,31 @@ mod tests {
                         .iter()
                         .map(|value| (*value).to_string())
                         .collect(),
+                    targeting_rules: client_allowlist
+                        .iter()
+                        .flat_map(|value| {
+                            let mut rules = vec![crate::config::AuthV2TargetingRule {
+                                tenant_id: None,
+                                request_channel: None,
+                                requested_client_id: Some((*value).to_string()),
+                                cohort: (*value).to_string(),
+                            }];
+                            let request_channel = match *value {
+                                "internal" | "canary_web" => Some("web"),
+                                "canary_mobile" => Some("mobile"),
+                                _ => None,
+                            };
+                            if let Some(request_channel) = request_channel {
+                                rules.push(crate::config::AuthV2TargetingRule {
+                                    tenant_id: None,
+                                    request_channel: Some(request_channel.to_string()),
+                                    requested_client_id: None,
+                                    cohort: (*value).to_string(),
+                                });
+                            }
+                            rules
+                        })
+                        .collect(),
                     shadow_audit_only,
                 },
                 accounts: Arc::new(StaticAccountRepository::new(vec![
@@ -5953,6 +6149,7 @@ mod tests {
             ip: Some("127.0.0.1".to_string()),
             user_agent: Some("handler-tests".to_string()),
             client_id: None,
+            auth_v2_rollout: None,
             auth_api_surface: crate::modules::auth::application::AuthApiSurface::V1,
         }
     }
@@ -6010,6 +6207,7 @@ mod tests {
                 auth_flow_abuse_penalty_units: 1,
                 legacy_fallback_mode: crate::config::AuthV2LegacyFallbackMode::Disabled,
                 client_allowlist: Vec::new(),
+                targeting_rules: Vec::new(),
                 shadow_audit_only: false,
             },
             enforce_secure_transport: false,

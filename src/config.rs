@@ -72,7 +72,16 @@ pub struct AuthV2Config {
     pub auth_flow_abuse_penalty_units: u32,
     pub legacy_fallback_mode: AuthV2LegacyFallbackMode,
     pub client_allowlist: Vec<String>,
+    pub targeting_rules: Vec<AuthV2TargetingRule>,
     pub shadow_audit_only: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthV2TargetingRule {
+    pub tenant_id: Option<String>,
+    pub request_channel: Option<String>,
+    pub requested_client_id: Option<String>,
+    pub cohort: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +143,46 @@ impl AuthV2Config {
                     .as_ref()
                     .is_some_and(|canonical| canonical == &stored_value)
         })
+    }
+
+    pub fn matching_targeting_rule(
+        &self,
+        tenant_id: Option<&str>,
+        request_channel: Option<&str>,
+        requested_client_id: Option<&str>,
+    ) -> Option<&AuthV2TargetingRule> {
+        let tenant_id = normalize_auth_v2_tenant_id(tenant_id);
+        let request_channel = normalize_auth_v2_request_channel(request_channel);
+        let requested_client_id = Self::normalized_client_id(requested_client_id);
+        let canonical_requested_client_id =
+            normalize_auth_v2_cohort_label(requested_client_id.as_deref());
+
+        self.targeting_rules
+            .iter()
+            .find(|rule| {
+                rule.tenant_id.is_some()
+                    && rule.tenant_id == tenant_id
+                    && rule.request_channel == request_channel
+            })
+            .or_else(|| {
+                self.targeting_rules.iter().find(|rule| {
+                    rule.tenant_id.is_none()
+                        && rule.request_channel.is_some()
+                        && rule.request_channel == request_channel
+                })
+            })
+            .or_else(|| {
+                self.targeting_rules.iter().find(|rule| {
+                    rule.requested_client_id
+                        .as_ref()
+                        .is_some_and(|rule_client_id| {
+                            Some(rule_client_id) == requested_client_id.as_ref()
+                                || Some(rule_client_id) == canonical_requested_client_id.as_ref()
+                                || normalize_auth_v2_cohort_label(Some(rule_client_id)).as_ref()
+                                    == canonical_requested_client_id.as_ref()
+                        })
+                })
+            })
     }
 }
 
@@ -274,6 +323,10 @@ impl AppConfig {
                     .unwrap_or_else(|_| "disabled".to_string()),
             )?,
             client_allowlist: parse_auth_v2_client_allowlist(
+                std::env::var("AUTH_V2_CLIENT_ALLOWLIST").unwrap_or_default(),
+            )?,
+            targeting_rules: parse_auth_v2_targeting_rules(
+                std::env::var("AUTH_V2_TARGETING_RULES").unwrap_or_default(),
                 std::env::var("AUTH_V2_CLIENT_ALLOWLIST").unwrap_or_default(),
             )?,
             shadow_audit_only: std::env::var("AUTH_V2_SHADOW_AUDIT_ONLY")
@@ -896,6 +949,26 @@ fn normalize_auth_v2_cohort_label(value: Option<&str>) -> Option<String> {
         .map(|cohort| cohort.as_str().to_string())
 }
 
+pub(crate) fn normalize_auth_v2_request_channel(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| match value.to_ascii_lowercase().as_str() {
+            "web" | "canary_web" | "internal-web" | "staff" | "qa" => "web".to_string(),
+            "mobile" | "canary_mobile" | "ios" | "android" | "ios-beta" | "android-beta" => {
+                "mobile".to_string()
+            }
+            other => other.to_string(),
+        })
+}
+
+fn normalize_auth_v2_tenant_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+}
+
 fn parse_auth_v2_client_allowlist(value: String) -> Result<Vec<String>> {
     let mut seen = HashSet::new();
 
@@ -909,6 +982,122 @@ fn parse_auth_v2_client_allowlist(value: String) -> Result<Vec<String>> {
                 .filter(|entry| seen.insert(entry.clone()))
                 .collect()
         })
+}
+
+fn parse_auth_v2_targeting_rules(
+    value: String,
+    client_allowlist: String,
+) -> Result<Vec<AuthV2TargetingRule>> {
+    let explicit_rules = parse_explicit_auth_v2_targeting_rules(&value)?;
+    if !explicit_rules.is_empty() {
+        return Ok(explicit_rules);
+    }
+
+    parse_auth_v2_client_allowlist(client_allowlist).map(|allowlist| {
+        let mut rules = Vec::new();
+
+        for cohort in allowlist {
+            rules.push(AuthV2TargetingRule {
+                tenant_id: None,
+                request_channel: None,
+                requested_client_id: Some(cohort.clone()),
+                cohort: cohort.clone(),
+            });
+
+            if let Some(request_channel) = compatibility_request_channel_for_cohort(&cohort) {
+                let channel_rule = AuthV2TargetingRule {
+                    tenant_id: None,
+                    request_channel: Some(request_channel.to_string()),
+                    requested_client_id: None,
+                    cohort: cohort.clone(),
+                };
+                if !rules.contains(&channel_rule) {
+                    rules.push(channel_rule);
+                }
+            }
+        }
+
+        rules
+    })
+}
+
+fn compatibility_request_channel_for_cohort(cohort: &str) -> Option<&'static str> {
+    match cohort {
+        "internal" | "canary_web" => Some("web"),
+        "canary_mobile" => Some("mobile"),
+        _ => None,
+    }
+}
+
+fn parse_explicit_auth_v2_targeting_rules(value: &str) -> Result<Vec<AuthV2TargetingRule>> {
+    let mut rules = Vec::new();
+
+    for raw_rule in value
+        .split(',')
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+    {
+        let mut tenant_id = None;
+        let mut request_channel = None;
+        let mut requested_client_id = None;
+        let mut cohort = None;
+
+        for raw_part in raw_rule
+            .split(';')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
+            let Some((raw_key, raw_value)) = raw_part.split_once('=') else {
+                anyhow::bail!(
+                    "invalid AUTH_V2_TARGETING_RULES entry: {raw_rule}; expected key=value segments separated by ';'"
+                );
+            };
+            let key = raw_key.trim().to_ascii_lowercase();
+            let value = raw_value.trim();
+            if value.is_empty() {
+                anyhow::bail!(
+                    "invalid AUTH_V2_TARGETING_RULES entry: {raw_rule}; field '{key}' must not be empty"
+                );
+            }
+
+            match key.as_str() {
+                "tenant" | "tenant_id" => tenant_id = normalize_auth_v2_tenant_id(Some(value)),
+                "channel" | "request_channel" => {
+                    request_channel = normalize_auth_v2_request_channel(Some(value))
+                }
+                "client" | "client_id" | "requested_client_id" => {
+                    requested_client_id = AuthV2Config::normalized_client_id(Some(value))
+                }
+                "cohort" => cohort = Some(resolve_auth_v2_cohort(value)?.as_str().to_string()),
+                _ => anyhow::bail!(
+                    "invalid AUTH_V2_TARGETING_RULES entry: {raw_rule}; unsupported field '{key}'"
+                ),
+            }
+        }
+
+        if cohort.is_none() {
+            anyhow::bail!("invalid AUTH_V2_TARGETING_RULES entry: {raw_rule}; cohort is required");
+        }
+        if tenant_id.is_some() && request_channel.is_none() {
+            anyhow::bail!(
+                "invalid AUTH_V2_TARGETING_RULES entry: {raw_rule}; tenant-specific rules require channel"
+            );
+        }
+        if request_channel.is_none() && requested_client_id.is_none() {
+            anyhow::bail!(
+                "invalid AUTH_V2_TARGETING_RULES entry: {raw_rule}; channel or client_id is required"
+            );
+        }
+
+        rules.push(AuthV2TargetingRule {
+            tenant_id,
+            request_channel,
+            requested_client_id,
+            cohort: cohort.expect("cohort checked above"),
+        });
+    }
+
+    Ok(rules)
 }
 
 fn parse_auth_v2_pake_provider(value: String) -> Result<AuthV2PakeProvider> {
@@ -1308,14 +1497,14 @@ mod tests {
 
     use super::{
         database_url_uses_secure_transport, parse_auth_v2_client_allowlist,
-        parse_auth_v2_legacy_fallback_mode, parse_auth_v2_pake_provider, parse_email_delivery_mode,
-        parse_email_provider_config, parse_login_risk_blocked_cidrs,
-        parse_login_risk_challenge_cidrs, parse_login_risk_mode, parse_metrics_allowed_cidrs,
-        parse_positive_u64_with_default, redis_url_uses_secure_transport, resolve_auth_v2_cohort,
-        resolve_jwt_key_configuration, resolve_optional_secret_from_env,
-        validate_backend_transport_security, AppConfig, AuthRuntime, AuthV2Cohort,
-        AuthV2LegacyFallbackMode, AuthV2PakeProvider, EmailDeliveryMode, EmailProviderConfig,
-        LoginRiskMode,
+        parse_auth_v2_legacy_fallback_mode, parse_auth_v2_pake_provider,
+        parse_auth_v2_targeting_rules, parse_email_delivery_mode, parse_email_provider_config,
+        parse_login_risk_blocked_cidrs, parse_login_risk_challenge_cidrs, parse_login_risk_mode,
+        parse_metrics_allowed_cidrs, parse_positive_u64_with_default,
+        redis_url_uses_secure_transport, resolve_auth_v2_cohort, resolve_jwt_key_configuration,
+        resolve_optional_secret_from_env, validate_backend_transport_security, AppConfig,
+        AuthRuntime, AuthV2Cohort, AuthV2LegacyFallbackMode, AuthV2PakeProvider,
+        AuthV2TargetingRule, EmailDeliveryMode, EmailProviderConfig, LoginRiskMode,
     };
 
     #[test]
@@ -1444,6 +1633,11 @@ mod tests {
             legacy_fallback_mode: AuthV2LegacyFallbackMode::Allowlisted,
             client_allowlist: parse_auth_v2_client_allowlist("canary_web, ios-beta".to_string())
                 .expect("allowlist should parse"),
+            targeting_rules: parse_auth_v2_targeting_rules(
+                String::new(),
+                "canary_web, ios-beta".to_string(),
+            )
+            .expect("compatibility targeting rules should parse"),
             shadow_audit_only: false,
         };
 
@@ -1451,6 +1645,88 @@ mod tests {
         assert!(config.client_is_allowlisted(Some("ios")));
         assert!(!config.client_is_allowlisted(Some("legacy-holdout")));
         assert!(!config.client_is_allowlisted(None));
+    }
+
+    #[test]
+    fn parse_auth_v2_targeting_rules_supports_tenant_channel_and_client_compatibility_entries() {
+        let rules = parse_auth_v2_targeting_rules(
+            "tenant=external-acme;channel=web;cohort=beta_external,channel=mobile;cohort=canary_mobile,client=internal-web;cohort=internal".to_string(),
+            String::new(),
+        )
+        .expect("explicit targeting rules should parse");
+
+        assert_eq!(
+            rules,
+            vec![
+                AuthV2TargetingRule {
+                    tenant_id: Some("external-acme".to_string()),
+                    request_channel: Some("web".to_string()),
+                    requested_client_id: None,
+                    cohort: "beta_external".to_string(),
+                },
+                AuthV2TargetingRule {
+                    tenant_id: None,
+                    request_channel: Some("mobile".to_string()),
+                    requested_client_id: None,
+                    cohort: "canary_mobile".to_string(),
+                },
+                AuthV2TargetingRule {
+                    tenant_id: None,
+                    request_channel: None,
+                    requested_client_id: Some("internal-web".to_string()),
+                    cohort: "internal".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_auth_v2_targeting_rules_falls_back_to_legacy_client_allowlist() {
+        let rules = parse_auth_v2_targeting_rules(String::new(), "web, ios-beta".to_string())
+            .expect("legacy allowlist should map into compatibility rules");
+
+        assert_eq!(
+            rules,
+            vec![
+                AuthV2TargetingRule {
+                    tenant_id: None,
+                    request_channel: None,
+                    requested_client_id: Some("canary_web".to_string()),
+                    cohort: "canary_web".to_string(),
+                },
+                AuthV2TargetingRule {
+                    tenant_id: None,
+                    request_channel: Some("web".to_string()),
+                    requested_client_id: None,
+                    cohort: "canary_web".to_string(),
+                },
+                AuthV2TargetingRule {
+                    tenant_id: None,
+                    request_channel: None,
+                    requested_client_id: Some("canary_mobile".to_string()),
+                    cohort: "canary_mobile".to_string(),
+                },
+                AuthV2TargetingRule {
+                    tenant_id: None,
+                    request_channel: Some("mobile".to_string()),
+                    requested_client_id: None,
+                    cohort: "canary_mobile".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_auth_v2_targeting_rules_rejects_tenant_without_channel() {
+        let error = parse_auth_v2_targeting_rules(
+            "tenant=external-acme;cohort=beta_external".to_string(),
+            String::new(),
+        )
+        .expect_err("tenant-only rule should fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("tenant-specific rules require channel"));
     }
 
     #[test]
@@ -1516,6 +1792,10 @@ mod tests {
                     "AUTH_V2_CLIENT_ALLOWLIST",
                     Some(" canary_web , internal-web ,, ios-beta "),
                 ),
+                (
+                    "AUTH_V2_TARGETING_RULES",
+                    Some("tenant=external-acme;channel=web;cohort=beta_external,channel=mobile;cohort=canary_mobile"),
+                ),
                 ("AUTH_V2_SHADOW_AUDIT_ONLY", Some("true")),
                 ("AUTH_V2_AUTH_FLOW_PRUNE_INTERVAL_SECONDS", Some("90")),
             ],
@@ -1536,6 +1816,23 @@ mod tests {
                 assert_eq!(
                     config.auth_v2.client_allowlist,
                     vec!["canary_web", "internal", "canary_mobile"]
+                );
+                assert_eq!(
+                    config.auth_v2.targeting_rules,
+                    vec![
+                        AuthV2TargetingRule {
+                            tenant_id: Some("external-acme".to_string()),
+                            request_channel: Some("web".to_string()),
+                            requested_client_id: None,
+                            cohort: "beta_external".to_string(),
+                        },
+                        AuthV2TargetingRule {
+                            tenant_id: None,
+                            request_channel: Some("mobile".to_string()),
+                            requested_client_id: None,
+                            cohort: "canary_mobile".to_string(),
+                        },
+                    ]
                 );
                 assert!(config.auth_v2.shadow_audit_only);
                 assert_eq!(config.auth_v2_auth_flow_prune_interval_seconds, 90);
