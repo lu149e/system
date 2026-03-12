@@ -172,7 +172,7 @@ dependencies = [
  "opaque-ke",
  "openssl",
  "prometheus",
- "rand 0.8.5",
+ "rand 0.9.2",
  "redis",
  "reqwest",
  "serde",
